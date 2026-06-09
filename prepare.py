@@ -15,11 +15,11 @@ import os
 import numpy as np
 from datasets import load_dataset
 
+from chat_format import EOS_TOKEN, special_token_map
 from data import BIN_DTYPE
 from tokenizer import BPETokenizer
 
 
-EOS_TOKEN = '<|endoftext|>'
 DATASET_PATH = 'HuggingFaceTB/smollm-corpus'
 DATASET_CONFIG = 'cosmopedia-v2'
 
@@ -154,8 +154,11 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     num_workers = os.cpu_count() or 1
 
-    eos_id = args.vocab_size - 1
-    tokenizer = BPETokenizer(special_tokens={EOS_TOKEN: eos_id})
+    # Reserve chat specials (<|im_start|>, <|im_end|>) now so SFT later needs
+    # no embedding resize; they're simply unused during pretraining.
+    specials = special_token_map(args.vocab_size)
+    eos_id = specials[EOS_TOKEN]
+    tokenizer = BPETokenizer(special_tokens=specials)
 
     print(f"Loading {args.bpe_train_docs} docs from cosmopedia for BPE training...")
     bpe_corpus = _bpe_training_corpus(_load_stream(), args.bpe_train_docs)
