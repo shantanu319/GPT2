@@ -116,13 +116,17 @@ def train(
     d_model: int = 640,
     n_layers: int = 14,
     heads: int = 10,
+    kv_heads: int = 5,
+    loops: int = 1,
     batchsize: int = 128,
+    grad_accum: int = 1,
     seqlen: int = 1024,
     epochs: int = 1,
     lr: float = 3e-4,
-    muon_lr: float = 0.02,
+    muon_lr: float = 0.03,
     warmup_steps: int = 1000,
     save_every: int = 2000,
+    val_every: int = 2000,
     printevery: int = 50,
     dir_name: str = "modal_run",
 ):
@@ -154,13 +158,17 @@ def train(
             "-d_model", str(d_model),
             "-n_layers", str(n_layers),
             "-heads", str(heads),
+            "-kv_heads", str(kv_heads),
+            "-loops", str(loops),
             "-batchsize", str(batchsize),
+            "-grad_accum", str(grad_accum),
             "-seqlen", str(seqlen),
             "-epochs", str(epochs),
             "-lr", str(lr),
             "-muon_lr", str(muon_lr),
             "-warmup_steps", str(warmup_steps),
             "-save_every", str(save_every),
+            "-val_every", str(val_every),
             "-printevery", str(printevery),
         ],
         check=True, env=env,
@@ -174,6 +182,93 @@ def train(
     print(f"Download with: modal volume get {VOLUME_NAME} /saved ./modal_out")
 
 
+@app.function(
+    volumes={VOL_MOUNT: vol},
+    cpu=4.0,
+    timeout=60 * 60 * 4,
+)
+def sft_prepare(
+    force: bool = False,
+    max_conversations: int = 0,
+    holdout_period: int = 200,
+):
+    """Tokenize smol-smoltalk into sft_*.bin shards on the volume."""
+    import os
+    import subprocess
+
+    if not force and os.path.exists(f"{DATA_DIR}/sft_train.bin"):
+        print(f"{DATA_DIR}/sft_train.bin already exists — skipping (--force-sft-prepare to rebuild)")
+        return
+
+    os.chdir("/root/src")
+    cmd = [
+        "python", "-u", "sft_prepare.py",
+        "--output-dir", DATA_DIR,
+        "--holdout-period", str(holdout_period),
+    ]
+    if max_conversations > 0:
+        cmd += ["--max-conversations", str(max_conversations)]
+    subprocess.run(cmd, check=True)
+    vol.commit()
+    print(f"SFT data committed to `{VOLUME_NAME}:{DATA_DIR}`")
+
+
+@app.function(
+    volumes={VOL_MOUNT: vol},
+    gpu="H100",
+    timeout=60 * 60 * 12,
+)
+def sft(
+    checkpoint: str = "modal_run/ckpt_final.pt",
+    epochs: int = 2,
+    batchsize: int = 64,
+    seqlen: int = 512,
+    lr: float = 3e-5,
+    muon_lr: float = 0.003,
+    warmup_steps: int = 100,
+    save_every: int = 1000,
+    val_every: int = 500,
+    dir_name: str = "sft_run",
+):
+    """Fine-tune a pretrained checkpoint on chat data. `checkpoint` is relative
+    to the volume's /saved root."""
+    import os
+    import subprocess
+
+    ckpt_path = f"{SAVE_ROOT}/{checkpoint}"
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"no checkpoint at {ckpt_path}")
+    if not os.path.exists(f"{DATA_DIR}/sft_train.bin"):
+        raise FileNotFoundError(
+            f"no {DATA_DIR}/sft_train.bin — run `modal run modal_app.py::sft_prepare` first")
+
+    os.chdir("/root/src")
+    os.makedirs(SAVE_ROOT, exist_ok=True)
+    if not os.path.lexists("/root/src/saved"):
+        os.symlink(SAVE_ROOT, "/root/src/saved")
+
+    subprocess.run(
+        [
+            "python", "-u", "finetune.py",
+            "--checkpoint", ckpt_path,
+            "--data-dir", DATA_DIR,
+            "--epochs", str(epochs),
+            "--batchsize", str(batchsize),
+            "--seqlen", str(seqlen),
+            "--lr", str(lr),
+            "--muon-lr", str(muon_lr),
+            "--warmup-steps", str(warmup_steps),
+            "--save-every", str(save_every),
+            "--val-every", str(val_every),
+            "--dir-name", dir_name,
+        ],
+        check=True,
+    )
+    vol.commit()
+    print(f"SFT checkpoints saved to `{VOLUME_NAME}:/saved/{dir_name}/`")
+    print(f"Download with: modal volume get {VOLUME_NAME} /saved/{dir_name} ./modal_out/{dir_name}")
+
+
 @app.local_entrypoint()
 def main(
     force_prepare: bool = False,
@@ -184,15 +279,22 @@ def main(
     d_model: int = 640,
     n_layers: int = 14,
     heads: int = 10,
+    kv_heads: int = 5,
+    loops: int = 1,
     batchsize: int = 128,
+    grad_accum: int = 1,
     seqlen: int = 1024,
     epochs: int = 1,
     lr: float = 3e-4,
-    muon_lr: float = 0.02,
+    muon_lr: float = 0.03,
     warmup_steps: int = 1000,
     save_every: int = 2000,
+    val_every: int = 2000,
     printevery: int = 50,
     dir_name: str = "modal_run",
+    run_sft: bool = False,
+    sft_epochs: int = 2,
+    sft_dir_name: str = "sft_run",
 ):
     prepare.remote(
         force=force_prepare,
@@ -205,13 +307,24 @@ def main(
         d_model=d_model,
         n_layers=n_layers,
         heads=heads,
+        kv_heads=kv_heads,
+        loops=loops,
         batchsize=batchsize,
+        grad_accum=grad_accum,
         seqlen=seqlen,
         epochs=epochs,
         lr=lr,
         muon_lr=muon_lr,
         warmup_steps=warmup_steps,
         save_every=save_every,
+        val_every=val_every,
         printevery=printevery,
         dir_name=dir_name,
     )
+    if run_sft:
+        sft_prepare.remote()
+        sft.remote(
+            checkpoint=f"{dir_name}/ckpt_final.pt",
+            epochs=sft_epochs,
+            dir_name=sft_dir_name,
+        )
