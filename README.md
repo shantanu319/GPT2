@@ -42,6 +42,21 @@ The checkpoints land at ./modal_out/<dir_name>/ckpt_*.pt and the plot at ./modal
 
 GPU choice lives in modal_app.py (`gpu="L4"` — roughly $0.80/hr, plenty for the default 8M config). Bump it to `"L40S"` or `"A100"` if you scale the model up. Timeout is 8h; drop it if you want tighter cost guardrails.
 
+Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping, GQA (`-kv_heads`, default 5 of 10 heads on Modal — saves params + halves the KV cache), partial RoPE (rotate half the head dims), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds Muon weight decay, gradient accumulation (`-grad_accum`), and capped mid-epoch validation (`-val_every`).
+
+Posttraining (chat SFT, target: chat-able under 100M params):
+    prepare.py now reserves <|im_start|>/<|im_end|> chat specials in the vocab (rebuild with --force-prepare once),
+    sft_prepare.py tokenizes HuggingFaceTB/smol-smoltalk into ChatML, packed into sft_*.bin with a uint8 loss mask,
+    finetune.py loads a pretrain checkpoint and runs masked SFT (loss only on assistant tokens).
+
+    modal run modal_app.py --run-sft                         # full pipeline: prepare -> pretrain -> sft_prepare -> sft
+    modal run modal_app.py::sft_prepare                      # just tokenize chat data
+    modal run modal_app.py::sft --checkpoint modal_run/ckpt_final.pt --dir-name sft_run
+
+    # local chat with an SFT checkpoint (ChatML template auto-enabled when specials exist):
+    python sample.py --checkpoint sft_final.pt --prompt "hi there" --chat
+    python chat_server.py --checkpoint sft_final.pt --data-dir data_cache/cosmopedia   # add --raw for pretrain ckpts
+
 If you want to try it yourself, download the latest weights here: 
 https://drive.google.com/file/d/1dS8MitkyJ7bBKZWqizLYizwkZ7WSJR_f/view?usp=sharing
 
