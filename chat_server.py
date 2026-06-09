@@ -20,6 +20,7 @@ import sys
 
 import torch
 
+from chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
 from model import Transformer, nopeak_mask
 from sample import _sample_next
 from tokenizer import BPETokenizer
@@ -63,7 +64,8 @@ def _decode_one(model, tok_id, start_pos, device):
 
 @torch.no_grad()
 def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
-                  max_tokens, temperature, top_p, max_context, device):
+                  max_tokens, temperature, top_p, max_context, device,
+                  stop_ids=None):
     """Extend context_ids with new_prompt_ids, generate up to max_tokens, append
     generated tokens in place. Returns (newly_generated_ids, new_cache_len).
 
@@ -92,12 +94,16 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
             last_logits = _decode_one(model, tok, cache_len, device)
             cache_len += 1
 
+    stop_ids = set(stop_ids or ())
+    if eos_id is not None:
+        stop_ids.add(eos_id)
+
     generated = []
     for _ in range(max_tokens):
         next_id = _sample_next(last_logits, temperature, top_p)
         generated.append(next_id)
         context_ids.append(next_id)
-        if eos_id is not None and next_id == eos_id:
+        if next_id in stop_ids:
             break
 
         if cache_len + 1 > max_context:
@@ -122,6 +128,11 @@ def main():
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--raw', action='store_true',
+                        help='Disable the chat template (raw LM continuation), '
+                             'e.g. for pretrain-only checkpoints')
+    parser.add_argument('--system', default=DEFAULT_SYSTEM,
+                        help='System prompt used in chat-template mode')
     args = parser.parse_args()
 
     device = _resolve_device(args.no_cuda)
@@ -142,13 +153,20 @@ def main():
         N=cfg['n_layers'],
         heads=cfg['heads'],
         dropout=cfg['dropout'],
+        kv_heads=cfg.get('kv_heads'),
+        loops=cfg.get('loops', 1),
     ).to(device)
     model.load_state_dict(ckpt['model'])
     log(f"model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
+    im_end_id = tokenizer.special_tokens.get(IM_END)
+    chat_mode = not args.raw and IM_START in tokenizer.special_tokens
+    log(f"chat template: {'on' if chat_mode else 'off'}")
+    stop_ids = {im_end_id} if chat_mode and im_end_id is not None else set()
     context_ids = []
     cache_len = 0
+    first_turn = True
 
     _send({"type": "ready"})
 
@@ -166,12 +184,22 @@ def main():
         if kind == "reset":
             context_ids = []
             cache_len = 0
+            first_turn = True
             model.reset_cache()
             _send({"type": "reset_ok"})
         elif kind == "prompt":
             prompt = msg.get("prompt", "")
             try:
-                new_prompt_ids = tokenizer.encode(prompt)
+                if chat_mode:
+                    # assistant stop token has no trailing newline; add one
+                    text = '' if first_turn else '\n'
+                    if first_turn and args.system:
+                        text += render_turn('system', args.system)
+                    text += render_turn('user', prompt) + f"{IM_START}assistant\n"
+                    new_prompt_ids = tokenizer.encode(text)
+                    first_turn = False
+                else:
+                    new_prompt_ids = tokenizer.encode(prompt)
                 new_ids, cache_len = generate_into(
                     context_ids, cache_len, new_prompt_ids, model, eos_id,
                     max_tokens=msg.get("max_tokens", args.max_tokens),
@@ -179,7 +207,10 @@ def main():
                     top_p=msg.get("top_p", args.top_p),
                     max_context=args.max_context,
                     device=device,
+                    stop_ids=stop_ids,
                 )
+                if chat_mode and new_ids and new_ids[-1] in stop_ids | {eos_id}:
+                    new_ids = new_ids[:-1]  # don't print the stop token
                 _send({"type": "response", "text": tokenizer.decode(new_ids)})
             except Exception as e:  # noqa: BLE001
                 _send({"type": "error", "error": repr(e)})

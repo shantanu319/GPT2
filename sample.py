@@ -50,8 +50,12 @@ def _sample_next(logits, temperature, top_p):
 @torch.no_grad()
 def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
              max_context, device, eos_id=None, stop_at_eos=True,
-             use_kv_cache=True):
+             use_kv_cache=True, stop_ids=None):
     model.eval()
+
+    stop_ids = set(stop_ids or ())
+    if stop_at_eos and eos_id is not None:
+        stop_ids.add(eos_id)
 
     if prompt:
         ids = tokenizer.encode(prompt)
@@ -72,7 +76,7 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
                 [tokens, torch.tensor([[next_id]], dtype=torch.long, device=device)],
                 dim=1,
             )
-            if stop_at_eos and eos_id is not None and next_id == eos_id:
+            if next_id in stop_ids:
                 break
         return tokenizer.decode(tokens[0].tolist())
 
@@ -93,7 +97,7 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
     for _ in range(max_tokens):
         next_id = _sample_next(last_logits, temperature, top_p)
         all_ids.append(next_id)
-        if stop_at_eos and eos_id is not None and next_id == eos_id:
+        if next_id in stop_ids:
             break
 
         if cache_len + 1 >= max_context:
@@ -128,6 +132,8 @@ def main():
     parser.add_argument('--no-kv-cache', action='store_true',
                         help='Disable KV cache (re-feed full context each step). '
                              'Temporary: used to verify KV-cache correctness.')
+    parser.add_argument('--chat', action='store_true',
+                        help='Wrap --prompt in the ChatML template (for SFT checkpoints)')
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -154,16 +160,30 @@ def main():
         N=cfg['n_layers'],
         heads=cfg['heads'],
         dropout=cfg['dropout'],
+        kv_heads=cfg.get('kv_heads'),
+        loops=cfg.get('loops', 1),
     ).to(device)
     model.load_state_dict(ckpt['model'])
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
 
+    prompt = args.prompt
+    stop_ids = set()
+    if args.chat:
+        from chat_format import DEFAULT_SYSTEM, IM_END, render_conversation
+        prompt = render_conversation(
+            [{'role': 'system', 'content': DEFAULT_SYSTEM},
+             {'role': 'user', 'content': args.prompt}],
+            add_generation_prompt=True,
+        )
+        if IM_END in tokenizer.special_tokens:
+            stop_ids.add(tokenizer.special_tokens[IM_END])
+
     for i in range(args.num_samples):
         if args.num_samples > 1:
             print(f"\n--- sample {i+1}/{args.num_samples} ---")
         text = generate(
-            model, tokenizer, args.prompt,
+            model, tokenizer, prompt,
             max_tokens=args.max_tokens,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -171,6 +191,7 @@ def main():
             device=device,
             eos_id=eos_id,
             use_kv_cache=not args.no_kv_cache,
+            stop_ids=stop_ids,
         )
         print(text)
 
