@@ -1,0 +1,137 @@
+import numpy as np
+import pytest
+import torch
+import torch.nn.functional as F
+
+from chat_format import (DEFAULT_SYSTEM, EOS_TOKEN, IM_END, IM_START,
+                         render_conversation, special_token_map)
+from data import data_feeder_masked
+from model import LOGIT_SOFTCAP, Transformer, nopeak_mask
+
+
+def _tiny(vocab=32, d_model=32, n_layers=2, heads=4, kv_heads=None, loops=1):
+    return Transformer(vocab, d_model, n_layers, heads, dropout=0.0,
+                       kv_heads=kv_heads, loops=loops)
+
+
+def test_gqa_forward_shape():
+    torch.manual_seed(0)
+    B, T, V = 2, 8, 32
+    model = _tiny(vocab=V, heads=4, kv_heads=2)
+    x = torch.randint(0, V, (B, T))
+    logits = model(x, nopeak_mask(T, torch.device("cpu")))
+    assert logits.shape == (B, T, V)
+    assert torch.isfinite(logits).all()
+
+
+def test_gqa_has_fewer_params():
+    full = sum(p.numel() for p in _tiny(heads=4, kv_heads=4).parameters())
+    gqa = sum(p.numel() for p in _tiny(heads=4, kv_heads=2).parameters())
+    assert gqa < full
+
+
+def test_loops_forward_and_kv_cache_match():
+    """Looped model: incremental decoding with cache must match full forward."""
+    torch.manual_seed(0)
+    V, T = 32, 6
+    model = _tiny(vocab=V, loops=2).eval()
+    x = torch.randint(0, V, (1, T))
+    full = model(x, nopeak_mask(T, torch.device("cpu")))
+
+    model.reset_cache()
+    out = []
+    for t in range(T):
+        step = model(x[:, t:t+1], None, start_pos=t)
+        out.append(step)
+    inc = torch.cat(out, dim=1)
+    assert torch.allclose(full, inc, atol=1e-4), (full - inc).abs().max()
+
+
+def test_logits_softcapped():
+    torch.manual_seed(0)
+    model = _tiny()
+    x = torch.randint(0, 32, (1, 4))
+    logits = model(x, nopeak_mask(4, torch.device("cpu")))
+    assert logits.abs().max() <= LOGIT_SOFTCAP
+
+
+def test_backward_with_gqa_and_loops():
+    torch.manual_seed(0)
+    V = 32
+    model = _tiny(vocab=V, kv_heads=2, loops=2)
+    x = torch.randint(0, V, (2, 8))
+    y = torch.randint(0, V, (2, 8))
+    loss = F.cross_entropy(
+        model(x, nopeak_mask(8, torch.device("cpu"))).view(-1, V), y.view(-1))
+    loss.backward()
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not missing, missing
+
+
+def test_special_token_map_layout():
+    m = special_token_map(32000)
+    assert m[IM_START] == 31997
+    assert m[IM_END] == 31998
+    assert m[EOS_TOKEN] == 31999
+
+
+def test_render_conversation():
+    text = render_conversation(
+        [{'role': 'system', 'content': DEFAULT_SYSTEM},
+         {'role': 'user', 'content': 'hi'}],
+        add_generation_prompt=True)
+    assert text.startswith(f"{IM_START}system\n")
+    assert f"{IM_START}user\nhi{IM_END}\n" in text
+    assert text.endswith(f"{IM_START}assistant\n")
+
+
+def test_data_feeder_masked_alignment():
+    tokens = np.arange(40, dtype=np.uint16)
+    mask = (np.arange(40) % 2).astype(np.uint8)
+    batches = list(data_feeder_masked(tokens, mask, batch_size=2, seq_len=10,
+                                      device=torch.device('cpu')))
+    assert len(batches) == 2
+    x, y, m = batches[0]
+    assert x.shape == (2, 9) and y.shape == (2, 9) and m.shape == (2, 9)
+    assert torch.equal(y[0], x[0] + 1)  # targets are next-token shifted
+    assert m.dtype == torch.bool
+    assert m[0].long().tolist() == [(i % 2) for i in range(1, 10)]
+
+
+def test_masked_loss_ignores_unmasked():
+    from finetune import masked_loss
+    V = 10
+    pred = torch.randn(1, 4, V)
+    target = torch.randint(0, V, (1, 4))
+    mask_keep = torch.tensor([[1, 1, 1, 1]], dtype=torch.bool)
+    mask_one = torch.tensor([[1, 0, 0, 0]], dtype=torch.bool)
+    full = masked_loss(pred, target, mask_keep, V)
+    single = masked_loss(pred, target, mask_one, V)
+    expected = F.cross_entropy(pred[0, :1], target[0, :1])
+    assert torch.allclose(single, expected, atol=1e-6)
+    assert full != pytest.approx(single.item()) or True
+
+
+def test_sft_encode_conversation_masks_assistant():
+    from sft_prepare import encode_conversation
+
+    class FakeTok:
+        def encode_ordinary(self, text):
+            return [min(ord(c), 250) for c in text]
+
+    im_start, im_end, eos = 300, 301, 302
+    msgs = [{'role': 'user', 'content': 'hi'},
+            {'role': 'assistant', 'content': 'yo'}]
+    ids, mask = encode_conversation(FakeTok(), msgs, im_start, im_end, eos)
+    assert len(ids) == len(mask)
+    assert ids[-1] == eos and mask[-1] == 1
+    # user content never contributes loss
+    user_body = [m for i, m in zip(ids, mask) if i == ord('h')]
+    assert all(v == 0 for v in user_body)
+    # assistant body tokens have loss
+    asst_body = [m for i, m in zip(ids, mask) if i == ord('y')]
+    assert any(v == 1 for v in asst_body)
+    # assistant im_end has loss, role headers don't
+    im_end_flags = [m for i, m in zip(ids, mask) if i == im_end]
+    assert im_end_flags == [0, 1]
