@@ -6,6 +6,9 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
+LOGIT_SOFTCAP = 30.0  # tanh soft-capping (Gemma-2 / modded-nanogpt)
+
+
 class Embedder(nn.Module):
     def __init__(self, vocab_size, d_model):
         super().__init__()
@@ -35,6 +38,17 @@ def apply_rope(x, cos, sin):
     return torch.stack((rotated_1, rotated_2), dim=-1).flatten(-2)
 
 
+def apply_partial_rope(x, cos, sin, rot_dim):
+    """Rotate only the first rot_dim dims of each head (partial rotary).
+
+    Parameter-golf leaderboard finding: rotating ~half the head dims and
+    leaving the rest position-free helps small models."""
+    if rot_dim >= x.size(-1):
+        return apply_rope(x, cos, sin)
+    x_rot, x_pass = x[..., :rot_dim], x[..., rot_dim:]
+    return torch.cat((apply_rope(x_rot, cos, sin), x_pass), dim=-1)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, d_model, eps=1e-6):
         super().__init__()
@@ -54,61 +68,87 @@ def attention(q, k, v, mask=None, dropout_p=0.0):
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, heads, d_model, max_seq_len=4096, dropout=0.1):
+    """Multi-head attention with GQA, QK-norm, and partial RoPE.
+
+    kv_heads < heads shares each KV head across heads//kv_heads query heads
+    (saves params + KV cache). QK-norm (RMSNorm on per-head q/k) stabilizes
+    training and tolerates higher Muon LRs. rope_frac controls partial rotary.
+    """
+
+    def __init__(self, heads, d_model, kv_heads=None, max_seq_len=4096,
+                 dropout=0.1, rope_frac=0.5):
         super().__init__()
 
         self.d_model = d_model
         self.d_k = d_model // heads
         self.h = heads
+        self.h_kv = kv_heads or heads
+        assert heads % self.h_kv == 0, "heads must be divisible by kv_heads"
+        self.groups = heads // self.h_kv
+
+        # rotate an even number of dims per head
+        self.rot_dim = max(2, int(self.d_k * rope_frac) // 2 * 2)
 
         self.q_linear = nn.Linear(d_model, d_model)
-        self.v_linear = nn.Linear(d_model, d_model)
-        self.k_linear = nn.Linear(d_model, d_model)
+        self.k_linear = nn.Linear(d_model, self.h_kv * self.d_k)
+        self.v_linear = nn.Linear(d_model, self.h_kv * self.d_k)
+
+        self.q_norm = RMSNorm(self.d_k)
+        self.k_norm = RMSNorm(self.d_k)
 
         self.dropout = nn.Dropout(dropout)
         self.out = nn.Linear(d_model, d_model)
 
-        cos, sin = precompute_rope_freqs(self.d_k, max_seq_len)
+        cos, sin = precompute_rope_freqs(self.rot_dim, max_seq_len)
         self.register_buffer('rope_cos', cos, persistent=False)
         self.register_buffer('rope_sin', sin, persistent=False)
 
-        self.k_cache = None
-        self.v_cache = None
+        # KV caches keyed by recurrence pass index (depth-looped layers are
+        # distinct positions in the unrolled stack, so they need separate caches).
+        self.k_cache = {}
+        self.v_cache = {}
 
     def reset_cache(self):
-        self.k_cache = None
-        self.v_cache = None
+        self.k_cache = {}
+        self.v_cache = {}
 
-    def forward(self, q, k, v, mask=None, start_pos=None):
+    def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0):
 
         bs = q.size(0)
 
-        # perform linear operation and split into N heads
-        k = self.k_linear(k).view(bs, -1, self.h, self.d_k)
+        # perform linear operation and split into heads (kv may have fewer)
+        k = self.k_linear(k).view(bs, -1, self.h_kv, self.d_k)
         q = self.q_linear(q).view(bs, -1, self.h, self.d_k)
-        v = self.v_linear(v).view(bs, -1, self.h, self.d_k)
+        v = self.v_linear(v).view(bs, -1, self.h_kv, self.d_k)
 
-        # transpose to get dimensions bs * N * sl * d_model
+        # transpose to get dimensions bs * heads * sl * d_k
         k = k.transpose(1, 2)
         q = q.transpose(1, 2)
         v = v.transpose(1, 2)
 
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
         T = q.size(2)
         pos = start_pos if start_pos is not None else 0
-        q = apply_rope(q, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T])
-        k = apply_rope(k, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T])
+        q = apply_partial_rope(q, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T], self.rot_dim)
+        k = apply_partial_rope(k, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T], self.rot_dim)
 
         if start_pos is not None:
-            if self.k_cache is None:
+            if cache_idx not in self.k_cache:
                 max_len = self.rope_cos.size(0)
-                self.k_cache = torch.zeros(bs, self.h, max_len, self.d_k,
-                                           device=q.device, dtype=q.dtype)
-                self.v_cache = torch.zeros(bs, self.h, max_len, self.d_k,
-                                           device=q.device, dtype=q.dtype)
-            self.k_cache[:, :, start_pos:start_pos+T] = k
-            self.v_cache[:, :, start_pos:start_pos+T] = v
-            k = self.k_cache[:, :, :start_pos+T]
-            v = self.v_cache[:, :, :start_pos+T]
+                self.k_cache[cache_idx] = torch.zeros(
+                    bs, self.h_kv, max_len, self.d_k, device=q.device, dtype=q.dtype)
+                self.v_cache[cache_idx] = torch.zeros(
+                    bs, self.h_kv, max_len, self.d_k, device=q.device, dtype=q.dtype)
+            self.k_cache[cache_idx][:, :, start_pos:start_pos+T] = k
+            self.v_cache[cache_idx][:, :, start_pos:start_pos+T] = v
+            k = self.k_cache[cache_idx][:, :, :start_pos+T]
+            v = self.v_cache[cache_idx][:, :, :start_pos+T]
+
+        if self.groups > 1:
+            k = k.repeat_interleave(self.groups, dim=1)
+            v = v.repeat_interleave(self.groups, dim=1)
 
         dropout_p = self.dropout.p if self.training else 0.0
         scores = attention(q, k, v, mask, dropout_p)
@@ -147,7 +187,7 @@ def get_clones(module, N):
 # build a decoder layer with two multi-head attention layers and
 # one feed-forward layer
 class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
-    def __init__(self, d_model, heads, dropout=0.1):
+    def __init__(self, d_model, heads, dropout=0.1, kv_heads=None):
         super().__init__()
         self.norm_1 = RMSNorm(d_model)
         self.norm_3 = RMSNorm(d_model)
@@ -155,45 +195,54 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
         self.dropout_1 = nn.Dropout(dropout)
         self.dropout_3 = nn.Dropout(dropout)
 
-        self.attn_1 = MultiHeadAttention(heads, d_model, dropout=dropout)
+        self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads, dropout=dropout)
         self.ff = SwiGLU(d_model, dropout=dropout)
 
-    def forward(self, x, mask, start_pos=None):
+    def forward(self, x, mask, start_pos=None, cache_idx=0):
         x2 = self.norm_1(x)
-        x = x + self.dropout_1(self.attn_1(x2, x2, x2, mask, start_pos=start_pos))
+        x = x + self.dropout_1(
+            self.attn_1(x2, x2, x2, mask, start_pos=start_pos, cache_idx=cache_idx))
         x2 = self.norm_3(x)
         x = x + self.dropout_3(self.ff(x2))
         return x
 
 
 class Decoder(nn.Module):
-    def __init__(self, vocab, d_model, N, heads, dropout):
+    def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1):
         super().__init__()
         self.N = N
+        self.loops = loops
         self.embed = Embedder(vocab, d_model)
-        self.layers = get_clones(DecoderLayer(d_model, heads, dropout), N)
+        self.layers = get_clones(DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads), N)
         self.norm = RMSNorm(d_model)
 
     def forward(self, trg, mask, start_pos=None):
         x = self.embed(trg)
-        for i in range(self.N):
-            if self.training:
-                x = checkpoint(self.layers[i], x, mask, start_pos, use_reentrant=False)
-            else:
-                x = self.layers[i](x, mask, start_pos=start_pos)
+        # Depth recurrence (parameter-golf): run the stack `loops` times for
+        # loops*N effective layers with N layers' worth of params.
+        for loop in range(self.loops):
+            for i in range(self.N):
+                if self.training:
+                    x = checkpoint(self.layers[i], x, mask, start_pos, loop,
+                                   use_reentrant=False)
+                else:
+                    x = self.layers[i](x, mask, start_pos=start_pos, cache_idx=loop)
         return self.norm(x)
 
 
 class Transformer(nn.Module):
-    def __init__(self, vocab, d_model, N, heads, dropout):
+    def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1):
         super().__init__()
-        self.decoder = Decoder(vocab, d_model, N, heads, dropout)
+        self.decoder = Decoder(vocab, d_model, N, heads, dropout,
+                               kv_heads=kv_heads, loops=loops)
         self.out = nn.Linear(d_model, vocab)
         self.out.weight = self.decoder.embed.embed.weight
 
     def forward(self, vocab, mask, start_pos=None):
         d_output = self.decoder(vocab, mask, start_pos=start_pos)
         output = self.out(d_output)
+        # Soft-cap logits so no token can dominate early; keeps loss landscape smooth.
+        output = LOGIT_SOFTCAP * torch.tanh(output / LOGIT_SOFTCAP)
         return output
 
     def reset_cache(self):
@@ -206,16 +255,27 @@ def get_model(opt, vocab):
     assert opt.d_model % opt.heads == 0
     assert opt.dropout < 1
 
-    model = Transformer(vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout)
+    kv_heads = getattr(opt, 'kv_heads', None) or opt.heads
+    loops = getattr(opt, 'loops', 1) or 1
+
+    model = Transformer(vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout,
+                        kv_heads=kv_heads, loops=loops)
     model.to(opt.device)
 
     if opt.loadname is not None:
         print("loading pretrained weights...")
-        model.load_state_dict(torch.load(opt.loadname))
+        ckpt = torch.load(opt.loadname, map_location=opt.device, weights_only=False)
+        state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
+        model.load_state_dict(state)
     else:
-        for p in model.parameters():
+        for name, p in model.named_parameters():
             if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
+                # Zero-init residual-out projections (attn out + FFN down):
+                # each block starts as identity, so depth costs nothing at init.
+                if name.endswith('attn_1.out.weight') or name.endswith('ff.w_down.weight'):
+                    nn.init.zeros_(p)
+                else:
+                    nn.init.xavier_uniform_(p)
 
     return model
 

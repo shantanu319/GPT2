@@ -9,11 +9,17 @@ def parse_args():
     parser.add_argument('-d_model', type=int, default=512)
     parser.add_argument('-n_layers', type=int, default=6)
     parser.add_argument('-heads', type=int, default=8)
-    parser.add_argument('-dropout', type=int, default=0.1)
+    parser.add_argument('-kv_heads', type=int, default=0,
+                        help='KV heads for GQA (0 = same as heads, i.e. full MHA)')
+    parser.add_argument('-loops', type=int, default=1,
+                        help='Depth recurrence: run the layer stack this many times')
+    parser.add_argument('-dropout', type=float, default=0.0)
     parser.add_argument('-batchsize', type=int, default=16)
+    parser.add_argument('-grad_accum', type=int, default=1,
+                        help='Gradient accumulation steps (effective batch = batchsize * grad_accum)')
     parser.add_argument('-printevery', type=int, default=10)
     parser.add_argument('-lr', type=float, default=3e-4, help='AdamW peak learning rate')
-    parser.add_argument('-muon_lr', type=float, default=0.02, help='Muon peak learning rate')
+    parser.add_argument('-muon_lr', type=float, default=0.03, help='Muon peak learning rate')
     parser.add_argument('-warmup_steps', type=int, default=100)
     parser.add_argument('-seqlen', type=int, default=512)
     parser.add_argument('-threshold', type=int, default=3)
@@ -21,6 +27,10 @@ def parse_args():
     parser.add_argument('-loadname', type=str)
     parser.add_argument('-save_every', type=int, default=500,
                         help='Save a checkpoint every N training steps (0 disables periodic saves)')
+    parser.add_argument('-val_every', type=int, default=0,
+                        help='Run a capped validation pass every N steps (0 = only at epoch end)')
+    parser.add_argument('-val_batches', type=int, default=50,
+                        help='Max batches per mid-epoch validation pass')
     parser.add_argument('-tied', type=int, default=1)
     parser.add_argument('-dir_name', type=str, default='model')
     parser.add_argument('-norm', type=float, default=2.0)

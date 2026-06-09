@@ -37,7 +37,7 @@ def make_optimizers(model, muon_lr=0.02, adamw_lr=3e-4):
             adamw_params.append(p)
         else:
             muon_params.append(p)
-    muon = torch.optim.Muon(muon_params, lr=muon_lr)
+    muon = torch.optim.Muon(muon_params, lr=muon_lr, weight_decay=0.01)
     adamw = torch.optim.AdamW(
         adamw_params, lr=adamw_lr, weight_decay=0.1, betas=(0.9, 0.95)
     )
@@ -83,11 +83,19 @@ def train_model(model, opt):
     training_losses = []
     validation_losses = []
 
+    grad_accum = max(1, getattr(opt, 'grad_accum', 1))
+    val_every = getattr(opt, 'val_every', 0)
+    val_batches = getattr(opt, 'val_batches', 50)
+
     step = 0
+    micro = 0
     for epoch in range(opt.epochs):
         epoch_loss = 0
         epoch_tokens = 0
         iter = 0
+
+        for o in opt.optimizers:
+            o.zero_grad()
 
         for inX, out in data_feeder(opt.train, opt.batchsize, opt.seqlen, opt.device):
             iter += 1
@@ -103,12 +111,15 @@ def train_model(model, opt):
             epoch_loss += loss.item() * out.size(0)
             epoch_tokens += out.size(0)
 
-            for o in opt.optimizers:
-                o.zero_grad()
-            loss.backward()
+            (loss / grad_accum).backward()
+            micro += 1
+            if micro % grad_accum != 0:
+                continue
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
             for o in opt.optimizers:
                 o.step()
+                o.zero_grad()
 
             if iter % opt.printevery == 0:
                 current_pplx = math.exp(loss.item())
@@ -119,6 +130,9 @@ def train_model(model, opt):
                 path = _checkpoint_path(opt, f'step{step}')
                 save_checkpoint(model, opt.optimizers, step, path, config=opt.model_config)
                 print(f"Saved checkpoint: {path}")
+            if val_every and step % val_every == 0:
+                validate_model(model, opt, max_batches=val_batches)
+                model.train()
 
         train_loss = epoch_loss / epoch_tokens
         training_losses.append(train_loss)
@@ -135,14 +149,16 @@ def train_model(model, opt):
     return training_losses, validation_losses
 
 
-def validate_model(model, opt):
+def validate_model(model, opt, max_batches=None):
     print("validating model...")
     model.eval()  # Set to evaluation mode so dropout, etc. are disabled
     total_loss = 0
     total_tokens = 0
 
     with torch.no_grad(), torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-        for inX, out in data_feeder(opt.valid, opt.batchsize, opt.seqlen, opt.device):
+        for i, (inX, out) in enumerate(data_feeder(opt.valid, opt.batchsize, opt.seqlen, opt.device)):
+            if max_batches is not None and i >= max_batches:
+                break
             mask = nopeak_mask(inX.size(1), opt.device)
             pred = model(inX, mask)
             pred = pred.view(-1, opt.vocab_size)
@@ -243,6 +259,8 @@ def main():
         'd_model': opt.d_model,
         'n_layers': opt.n_layers,
         'heads': opt.heads,
+        'kv_heads': opt.kv_heads or opt.heads,
+        'loops': opt.loops,
         'dropout': opt.dropout,
     }
 
@@ -251,7 +269,7 @@ def main():
 
     opt.optimizers = make_optimizers(model, muon_lr=opt.muon_lr, adamw_lr=opt.lr)
     batches_per_epoch = max(1, len(opt.train) // (opt.batchsize * opt.seqlen))
-    opt.total_steps = max(1, opt.epochs * batches_per_epoch)
+    opt.total_steps = max(1, opt.epochs * batches_per_epoch // max(1, opt.grad_accum))
 
     train_losses, valid_losses = train_model(model, opt)
     test_loss = test_model(model, opt, -1)
