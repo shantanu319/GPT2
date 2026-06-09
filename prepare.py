@@ -1,4 +1,8 @@
-"""Offline data prep: train a BPE tokenizer and emit .bin shards for cosmopedia.
+"""Offline data prep: train a BPE tokenizer and emit .bin shards for a mixed corpus.
+
+The corpus is a weighted interleave of several HuggingFace streams (see SOURCES):
+synthetic textbooks (cosmopedia-v2), real educational web text (fineweb-edu-dedup),
+math (FineMath-4+, OpenMathInstruct-2 worked solutions) and physics (CAMEL physics).
 
 Run once to produce:
   {output_dir}/tokenizer.json
@@ -11,6 +15,9 @@ Then train.py points at {output_dir} and mmaps the .bin files directly.
 import argparse
 import multiprocessing as mp
 import os
+import random
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 from datasets import load_dataset
@@ -20,8 +27,36 @@ from data import BIN_DTYPE
 from tokenizer import BPETokenizer
 
 
-DATASET_PATH = 'HuggingFaceTB/smollm-corpus'
-DATASET_CONFIG = 'cosmopedia-v2'
+def _render_text(row):
+    return row['text']
+
+
+def _render_problem_solution(row):
+    return f"Problem:\n{row['problem']}\n\nSolution:\n{row['generated_solution']}"
+
+
+def _render_camel(row):
+    return f"Problem:\n{row['message_1']}\n\nSolution:\n{row['message_2']}"
+
+
+@dataclass(frozen=True)
+class Source:
+    name: str
+    path: str
+    config: Optional[str]
+    weight: float
+    render: Callable
+
+
+# Weighted pretraining mixture (SmolLM2-135M-style: keep a synthetic-textbook
+# backbone, add real web for register diversity, then math + physics).
+SOURCES = [
+    Source('cosmopedia',  'HuggingFaceTB/smollm-corpus', 'cosmopedia-v2',      0.55, _render_text),
+    Source('fineweb-edu', 'HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup',  0.20, _render_text),
+    Source('finemath',    'HuggingFaceTB/finemath',      'finemath-4plus',     0.15, _render_text),
+    Source('openmath',    'nvidia/OpenMathInstruct-2',   None,                 0.05, _render_problem_solution),
+    Source('camel-physics', 'camel-ai/physics',          None,                 0.05, _render_camel),
+]
 
 # Worker-process state, populated once per worker by _init_worker.
 _WORKER_TOKENIZER = None
@@ -44,17 +79,41 @@ def _worker_encode(text):
     return arr
 
 
-def _bpe_training_corpus(dataset, num_docs):
+def _open_stream(source):
+    ds = load_dataset(source.path, source.config, split='train', streaming=True)
+    for row in ds:
+        yield source.render(row)
+
+
+def mixed_stream(sources=SOURCES, seed=1337):
+    """Yield rendered docs sampled across sources proportionally to weight.
+
+    Deterministic for a fixed seed. When a source is exhausted it is dropped
+    and the remaining weights are renormalized, so small sets (e.g. CAMEL
+    physics, ~20k rows) mix in early and the stream keeps going."""
+    rng = random.Random(seed)
+    iters = [(s.name, _open_stream(s), s.weight) for s in sources]
+    while iters:
+        names, streams, weights = zip(*iters)
+        idx = rng.choices(range(len(iters)), weights=weights)[0]
+        try:
+            yield next(streams[idx])
+        except StopIteration:
+            print(f"  source '{names[idx]}' exhausted — renormalizing mixture")
+            iters.pop(idx)
+
+
+def _bpe_training_corpus(stream, num_docs):
     texts = []
-    for i, row in enumerate(dataset):
+    for i, text in enumerate(stream):
         if i >= num_docs:
             break
-        texts.append(row['text'])
+        texts.append(text)
     return '\n'.join(texts)
 
 
-def _encode_row(tokenizer, row, eos_id):
-    ids = tokenizer.encode_ordinary(row['text'])
+def _encode_text(tokenizer, text, eos_id):
+    ids = tokenizer.encode_ordinary(text)
     ids.append(eos_id)
     arr = np.array(ids, dtype=BIN_DTYPE)
     if arr.size and arr.max() >= np.iinfo(BIN_DTYPE).max:
@@ -62,22 +121,20 @@ def _encode_row(tokenizer, row, eos_id):
     return arr
 
 
-def _iter_encoded(tokenizer, tokenizer_path, dataset, eos_id, max_docs, num_workers):
+def _iter_encoded(tokenizer, tokenizer_path, stream, eos_id, max_docs, num_workers):
     """Yield (doc_index, encoded_array) preserving doc order.
 
     Uses a process pool when num_workers > 1; falls back to in-process
     serial encoding otherwise."""
     def texts():
-        for i, row in enumerate(dataset):
+        for i, text in enumerate(stream):
             if max_docs is not None and i >= max_docs:
                 break
-            yield row['text']
+            yield text
 
     if num_workers <= 1:
-        for i, row in enumerate(dataset):
-            if max_docs is not None and i >= max_docs:
-                break
-            yield i, _encode_row(tokenizer, row, eos_id)
+        for i, text in enumerate(texts()):
+            yield i, _encode_text(tokenizer, text, eos_id)
         return
 
     # Fork beats spawn here by ~3-4x (no Python re-import cost per worker, and
@@ -87,10 +144,8 @@ def _iter_encoded(tokenizer, tokenizer_path, dataset, eos_id, max_docs, num_work
     try:
         ctx = mp.get_context('fork')
     except ValueError:
-        for i, row in enumerate(dataset):
-            if max_docs is not None and i >= max_docs:
-                break
-            yield i, _encode_row(tokenizer, row, eos_id)
+        for i, text in enumerate(texts()):
+            yield i, _encode_text(tokenizer, text, eos_id)
         return
 
     with ctx.Pool(processes=num_workers,
@@ -101,7 +156,7 @@ def _iter_encoded(tokenizer, tokenizer_path, dataset, eos_id, max_docs, num_work
 
 
 def _tokenize_stream_three_bins(
-    tokenizer, tokenizer_path, dataset, eos_id, train_path, val_path, test_path,
+    tokenizer, tokenizer_path, stream, eos_id, train_path, val_path, test_path,
     max_docs=None, holdout_period=500, num_workers=1,
 ):
     """Single-pass streaming tokenize into three .bin shards.
@@ -112,7 +167,7 @@ def _tokenize_stream_three_bins(
     val_tokens = 0
     test_tokens = 0
     with open(train_path, 'wb') as trf, open(val_path, 'wb') as vf, open(test_path, 'wb') as tf:
-        for i, arr in _iter_encoded(tokenizer, tokenizer_path, dataset, eos_id,
+        for i, arr in _iter_encoded(tokenizer, tokenizer_path, stream, eos_id,
                                      max_docs, num_workers):
             bucket = i % holdout_period
             if bucket == 0:
@@ -130,21 +185,19 @@ def _tokenize_stream_three_bins(
     return train_tokens, val_tokens, test_tokens
 
 
-def _load_stream():
-    return load_dataset(DATASET_PATH, DATASET_CONFIG, split='train', streaming=True)
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', default='data_cache/cosmopedia')
     parser.add_argument('--vocab-size', type=int, default=32000,
                         help='Total vocab size including special tokens')
     parser.add_argument('--bpe-train-docs', type=int, default=10000,
-                        help='Number of docs to use for BPE training')
+                        help='Number of docs (from the mixed stream) for BPE training')
     parser.add_argument('--max-train-docs', type=int, default=None,
-                        help='Cap for tokenizing train split (default: full stream)')
+                        help='Cap for tokenizing the mixed stream (default: full stream)')
     parser.add_argument('--holdout-period', type=int, default=500,
                         help='Reserve 1-in-N docs each for val and test from the train stream.')
+    parser.add_argument('--seed', type=int, default=1337,
+                        help='Seed for the weighted source interleave')
     args = parser.parse_args()
 
     assert args.vocab_size > 256, "vocab_size must leave room for base bytes"
@@ -160,8 +213,11 @@ def main():
     eos_id = specials[EOS_TOKEN]
     tokenizer = BPETokenizer(special_tokens=specials)
 
-    print(f"Loading {args.bpe_train_docs} docs from cosmopedia for BPE training...")
-    bpe_corpus = _bpe_training_corpus(_load_stream(), args.bpe_train_docs)
+    mix_desc = ', '.join(f"{s.name}={s.weight:.0%}" for s in SOURCES)
+    print(f"Mixture: {mix_desc}")
+
+    print(f"Loading {args.bpe_train_docs} mixed docs for BPE training...")
+    bpe_corpus = _bpe_training_corpus(mixed_stream(seed=args.seed), args.bpe_train_docs)
     print(f"  BPE training corpus: {len(bpe_corpus):,} chars")
 
     target_ordinary_vocab = args.vocab_size - len(tokenizer.special_tokens)
@@ -176,10 +232,11 @@ def main():
     val_path = os.path.join(args.output_dir, 'val.bin')
     test_path = os.path.join(args.output_dir, 'test.bin')
 
-    print(f"Tokenizing cosmopedia stream into train/val/test "
+    print(f"Tokenizing mixed stream into train/val/test "
           f"(holdout 2-in-{args.holdout_period}, num_workers={num_workers})...")
     n_train, n_val, n_test = _tokenize_stream_three_bins(
-        tokenizer, tok_path, _load_stream(), eos_id, train_path, val_path, test_path,
+        tokenizer, tok_path, mixed_stream(seed=args.seed), eos_id,
+        train_path, val_path, test_path,
         max_docs=args.max_train_docs, holdout_period=args.holdout_period,
         num_workers=num_workers,
     )

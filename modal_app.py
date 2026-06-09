@@ -81,7 +81,7 @@ def prepare(
     max_train_docs: int = 0,
     holdout_period: int = 500,
 ):
-    """Download cosmopedia, train BPE, emit train/val/test.bin into the volume.
+    """Stream the mixed corpus (see prepare.SOURCES), train BPE, emit train/val/test.bin into the volume.
 
     max_train_docs=0 means no cap (full stream)."""
     import os

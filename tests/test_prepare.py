@@ -2,7 +2,7 @@
 import numpy as np
 
 from data import BIN_DTYPE
-from prepare import _iter_encoded, _tokenize_stream_three_bins
+from prepare import _iter_encoded, _tokenize_stream_three_bins, mixed_stream, Source
 from tokenizer import BPETokenizer
 
 
@@ -34,7 +34,7 @@ def _train_tokenizer(tmp_path):
 
 
 def _rows():
-    return [{'text': t} for t in TEXTS]
+    return list(TEXTS)
 
 
 def test_iter_encoded_parallel_matches_serial(tmp_path):
@@ -83,3 +83,37 @@ def test_three_bins_parallel_byte_equal_to_serial(tmp_path):
     assert s_train.read_bytes() == p_train.read_bytes()
     assert s_val.read_bytes() == p_val.read_bytes()
     assert s_test.read_bytes() == p_test.read_bytes()
+
+
+def _fake_sources(monkeypatch, docs_by_name, weights):
+    import prepare
+
+    def fake_open(source):
+        return iter(docs_by_name[source.name])
+
+    monkeypatch.setattr(prepare, '_open_stream', fake_open)
+    return [Source(name, 'path', None, w, lambda r: r)
+            for name, w in weights.items()]
+
+
+def test_mixed_stream_deterministic_and_complete(monkeypatch):
+    docs = {'a': [f"a{i}" for i in range(50)], 'b': [f"b{i}" for i in range(10)]}
+    sources = _fake_sources(monkeypatch, docs, {'a': 0.8, 'b': 0.2})
+
+    out1 = list(mixed_stream(sources, seed=7))
+    out2 = list(mixed_stream(sources, seed=7))
+    assert out1 == out2  # deterministic for a fixed seed
+    # every doc from every source is consumed exactly once
+    assert sorted(out1) == sorted(docs['a'] + docs['b'])
+    # per-source doc order is preserved
+    assert [d for d in out1 if d.startswith('a')] == docs['a']
+
+
+def test_mixed_stream_renormalizes_on_exhaustion(monkeypatch):
+    docs = {'big': [f"x{i}" for i in range(200)], 'tiny': ['t0', 't1']}
+    sources = _fake_sources(monkeypatch, docs, {'big': 0.5, 'tiny': 0.5})
+
+    out = list(mixed_stream(sources, seed=3))
+    # tiny exhausts early but the stream still drains the big source
+    assert len(out) == 202
+    assert out.count('t0') == 1 and out.count('t1') == 1
