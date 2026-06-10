@@ -1,6 +1,6 @@
 Initially, this repository was an implementation of GPT2, from scratch, using PyTorch. It was trained on the WikiText dataset and then subsequently abandoned. I spent some time revamping the project, adding new features, and training it on the cosmopedia dataset. I also wrote a tokenizer for the model, using the Byte Pair Encoding algorithm. The main changes I made were to modernize it, add RoPE embeddings, SwiGLU activations, and RMSNorm layers. I also added a chat interface for the model, using clap + rustyline (essentially a rust wrapper around the python inference server).
 
-The model itself lives in model.py and is a pretty standard pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. RoPE is baked into each attention block — I precompute the cos/sin buffers once at construction time and apply them to the per-head q/k tensors. I stuck with a hand-rolled scaled-dot-product attention instead of the fused F.scaled_dot_product_attention so the mask + dropout plumbing stays visible. The default config is roughly 8M trainable params at d_model=256, 6 layers, 4 heads, seqlen=256 — small enough to fit an overnight run on an M3 Air (what I've been testing the pipeline on). Although I need a GPU cluster of some kind to perform a more complete training run and maybe scale up to 100M parameters.
+The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is fused SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and halving the KV cache), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±30. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params). Local default is ~8M at d_model=256; the Modal default is ~84M at d_model=640, 14 layers, 10 heads (5 KV).
 
 The tokenizer (tokenizer.py) is a minbpe-style byte-level BPE with the GPT-2 pre-tokenization regex bolted on. It's stdlib-only — no tiktoken or sentencepiece — so the merge loop is transparent and hackable. prepare.py streams a weighted mixture of HuggingFace datasets (SmolLM2-style recipe: 55% cosmopedia-v2 synthetic textbooks, 20% fineweb-edu-dedup real web, 15% FineMath-4+, 5% OpenMathInstruct-2 worked math solutions, 5% CAMEL physics Q/A — see SOURCES in prepare.py), trains BPE on the first N mixed docs (10k by default, so the vocab sees LaTeX/digits), then re-tokenizes the mixed stream into train.bin/val.bin/test.bin in a single pass via a deterministic 1-in-N holdout split. Small sources that run dry are dropped and weights renormalized; the interleave is seeded so a re-run is byte-identical. The .bin shards are raw uint16 token arrays separated by <|endoftext|>, which train.py mmaps for zero-copy batch sampling.
 
@@ -21,26 +21,19 @@ EPOCHS=1 WARMUP_STEPS=300 \
 
 Running on a Modal GPU:
 
-modal_app.py packages the same prepare -> train flow onto Modal so I can burn through the cosmopedia stream on a cloud GPU instead of the M3 Air. One-time setup is `pip install modal && modal setup` (opens a browser to link your account). A named Modal Volume (`myowntransformer-data`) holds the tokenizer + .bin shards + checkpoints, so the data prep only runs once and re-training reuses it.
+modal_app.py packages prepare -> train -> sft_prepare -> sft onto Modal (H100). One-time setup is `pip install modal && modal setup`, plus an HF token so the dataset streams aren't rate-limited: `modal secret create huggingface HF_TOKEN=hf_...`. A named Modal Volume (`myowntransformer-data`) holds the tokenizer + .bin shards + checkpoints, so data prep only runs once and re-training reuses it. prepare reuses an existing tokenizer.json (delete it to force a vocab rebuild) and retries automatically when Modal preempts the worker.
 
-Common invocations:
-    modal run modal_app.py                        # prepare (if needed) + train, defaults on an L4
-    modal run modal_app.py --d-model 384 --n-layers 5 --heads 6 \
-        --seqlen 512 --batchsize 16 --epochs 1 --warmup-steps 300
-    modal run modal_app.py --force-prepare        # rebuild BPE + .bin shards on the volume
-    modal run modal_app.py::prepare               # just prep, no training
-    modal run modal_app.py::train --epochs 2      # just train, reuse existing volume data
-    modal run modal_app.py --bpe-train-docs 500 --epochs 1   # cheap smoke run
+The recommended entrypoint is the watcher — it launches the whole chain server-side and detached (so a laptop sleep can't kill it; each stage skips itself if its artifact already exists), then polls the volume and pulls everything into ./modal_out when sft_final.pt appears:
+    ./watch_pipeline.sh                               # launch + watch + auto-pull
+    SKIP_LAUNCH=1 ./watch_pipeline.sh                 # just watch an existing run
+    tail -f watch_pipeline.log                        # timestamped milestones
 
-Pulling artifacts back once a run finishes (replace `40M_run` with whatever `--dir-name` you used; default is `modal_run`):
-    modal volume get myowntransformer-data /saved/40M_run ./modal_out/40M_run
-    modal volume get myowntransformer-data /saved/40M_run_learning_curves.png ./modal_out/40M_run_learning_curves.png
-
-    # or grab everything under /saved at once:
-    modal volume get myowntransformer-data /saved ./modal_out
-The checkpoints land at ./modal_out/<dir_name>/ckpt_*.pt and the plot at ./modal_out/<dir_name>_learning_curves.png.
-
-GPU choice lives in modal_app.py (`gpu="L4"` — roughly $0.80/hr, plenty for the default 8M config). Bump it to `"L40S"` or `"A100"` if you scale the model up. Timeout is 8h; drop it if you want tighter cost guardrails.
+Piecemeal invocations still work:
+    modal run --detach modal_app.py::pipeline         # the same server-side chain
+    modal run modal_app.py::prepare                   # just data prep
+    modal run modal_app.py::train --epochs 2          # just pretrain
+    modal run modal_app.py::sft --checkpoint chat90m/ckpt_final.pt
+    modal volume get myowntransformer-data /saved ./modal_out   # pull artifacts manually
 
 Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping, GQA (`-kv_heads`, default 5 of 10 heads on Modal — saves params + halves the KV cache), partial RoPE (rotate half the head dims), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds Muon weight decay, gradient accumulation (`-grad_accum`), and capped mid-epoch validation (`-val_every`).
 
@@ -56,6 +49,10 @@ Posttraining (chat SFT, target: chat-able under 100M params):
     # local chat with an SFT checkpoint (ChatML template auto-enabled when specials exist):
     python sample.py --checkpoint sft_final.pt --prompt "hi there" --chat
     python chat_server.py --checkpoint sft_final.pt --data-dir data_cache/cosmopedia   # add --raw for pretrain ckpts
+
+Evaluation (evaluate.py): zero-shot multiple-choice in the lm-evaluation-harness style — each answer choice is scored by total log-likelihood (acc) and per-token log-likelihood (acc_norm), the standard for sub-100M models where generation evals are mostly noise. Supports arc_easy, arc_challenge, hellaswag, piqa; --chat wraps each question in the ChatML template so SFT checkpoints are scored in-distribution. Expect modest but above-chance numbers at this scale; compare base vs SFT to check posttraining didn't cost capability.
+    python evaluate.py --checkpoint modal_out/chat90m_sft/sft_final.pt \
+        --tokenizer modal_out/tokenizer.json --tasks arc_easy,hellaswag,piqa --limit 500
 
 If you want to try it yourself, download the latest weights here: 
 https://drive.google.com/file/d/1dS8MitkyJ7bBKZWqizLYizwkZ7WSJR_f/view?usp=sharing
