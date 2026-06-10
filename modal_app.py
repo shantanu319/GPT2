@@ -277,6 +277,49 @@ def sft(
     print(f"Download with: modal volume get {VOLUME_NAME} /saved/{dir_name} ./modal_out/{dir_name}")
 
 
+@app.function(
+    volumes={VOL_MOUNT: vol},
+    gpu="H100",
+    timeout=60 * 60 * 12,
+    secrets=[hf_secret],
+    retries=modal.Retries(max_retries=5, initial_delay=10.0),
+)
+def pipeline(
+    force_prepare: bool = False,
+    max_train_docs: int = 200000,
+    batchsize: int = 64,
+    grad_accum: int = 2,
+    save_every: int = 1000,
+    val_every: int = 1000,
+    warmup_steps: int = 300,
+    dir_name: str = "chat90m",
+    sft_epochs: int = 1,
+    sft_dir_name: str = "chat90m_sft",
+):
+    """Server-side chain: prepare -> train -> sft_prepare -> sft.
+
+    Runs entirely on one detached worker so a local disconnect can't kill it.
+    Every stage skips itself if its artifact already exists, so retries resume
+    from the last finished stage."""
+    import os
+
+    marker = f"{DATA_DIR}/prepare_done.marker"
+    if not os.path.exists(marker):
+        prepare.local(force=force_prepare, max_train_docs=max_train_docs)
+        open(marker, "w").write("ok")
+        vol.commit()
+    if not os.path.exists(f"{SAVE_ROOT}/{dir_name}/ckpt_final.pt"):
+        train.local(
+            batchsize=batchsize, grad_accum=grad_accum, save_every=save_every,
+            val_every=val_every, warmup_steps=warmup_steps, dir_name=dir_name,
+        )
+    sft_prepare.local()
+    if not os.path.exists(f"{SAVE_ROOT}/{sft_dir_name}/sft_final.pt"):
+        sft.local(checkpoint=f"{dir_name}/ckpt_final.pt",
+                  epochs=sft_epochs, dir_name=sft_dir_name)
+    print("PIPELINE COMPLETE")
+
+
 @app.local_entrypoint()
 def main(
     force_prepare: bool = False,

@@ -1,40 +1,45 @@
 #!/bin/bash
-# Drives the full Modal pipeline (prepare -> pretrain -> SFT) and logs only
-# milestones with timestamps. When everything finishes it pulls the SFT
-# weights + tokenizer back to ./modal_out so they can be tested locally.
+# Launches the server-side pipeline (prepare -> pretrain -> sft) DETACHED on
+# Modal, then polls the volume for the final SFT checkpoint. Survives laptop
+# sleep/disconnects: the run lives entirely on Modal; this script only watches.
 #
-# Usage: ./watch_pipeline.sh [extra modal-run args...]
+# Usage: ./watch_pipeline.sh            # launch + watch
+#        SKIP_LAUNCH=1 ./watch_pipeline.sh   # just watch an existing run
 set -uo pipefail
 
 DIR_NAME="${DIR_NAME:-chat90m}"
 SFT_DIR_NAME="${SFT_DIR_NAME:-chat90m_sft}"
+VOLUME=myowntransformer-data
 LOG=watch_pipeline.log
 : > "$LOG"
 
-stamp() { while IFS= read -r line; do echo "$(date +%H:%M:%S) $line"; done; }
+note() { echo "$(date +%H:%M:%S) $*" | tee -a "$LOG"; }
 
-echo "$(date +%H:%M:%S) launching pipeline (dir=$DIR_NAME, sft=$SFT_DIR_NAME)" | tee -a "$LOG"
-
-modal run modal_app.py \
-    --force-prepare --max-train-docs "${MAX_TRAIN_DOCS:-200000}" \
-    --batchsize 64 --grad-accum 2 \
-    --save-every 1000 --val-every 1000 --warmup-steps 300 \
-    --dir-name "$DIR_NAME" \
-    --run-sft --sft-epochs 1 --sft-dir-name "$SFT_DIR_NAME" \
-    "$@" 2>&1 |
-  grep --line-buffered -E \
-    'tokenized [0-9]+0000 docs|wrote .* tokens|Reusing|Saved tokenizer|exhausted|prepared|total params|step [0-9]+ \| Loss|Validation Loss|Saved checkpoint|finished|Test Loss|SFT val|saved .*sft|conversations|committed|Artifacts|Error|error|Traceback|preemption|interrupted' |
-  stamp | tee -a "$LOG"
-
-status=$?
-echo "$(date +%H:%M:%S) modal run exited with status $status" | tee -a "$LOG"
-
-if [ $status -eq 0 ]; then
-  echo "$(date +%H:%M:%S) pulling artifacts to ./modal_out ..." | tee -a "$LOG"
-  modal volume get --force myowntransformer-data "/saved/$SFT_DIR_NAME" "./modal_out/$SFT_DIR_NAME" 2>&1 | tail -1 | stamp | tee -a "$LOG"
-  modal volume get --force myowntransformer-data "/saved/$DIR_NAME/ckpt_final.pt" "./modal_out/$DIR_NAME/ckpt_final.pt" 2>&1 | tail -1 | stamp | tee -a "$LOG"
-  modal volume get --force myowntransformer-data /data_cache/cosmopedia/tokenizer.json ./modal_out/tokenizer.json 2>&1 | tail -1 | stamp | tee -a "$LOG"
-  echo "$(date +%H:%M:%S) DONE — weights in ./modal_out/$SFT_DIR_NAME" | tee -a "$LOG"
-else
-  echo "$(date +%H:%M:%S) PIPELINE FAILED — check modal app logs" | tee -a "$LOG"
+if [ -z "${SKIP_LAUNCH:-}" ]; then
+  note "launching detached pipeline (dir=$DIR_NAME, sft=$SFT_DIR_NAME)"
+  modal run --detach modal_app.py::pipeline \
+      --force-prepare \
+      --dir-name "$DIR_NAME" --sft-dir-name "$SFT_DIR_NAME" \
+      > /dev/null 2>&1 &
+  sleep 60
 fi
+
+note "watching volume for /saved/$SFT_DIR_NAME/sft_final.pt (poll: 5 min)"
+while true; do
+  if modal volume ls "$VOLUME" "saved/$SFT_DIR_NAME" 2>/dev/null | grep -q sft_final.pt; then
+    note "sft_final.pt found — pulling artifacts"
+    break
+  fi
+  ckpts=$(modal volume ls "$VOLUME" "saved/$DIR_NAME" 2>/dev/null | grep -c 'ckpt_' || true)
+  apps=$(modal app list 2>/dev/null | grep -c ephemeral || true)
+  note "poll: pretrain_ckpts=$ckpts live_apps=$apps"
+  if [ "$apps" -eq 0 ] && [ "$ckpts" -eq 0 ]; then
+    note "WARNING: no live app and no checkpoints — pipeline may have died"
+  fi
+  sleep 300
+done
+
+modal volume get --force "$VOLUME" "/saved/$SFT_DIR_NAME" "./modal_out/$SFT_DIR_NAME" 2>&1 | tail -1 | tee -a "$LOG"
+modal volume get --force "$VOLUME" "/saved/$DIR_NAME/ckpt_final.pt" "./modal_out/$DIR_NAME/ckpt_final.pt" 2>&1 | tail -1 | tee -a "$LOG"
+modal volume get --force "$VOLUME" /data_cache/cosmopedia/tokenizer.json ./modal_out/tokenizer.json 2>&1 | tail -1 | tee -a "$LOG"
+note "DONE — weights in ./modal_out/$SFT_DIR_NAME"
