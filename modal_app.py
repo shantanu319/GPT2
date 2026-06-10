@@ -68,11 +68,16 @@ image = (
 app = modal.App(APP_NAME, image=image)
 vol = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
+# HF_TOKEN raises HuggingFace streaming rate limits ~40x for anonymous reads.
+# Create once with: modal secret create huggingface HF_TOKEN=hf_...
+hf_secret = modal.Secret.from_name("huggingface")
+
 
 @app.function(
     volumes={VOL_MOUNT: vol},
     cpu=4.0,
     timeout=60 * 60 * 6,
+    secrets=[hf_secret],
 )
 def prepare(
     force: bool = False,
@@ -186,6 +191,7 @@ def train(
     volumes={VOL_MOUNT: vol},
     cpu=4.0,
     timeout=60 * 60 * 4,
+    secrets=[hf_secret],
 )
 def sft_prepare(
     force: bool = False,
