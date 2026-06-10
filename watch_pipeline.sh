@@ -16,7 +16,7 @@ stamp() { while IFS= read -r line; do echo "$(date +%H:%M:%S) $line"; done; }
 echo "$(date +%H:%M:%S) launching pipeline (dir=$DIR_NAME, sft=$SFT_DIR_NAME)" | tee -a "$LOG"
 
 modal run modal_app.py \
-    --force-prepare --max-train-docs 600000 \
+    --force-prepare --max-train-docs "${MAX_TRAIN_DOCS:-200000}" \
     --batchsize 64 --grad-accum 2 \
     --save-every 1000 --val-every 1000 --warmup-steps 300 \
     --dir-name "$DIR_NAME" \

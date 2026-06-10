@@ -78,6 +78,7 @@ hf_secret = modal.Secret.from_name("huggingface")
     cpu=4.0,
     timeout=60 * 60 * 6,
     secrets=[hf_secret],
+    retries=modal.Retries(max_retries=5, initial_delay=10.0),
 )
 def prepare(
     force: bool = False,
@@ -192,6 +193,7 @@ def train(
     cpu=4.0,
     timeout=60 * 60 * 4,
     secrets=[hf_secret],
+    retries=modal.Retries(max_retries=5, initial_delay=10.0),
 )
 def sft_prepare(
     force: bool = False,
