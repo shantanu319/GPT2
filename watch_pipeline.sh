@@ -31,10 +31,12 @@ while true; do
     break
   fi
   ckpts=$(modal volume ls "$VOLUME" "saved/$DIR_NAME" 2>/dev/null | grep -c 'ckpt_' || true)
-  apps=$(modal app list 2>/dev/null | grep -c ephemeral || true)
-  note "poll: pretrain_ckpts=$ckpts live_apps=$apps"
-  if [ "$apps" -eq 0 ] && [ "$ckpts" -eq 0 ]; then
-    note "WARNING: no live app and no checkpoints — pipeline may have died"
+  tasks=$(modal app list --json 2>/dev/null | python3 -c \
+    "import json,sys; print(sum(a.get('Tasks',0) for a in json.load(sys.stdin) if a.get('State','').startswith('ephemeral')))" \
+    2>/dev/null || echo "?")
+  note "poll: pretrain_ckpts=$ckpts running_tasks=$tasks"
+  if [ "$tasks" = "0" ]; then
+    note "WARNING: no running tasks — pipeline likely dead; relaunch with ./watch_pipeline.sh"
   fi
   sleep 300
 done

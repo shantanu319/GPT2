@@ -135,6 +135,7 @@ def train(
     val_every: int = 2000,
     printevery: int = 50,
     dir_name: str = "modal_run",
+    loadname: str = "",
 ):
     """Run train.py on a GPU, writing checkpoints + plot into the volume."""
     import os
@@ -156,9 +157,11 @@ def train(
         os.symlink(SAVE_ROOT, "/root/src/saved")
 
     env = {**os.environ, "MPLBACKEND": "Agg"}
+    extra = ["-loadname", loadname] if loadname else []
     subprocess.run(
         [
             "python", "-u", "train.py",
+            *extra,
             "-data_dir", DATA_DIR,
             "-dir_name", dir_name,
             "-d_model", str(d_model),
@@ -309,9 +312,22 @@ def pipeline(
         open(marker, "w").write("ok")
         vol.commit()
     if not os.path.exists(f"{SAVE_ROOT}/{dir_name}/ckpt_final.pt"):
+        # Resume weights from the newest periodic checkpoint if one survived
+        # a previous attempt (LR schedule restarts, which is fine).
+        loadname = ""
+        ckpt_dir = f"{SAVE_ROOT}/{dir_name}"
+        if os.path.isdir(ckpt_dir):
+            steps = sorted(
+                (int(f[len('ckpt_step'):-3]), f) for f in os.listdir(ckpt_dir)
+                if f.startswith('ckpt_step') and f.endswith('.pt')
+            )
+            if steps:
+                loadname = f"{ckpt_dir}/{steps[-1][1]}"
+                print(f"resuming pretrain from {loadname}")
         train.local(
             batchsize=batchsize, grad_accum=grad_accum, save_every=save_every,
             val_every=val_every, warmup_steps=warmup_steps, dir_name=dir_name,
+            loadname=loadname,
         )
     sft_prepare.local()
     if not os.path.exists(f"{SAVE_ROOT}/{sft_dir_name}/sft_final.pt"):
