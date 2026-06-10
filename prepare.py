@@ -211,22 +211,32 @@ def main():
     # no embedding resize; they're simply unused during pretraining.
     specials = special_token_map(args.vocab_size)
     eos_id = specials[EOS_TOKEN]
-    tokenizer = BPETokenizer(special_tokens=specials)
 
     mix_desc = ', '.join(f"{s.name}={s.weight:.0%}" for s in SOURCES)
     print(f"Mixture: {mix_desc}")
 
-    print(f"Loading {args.bpe_train_docs} mixed docs for BPE training...")
-    bpe_corpus = _bpe_training_corpus(mixed_stream(seed=args.seed), args.bpe_train_docs)
-    print(f"  BPE training corpus: {len(bpe_corpus):,} chars")
-
-    target_ordinary_vocab = args.vocab_size - len(tokenizer.special_tokens)
-    print(f"Training BPE to {target_ordinary_vocab} ordinary tokens (+{len(tokenizer.special_tokens)} special)...")
-    tokenizer.train(bpe_corpus, vocab_size=target_ordinary_vocab, verbose=True)
-
     tok_path = os.path.join(args.output_dir, 'tokenizer.json')
-    tokenizer.save(tok_path)
-    print(f"Saved tokenizer: {tok_path}")
+    if os.path.exists(tok_path):
+        # Resume support: BPE is the expensive phase, so a preempted/restarted
+        # run reuses the saved tokenizer and goes straight to tokenizing.
+        # Delete tokenizer.json to force a retrain.
+        tokenizer = BPETokenizer()
+        tokenizer.load(tok_path)
+        assert tokenizer.vocab_size == args.vocab_size, \
+            f"existing tokenizer vocab {tokenizer.vocab_size} != requested {args.vocab_size}"
+        print(f"Reusing existing tokenizer: {tok_path}")
+    else:
+        tokenizer = BPETokenizer(special_tokens=specials)
+        print(f"Loading {args.bpe_train_docs} mixed docs for BPE training...")
+        bpe_corpus = _bpe_training_corpus(mixed_stream(seed=args.seed), args.bpe_train_docs)
+        print(f"  BPE training corpus: {len(bpe_corpus):,} chars")
+
+        target_ordinary_vocab = args.vocab_size - len(tokenizer.special_tokens)
+        print(f"Training BPE to {target_ordinary_vocab} ordinary tokens (+{len(tokenizer.special_tokens)} special)...")
+        tokenizer.train(bpe_corpus, vocab_size=target_ordinary_vocab, verbose=True)
+
+        tokenizer.save(tok_path)
+        print(f"Saved tokenizer: {tok_path}")
 
     train_path = os.path.join(args.output_dir, 'train.bin')
     val_path = os.path.join(args.output_dir, 'val.bin')
