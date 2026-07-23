@@ -21,9 +21,19 @@ EPOCHS=1 WARMUP_STEPS=300 \
 
 Running on a vast.ai GPU:
 
-vast_train.py runs the same prepare -> train -> sft_prepare -> sft chain on a rented vast.ai instance (plain ssh + rsync — no serverless glue). One-time setup: `pip install vastai python-dotenv`, then put `VAST_AI_API_KEY=...` (from https://cloud.vast.ai/manage-keys/) in .env.local. The current instance is tracked in .vast_instance.json so the commands chain; the meter runs until `destroy`, so pull artifacts first. Set HF_TOKEN in .env.local to raise HuggingFace streaming rate limits during prepare.
+vast_train.py runs the same prepare -> train -> sft_prepare -> sft chain on a rented vast.ai instance (plain ssh + rsync — no serverless glue). One-time setup:
 
-    python vast_train.py smoke        # end-to-end check: cheap GPU box -> tiny train -> pull -> destroy
+    pip install vastai python-dotenv
+    echo 'VAST_AI_API_KEY=...' >> .env.local   # from https://cloud.vast.ai/manage-keys/
+
+Also: an SSH pubkey at ~/.ssh/id_ed25519.pub (attached to instances at create time — override the path with VAST_SSH_PUBKEY), and optionally HF_TOKEN in .env.local to raise HuggingFace streaming rate limits during prepare.
+
+Sanity-check the whole loop first — it provisions a cheap GPU, runs a tiny train on it, pulls the checkpoint back, and destroys the instance (~6 min, under $0.01):
+
+    python vast_train.py smoke
+
+Then the usual flow. The current instance is tracked in .vast_instance.json so the commands chain; the meter runs until `destroy`, so pull artifacts first. Offers are filtered to GPUs torch 2.11 supports (compute_cap>=750):
+
     python vast_train.py create       # provision cheapest matching GPU (e.g. --query 'gpu_name=H100_SXM cuda_max_good>=12.8')
     python vast_train.py push         # rsync code + data_cache up
     python vast_train.py pipeline     # whole chain, detached on the instance (survives laptop sleep)
