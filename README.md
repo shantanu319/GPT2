@@ -25,16 +25,16 @@ The three tuned configurations that ship as defaults (vocab 32000 everywhere):
 
 | | local (`run.sh`) | vast.ai `pipeline` | vast.ai `train` |
 |---|---|---|---|
-| d_model / layers / heads | 256 / 6 / 4 (full MHA) | 512 / 6 / 8 (full MHA) | 640 / 14 / 10 (5 KV) |
-| seqlen / batch | 256 / 32 | 512 / 64 × grad-accum 2 | 1024 / 128 |
-| epochs | 1 | 20 | 1 |
+| d_model / layers / heads | 256 / 6 / 4 (full MHA) | 640 / 17 / 10 (5 KV) | 640 / 17 / 10 (5 KV) |
+| seqlen / batch | 256 / 32 | 1024 / 64 × grad-accum 2 | 1024 / 128 |
+| epochs | 1 | 1 | 1 |
 | peak LR (Muon / AdamW) | 0.02 / 3e-4 | 0.03 / 3e-4 | 0.03 / 3e-4 |
-| warmup / save / val cadence | 200 / 500 / epoch-end | 300 / 1000 / 1000 | 1000 / 2000 / 2000 |
-| parameters | **13.0M** (4.9M non-embedding) | **35.7M** (19.3M non-embedding) | **84.2M** (63.7M non-embedding) |
+| warmup / save / val cadence | 200 / 500 / epoch-end | 1000 / 1000 / 1000 | 1000 / 2000 / 2000 |
+| parameters | **13.0M** (4.9M non-embedding) | **97.9M** (77.4M non-embedding) | **97.9M** (77.4M non-embedding) |
 
-Note the middle column: `vast_train.py pipeline` (and therefore `watch_pipeline.sh`) does **not** pass model-shape flags, so it trains at `config.py`'s defaults (512/6/8 full MHA, 20 epochs) — the 84M config only applies when you invoke `vast_train.py train` directly or pass the flags yourself.
+The two vast.ai columns share the same ~98M shape — `pipeline` (and therefore `watch_pipeline.sh`) passes the same model-shape flags as `train`; they differ only in effective batch (64 × grad-accum 2 vs 128) and checkpoint cadence. Every knob is overridable per-run, e.g. `python vast_train.py pipeline --n-layers 18 --save-every 2000`.
 
-The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is fused SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and halving the KV cache), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±30. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params). Local default is ~13M at d_model=256; the `vast_train.py train` default is ~84M at d_model=640, 14 layers, 10 heads (5 KV) — see the config table above.
+The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is fused SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and halving the KV cache), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±30. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params). Local default is ~13M at d_model=256; the vast.ai default is ~98M at d_model=640, 17 layers, 10 heads (5 KV) — see the config table above.
 
 The tokenizer (tokenizer.py) is a minbpe-style byte-level BPE with the GPT-2 pre-tokenization regex bolted on. It's stdlib-only — no tiktoken or sentencepiece — so the merge loop is transparent and hackable. prepare.py streams a weighted mixture of HuggingFace datasets (SmolLM2-style recipe: 55% cosmopedia-v2 synthetic textbooks, 20% fineweb-edu-dedup real web, 15% FineMath-4+, 5% OpenMathInstruct-2 worked math solutions, 5% CAMEL physics Q/A — see SOURCES in prepare.py), trains BPE on the first N mixed docs (10k by default, so the vocab sees LaTeX/digits), then re-tokenizes the mixed stream into train.bin/val.bin/test.bin in a single pass via a deterministic 1-in-N holdout split. Small sources that run dry are dropped and weights renormalized; the interleave is seeded so a re-run is byte-identical. The .bin shards are raw uint16 token arrays separated by <|endoftext|>, which train.py mmaps for zero-copy batch sampling.
 
@@ -79,7 +79,7 @@ The recommended entrypoint for a full run is the watcher — it launches the cha
 
 Piecemeal invocations:
     python vast_train.py prepare                      # just data prep (skips if train.bin exists on the instance)
-    python vast_train.py train --epochs 2             # just pretrain (~84M defaults; add --detach)
+    python vast_train.py train --epochs 2             # just pretrain (~98M defaults; add --detach)
     python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
     python vast_train.py status                       # instance state + pipeline log tail
     python vast_train.py pull                         # rsync saved/ + tokenizer.json into ./vast_out

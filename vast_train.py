@@ -349,9 +349,12 @@ def cmd_pipeline(args):
         hf_export=(f"export HF_TOKEN={os.environ['HF_TOKEN']}"
                    if os.environ.get("HF_TOKEN") else ""),
         prepare_args=(f"--max-train-docs {args.max_train_docs}" if args.max_train_docs > 0 else ""),
-        train_args=(f"-batchsize {args.batchsize} -grad_accum {args.grad_accum} "
-                    f"-save_every {args.save_every} -val_every {args.val_every} "
-                    f"-warmup_steps {args.warmup_steps}"),
+        train_args=(f"-d_model {args.d_model} -n_layers {args.n_layers} -heads {args.heads} "
+                    f"-kv_heads {args.kv_heads} -loops {args.loops} "
+                    f"-batchsize {args.batchsize} -grad_accum {args.grad_accum} "
+                    f"-seqlen {args.seqlen} -epochs {args.epochs} "
+                    f"-lr {args.lr} -muon_lr {args.muon_lr} -warmup_steps {args.warmup_steps} "
+                    f"-save_every {args.save_every} -val_every {args.val_every}"),
         sft_args=f"--epochs {args.sft_epochs}",
     )
     subprocess.run(ssh_prefix(state) + [f"cat > {REMOTE_ROOT}/remote_pipeline.sh"],
@@ -518,9 +521,9 @@ def main():
     sp.add_argument("--holdout-period", type=int, default=500)
     sp.set_defaults(fn=cmd_prepare)
 
-    sp = sub.add_parser("train", help="pretrain on the instance (~84M defaults)")
+    sp = sub.add_parser("train", help="pretrain on the instance (~98M defaults)")
     sp.add_argument("--d-model", type=int, default=640)
-    sp.add_argument("--n-layers", type=int, default=14)
+    sp.add_argument("--n-layers", type=int, default=17)
     sp.add_argument("--heads", type=int, default=10)
     sp.add_argument("--kv-heads", type=int, default=5)
     sp.add_argument("--loops", type=int, default=1)
@@ -560,15 +563,24 @@ def main():
     sp.add_argument("--detach", action="store_true")
     sp.set_defaults(fn=cmd_sft)
 
-    sp = sub.add_parser("pipeline", help="prepare -> pretrain -> sft, detached + resumable")
+    sp = sub.add_parser("pipeline", help="prepare -> pretrain -> sft, detached + resumable (~98M defaults)")
     sp.add_argument("--dir-name", default="vast_run")
     sp.add_argument("--sft-dir-name", default="vast_run_sft")
     sp.add_argument("--max-train-docs", type=int, default=0)
+    sp.add_argument("--d-model", type=int, default=640)
+    sp.add_argument("--n-layers", type=int, default=17)
+    sp.add_argument("--heads", type=int, default=10)
+    sp.add_argument("--kv-heads", type=int, default=5)
+    sp.add_argument("--loops", type=int, default=1)
     sp.add_argument("--batchsize", type=int, default=64)
     sp.add_argument("--grad-accum", type=int, default=2)
+    sp.add_argument("--seqlen", type=int, default=1024)
+    sp.add_argument("--epochs", type=int, default=1)
+    sp.add_argument("--lr", type=float, default=3e-4)
+    sp.add_argument("--muon-lr", type=float, default=0.03)
+    sp.add_argument("--warmup-steps", type=int, default=1000)
     sp.add_argument("--save-every", type=int, default=1000)
     sp.add_argument("--val-every", type=int, default=1000)
-    sp.add_argument("--warmup-steps", type=int, default=300)
     sp.add_argument("--sft-epochs", type=int, default=1)
     sp.set_defaults(fn=cmd_pipeline)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot pipeline: prepare data (if needed) -> train -> plot.
 #
-# All knobs are env-var overridable. Defaults target a ~8M-param
+# All knobs are env-var overridable. Defaults target a ~13M-param
 # cosmopedia run that should finish overnight on an M3 Air CPU.
 #
 #   ./run.sh                             # full pipeline with defaults
