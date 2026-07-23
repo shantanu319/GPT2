@@ -1,0 +1,6 @@
+12:07:49 launching detached pipeline (dir=chat90m, sft=chat90m_sft)
+12:08:49 watching volume for /saved/chat90m_sft/sft_final.pt (poll: 5 min)
+12:08:51 poll: pretrain_ckpts=1 running_tasks=0
+12:08:51 WARNING: no running tasks — pipeline likely dead; relaunch with ./watch_pipeline.sh
+12:13:53 poll: pretrain_ckpts=1 running_tasks=0
+12:13:53 WARNING: no running tasks — pipeline likely dead; relaunch with ./watch_pipeline.sh
