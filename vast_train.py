@@ -15,6 +15,8 @@ commands chain naturally:
     python vast_train.py train --detach                  #   ... or in background
     python vast_train.py sft-prepare
     python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
+    python vast_train.py dpo-prepare
+    python vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt
     python vast_train.py pull                            # rsync saved/ back to ./vast_out/
     python vast_train.py destroy                         # stop billing
 
@@ -68,6 +70,7 @@ export MPLBACKEND=Agg
 DATA={data_dir}
 DIR="{dir_name}"
 SFT="{sft_dir_name}"
+DPO="{dpo_dir_name}"
 step() {{ echo "[pipeline $(date +%H:%M:%S)] $*"; }}
 
 if [ ! -f "$DATA/train.bin" ]; then
@@ -97,6 +100,17 @@ if [ ! -f "saved/$SFT/sft_final.pt" ]; then
   step "sft"
   python -u finetune.py --checkpoint "saved/$DIR/ckpt_final.pt" --data-dir "$DATA" \
     --dir-name "$SFT" {sft_args} || exit 1
+fi
+
+if [ ! -f "$DATA/dpo_train.bin" ]; then
+  step "dpo_prepare"
+  python -u dpo_prepare.py --output-dir "$DATA" || exit 1
+fi
+
+if [ ! -f "saved/$DPO/dpo_final.pt" ]; then
+  step "dpo"
+  python -u dpo.py --checkpoint "saved/$SFT/sft_final.pt" --data-dir "$DATA" \
+    --dir-name "$DPO" {dpo_args} || exit 1
 fi
 
 echo "PIPELINE COMPLETE"
@@ -339,6 +353,35 @@ def cmd_sft(args):
         run_remote(state, cmd)
 
 
+def cmd_dpo_prepare(args):
+    state = load_state()
+    if not args.force:
+        rc = run_remote(state, f"test -f {REMOTE_ROOT}/{DATA_DIR}/dpo_train.bin", check=False).returncode
+        if rc == 0:
+            print("dpo_train.bin already exists on the instance (pass --force to rebuild)")
+            return
+    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u dpo_prepare.py --output-dir {DATA_DIR} "
+           f"--holdout-period {args.holdout_period}")
+    if args.max_pairs > 0:
+        cmd += f" --max-pairs {args.max_pairs}"
+    run_remote(state, cmd)
+
+
+def cmd_dpo(args):
+    state = load_state()
+    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u dpo.py "
+           f"--checkpoint {args.checkpoint} --data-dir {DATA_DIR} "
+           f"--epochs {args.epochs} --batchsize {args.batchsize} --beta {args.beta} "
+           f"--lr {args.lr} --muon-lr {args.muon_lr} --warmup-steps {args.warmup_steps} "
+           f"--save-every {args.save_every} --val-every {args.val_every} "
+           f"--dir-name {args.dir_name}")
+    if args.detach:
+        run_remote(state, f"nohup {cmd} > dpo_{args.dir_name}.log 2>&1 & echo detached pid $!")
+        print(f"detached; watch with `python vast_train.py ssh tail -f dpo_{args.dir_name}.log`")
+    else:
+        run_remote(state, cmd)
+
+
 def cmd_pipeline(args):
     state = load_state()
     script = PIPELINE_SCRIPT.format(
@@ -356,6 +399,9 @@ def cmd_pipeline(args):
                     f"-lr {args.lr} -muon_lr {args.muon_lr} -warmup_steps {args.warmup_steps} "
                     f"-save_every {args.save_every} -val_every {args.val_every}"),
         sft_args=f"--epochs {args.sft_epochs}",
+        dpo_dir_name=args.dpo_dir_name,
+        dpo_args=(f"--epochs {args.dpo_epochs} --batchsize {args.dpo_batchsize} "
+                  f"--beta {args.dpo_beta} --lr {args.dpo_lr} --muon-lr {args.dpo_muon_lr}"),
     )
     subprocess.run(ssh_prefix(state) + [f"cat > {REMOTE_ROOT}/remote_pipeline.sh"],
                    input=script.encode(), check=True)
@@ -563,7 +609,28 @@ def main():
     sp.add_argument("--detach", action="store_true")
     sp.set_defaults(fn=cmd_sft)
 
-    sp = sub.add_parser("pipeline", help="prepare -> pretrain -> sft, detached + resumable (~98M defaults)")
+    sp = sub.add_parser("dpo-prepare", help="tokenize DPO preference pairs on the instance")
+    sp.add_argument("--force", action="store_true")
+    sp.add_argument("--max-pairs", type=int, default=0)
+    sp.add_argument("--holdout-period", type=int, default=200)
+    sp.set_defaults(fn=cmd_dpo_prepare)
+
+    sp = sub.add_parser("dpo", help="DPO on top of an SFT checkpoint")
+    sp.add_argument("--checkpoint", required=True,
+                    help="path on the instance, e.g. saved/vast_run_sft/sft_final.pt")
+    sp.add_argument("--epochs", type=int, default=1)
+    sp.add_argument("--batchsize", type=int, default=8, help="preference pairs per step")
+    sp.add_argument("--beta", type=float, default=0.1)
+    sp.add_argument("--lr", type=float, default=1e-6)
+    sp.add_argument("--muon-lr", type=float, default=1e-4)
+    sp.add_argument("--warmup-steps", type=int, default=100)
+    sp.add_argument("--save-every", type=int, default=1000)
+    sp.add_argument("--val-every", type=int, default=500)
+    sp.add_argument("--dir-name", default="dpo_run")
+    sp.add_argument("--detach", action="store_true")
+    sp.set_defaults(fn=cmd_dpo)
+
+    sp = sub.add_parser("pipeline", help="prepare -> pretrain -> sft -> dpo, detached + resumable (~98M defaults)")
     sp.add_argument("--dir-name", default="vast_run")
     sp.add_argument("--sft-dir-name", default="vast_run_sft")
     sp.add_argument("--max-train-docs", type=int, default=0)
@@ -582,6 +649,12 @@ def main():
     sp.add_argument("--save-every", type=int, default=1000)
     sp.add_argument("--val-every", type=int, default=1000)
     sp.add_argument("--sft-epochs", type=int, default=1)
+    sp.add_argument("--dpo-dir-name", default="vast_run_dpo")
+    sp.add_argument("--dpo-epochs", type=int, default=1)
+    sp.add_argument("--dpo-batchsize", type=int, default=8)
+    sp.add_argument("--dpo-beta", type=float, default=0.1)
+    sp.add_argument("--dpo-lr", type=float, default=1e-6)
+    sp.add_argument("--dpo-muon-lr", type=float, default=1e-4)
     sp.set_defaults(fn=cmd_pipeline)
 
     sp = sub.add_parser("status", help="instance status + pipeline log tail")

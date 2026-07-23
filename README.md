@@ -9,6 +9,8 @@ Five stages, glued together by artifacts in `data_cache/cosmopedia/` and checkpo
                       ─ train.py ─────► saved/<run>/ckpt_step*.pt, ckpt_final.pt   (pretrain)
     smol-smoltalk ─ sft_prepare.py ─► sft_{train,val}.bin + uint8 loss masks
                       ─ finetune.py ─► saved/<run>/sft_final.pt                    (chat SFT)
+    ultrafeedback ─ dpo_prepare.py ─► dpo_{train,val}.bin + masks + pair index
+                      ─ dpo.py ──────► saved/<run>/dpo_final.pt                    (DPO)
                                        └► sample.py | chat_server.py + chat/ REPL | evaluate.py
 
 **1. Tokenizer + data (`tokenizer.py`, `prepare.py`, `data.py`).** Stdlib-only byte-level BPE with the GPT-2 pre-tokenization regex: 256 byte ids plus learned merges, vocab 32000 by default, with the 3 chat specials pinned to the top ids (`<|im_start|>`=vocab−3, `<|im_end|>`=vocab−2, `<|endoftext|>`=vocab−1) so SFT never has to resize the embedding. prepare.py streams a seeded (1337) weighted interleave — 55% cosmopedia-v2, 20% fineweb-edu-dedup, 15% FineMath-4+, 5% OpenMathInstruct-2, 5% CAMEL physics (sources that run dry are dropped and the weights renormalize) — trains the BPE on the first 10k mixed docs, then re-tokenizes the whole stream in a single pass, routing doc `i` to val if `i % 500 == 0`, to test if `== 1`, else to train (~0.4% held out; re-runs are byte-identical). The .bin shards are headerless little-endian uint16 with docs separated by a single `<|endoftext|>` id. data.py memmaps them and serves sequential (never shuffled) `(batch, seqlen)` windows, targets = inputs shifted by one.
@@ -19,7 +21,9 @@ Five stages, glued together by artifacts in `data_cache/cosmopedia/` and checkpo
 
 **4. Chat SFT (`sft_prepare.py`, `finetune.py`, `chat_format.py`).** smol-smoltalk conversations are rendered as ChatML — `<|im_start|>role\ncontent<|im_end|>\n` per turn, conversation closed with `<|endoftext|>` — and packed into `sft_*.bin` with an element-aligned uint8 loss mask: loss lands only on assistant body tokens, their closing `<|im_end|>`, and the final EOS. finetune.py rebuilds the model from the pretrain checkpoint's `config`, runs masked cross-entropy (per-token CE × mask, normalized by the mask sum) at lr 3e-5 AdamW / 3e-3 Muon with grad clip 1.0, and saves the same checkpoint format, so every inference tool works on SFT weights unchanged.
 
-**5. Inference + eval (`sample.py`, `chat_server.py`, `chat/`, `evaluate.py`).** Sampling is temperature + top-p (defaults 0.8 / 0.9) with a KV cache; when the window fills (`max_context`, 512 default) the cache is dropped and the last `max_context − 1` tokens are re-prefilled. chat_server.py is a long-lived JSON-lines stdin/stdout process holding multi-turn ChatML state (system turn on the first turn only, generation stops at `<|im_end|>`); the Rust CLI in `chat/` (clap + rustyline) just spawns it as a child and runs the REPL (`/reset`, `/quit`). evaluate.py scores arc_easy / arc_challenge / hellaswag / piqa lm-eval-harness style: argmax over answer choices of summed log-likelihood (`acc`) and per-token log-likelihood (`acc_norm`), with `--chat` to wrap questions in the ChatML template when scoring SFT checkpoints.
+**5. DPO (`dpo_prepare.py`, `dpo.py`).** Posttraining finishes with direct preference optimization. dpo_prepare.py streams HuggingFaceH4/ultrafeedback_binarized (61k GPT-4-ranked pairs), renders each chosen/rejected completion over the same ChatML prompt prefix (system + user, same template as SFT), and writes flat uint16 bins + masks plus an int32 pair index (`chosen_off, chosen_len, rejected_off, rejected_len` per pair) — no padding on disk. dpo.py loads the SFT checkpoint as the policy plus a frozen copy as the reference model, and minimizes `-log σ(β·[(π_c − ref_c) − (π_r − ref_r)])` where each term is the summed log-probability of completion tokens only. Batches are pairs (8/step default, padded in-memory with a causal ∧ not-pad attention mask), β = 0.1, lr 1e-6 AdamW / 1e-4 Muon, grad clip 1.0; logs the reward margin and preference accuracy alongside the loss. Same checkpoint format out, so the chat stack runs on DPO weights unchanged.
+
+**6. Inference + eval (`sample.py`, `chat_server.py`, `chat/`, `evaluate.py`).** Sampling is temperature + top-p (defaults 0.8 / 0.9) with a KV cache; when the window fills (`max_context`, 512 default) the cache is dropped and the last `max_context − 1` tokens are re-prefilled. chat_server.py is a long-lived JSON-lines stdin/stdout process holding multi-turn ChatML state (system turn on the first turn only, generation stops at `<|im_end|>`); the Rust CLI in `chat/` (clap + rustyline) just spawns it as a child and runs the REPL (`/reset`, `/quit`). evaluate.py scores arc_easy / arc_challenge / hellaswag / piqa lm-eval-harness style: argmax over answer choices of summed log-likelihood (`acc`) and per-token log-likelihood (`acc_norm`), with `--chat` to wrap questions in the ChatML template when scoring SFT checkpoints.
 
 The three tuned configurations that ship as defaults (vocab 32000 everywhere):
 
@@ -55,7 +59,7 @@ EPOCHS=1 WARMUP_STEPS=300 \
 
 Running on a vast.ai GPU:
 
-vast_train.py runs the same prepare -> train -> sft_prepare -> sft chain on a rented vast.ai instance (plain ssh + rsync — no serverless glue). One-time setup:
+vast_train.py runs the same prepare -> train -> sft_prepare -> sft -> dpo_prepare -> dpo chain on a rented vast.ai instance (plain ssh + rsync — no serverless glue). One-time setup:
 
     pip install vastai python-dotenv
     echo 'VAST_AI_API_KEY=...' >> .env.local   # from https://cloud.vast.ai/manage-keys/
@@ -72,7 +76,7 @@ Then the usual flow. The current instance is tracked in .vast_instance.json so t
     python vast_train.py push         # rsync code + data_cache up
     python vast_train.py pipeline     # whole chain, detached on the instance (survives laptop sleep)
 
-The recommended entrypoint for a full run is the watcher — it launches the chain detached (each stage skips itself if its artifact already exists), polls for sft_final.pt, then pulls everything into ./vast_out:
+The recommended entrypoint for a full run is the watcher — it launches the chain detached (each stage skips itself if its artifact already exists), polls for dpo_final.pt, then pulls everything into ./vast_out:
     ./watch_pipeline.sh                               # launch + watch + auto-pull
     SKIP_LAUNCH=1 ./watch_pipeline.sh                 # just watch an existing run
     tail -f watch_pipeline.log                        # timestamped milestones
@@ -81,26 +85,32 @@ Piecemeal invocations:
     python vast_train.py prepare                      # just data prep (skips if train.bin exists on the instance)
     python vast_train.py train --epochs 2             # just pretrain (~98M defaults; add --detach)
     python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
+    python vast_train.py dpo-prepare                  # just tokenize preference pairs
+    python vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt
     python vast_train.py status                       # instance state + pipeline log tail
     python vast_train.py pull                         # rsync saved/ + tokenizer.json into ./vast_out
     python vast_train.py destroy                      # stop billing
 
 Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping, GQA (`-kv_heads`, default 5 of 10 heads on vast.ai — saves params + halves the KV cache), partial RoPE (rotate half the head dims), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds Muon weight decay, gradient accumulation (`-grad_accum`), and capped mid-epoch validation (`-val_every`).
 
-Posttraining (chat SFT, target: chat-able under 100M params):
+Posttraining (SFT + DPO, target: chat-able under 100M params):
     prepare.py now reserves <|im_start|>/<|im_end|> chat specials in the vocab (rebuild with --force-prepare once),
     sft_prepare.py tokenizes HuggingFaceTB/smol-smoltalk into ChatML, packed into sft_*.bin with a uint8 loss mask,
-    finetune.py loads a pretrain checkpoint and runs masked SFT (loss only on assistant tokens).
+    finetune.py loads a pretrain checkpoint and runs masked SFT (loss only on assistant tokens),
+    dpo_prepare.py tokenizes HuggingFaceH4/ultrafeedback_binarized into chosen/rejected pairs (dpo_*.bin + pair index),
+    dpo.py loads the SFT checkpoint as policy + frozen reference and runs DPO (β=0.1) on completion log-probs.
 
-    python vast_train.py pipeline                                    # full chain: prepare -> pretrain -> sft_prepare -> sft
+    python vast_train.py pipeline                                    # full chain: prepare -> pretrain -> sft_prepare -> sft -> dpo_prepare -> dpo
     python vast_train.py sft-prepare                                 # just tokenize chat data
     python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt --dir-name sft_run
+    python vast_train.py dpo-prepare                                 # just tokenize preference pairs
+    python vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt --dir-name dpo_run
 
     # local chat with an SFT checkpoint (ChatML template auto-enabled when specials exist):
     python sample.py --checkpoint sft_final.pt --prompt "hi there" --chat
     python chat_server.py --checkpoint sft_final.pt --data-dir data_cache/cosmopedia   # add --raw for pretrain ckpts
 
-Evaluation (evaluate.py): zero-shot multiple-choice in the lm-evaluation-harness style — each answer choice is scored by total log-likelihood (acc) and per-token log-likelihood (acc_norm), the standard for sub-100M models where generation evals are mostly noise. Supports arc_easy, arc_challenge, hellaswag, piqa; --chat wraps each question in the ChatML template so SFT checkpoints are scored in-distribution. Expect modest but above-chance numbers at this scale; compare base vs SFT to check posttraining didn't cost capability.
+Evaluation (evaluate.py): zero-shot multiple-choice in the lm-evaluation-harness style — each answer choice is scored by total log-likelihood (acc) and per-token log-likelihood (acc_norm), the standard for sub-100M models where generation evals are mostly noise. Supports arc_easy, arc_challenge, hellaswag, piqa; --chat wraps each question in the ChatML template so SFT checkpoints are scored in-distribution. Expect modest but above-chance numbers at this scale; compare base vs SFT vs DPO to check posttraining didn't cost capability.
     python evaluate.py --checkpoint vast_out/saved/vast_run_sft/sft_final.pt \
         --tokenizer vast_out/tokenizer.json --tasks arc_easy,hellaswag,piqa --limit 500
 
