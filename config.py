@@ -31,6 +31,13 @@ def parse_args():
                         help='Run a capped validation pass every N steps (0 = only at epoch end)')
     parser.add_argument('-val_batches', type=int, default=50,
                         help='Max batches per mid-epoch validation pass')
+    parser.add_argument('-early_stop', type=int, default=0,
+                        help='Early-stop patience in val evaluations (0 = disabled)')
+    parser.add_argument('-early_stop_delta', type=float, default=0.005,
+                        help='Min relative val-loss improvement that resets patience')
+    parser.add_argument('-early_stop_cooldown', type=int, default=300,
+                        help='After an early stop, anneal LR to 0 over this many '
+                             'steps (0 = stop immediately)')
     parser.add_argument('-tied', type=int, default=1)
     parser.add_argument('-dir_name', type=str, default='model')
     parser.add_argument('-norm', type=float, default=2.0)

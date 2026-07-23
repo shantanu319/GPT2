@@ -62,6 +62,30 @@ def apply_lr_schedule(optimizers, step, total_steps, warmup_steps):
             group['lr'] = group['peak_lr'] * factor
 
 
+class EarlyStopper:
+    """Patience-based early stop on validation loss (HF/Lightning semantics).
+
+    An eval counts as an improvement when val loss drops more than
+    min_delta (relative) below the best seen; after `patience` consecutive
+    non-improving evals the stop triggers."""
+    def __init__(self, patience, min_delta=0.005):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = float('inf')
+        self.bad_evals = 0
+        self.triggered = False
+
+    def check(self, val_loss):
+        """Returns True when this eval improved on the best val loss."""
+        if val_loss < self.best * (1 - self.min_delta):
+            self.best = val_loss
+            self.bad_evals = 0
+            return True
+        self.bad_evals += 1
+        self.triggered = self.bad_evals >= self.patience
+        return False
+
+
 def save_checkpoint(model, optimizers, step, path, config=None):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     torch.save({
@@ -77,6 +101,37 @@ def _checkpoint_path(opt, tag):
     return os.path.join(opt.dir_name, f'{base}_{tag}.pt')
 
 
+def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
+    """After an early stop, anneal the LR linearly to 0 over a short tail so the
+    final checkpoint isn't left mid-schedule (hot)."""
+    print(f"cooldown: annealing LR to 0 over {cooldown_steps} steps")
+    groups = [(g, g['lr']) for o in opt.optimizers for g in o.param_groups]
+    for o in opt.optimizers:
+        o.zero_grad()
+    cd, micro = 0, 0
+    for inX, out in data_feeder(opt.train, opt.batchsize, opt.seqlen, opt.device):
+        frac = max(0.0, 1.0 - (cd + 1) / cooldown_steps)
+        for g, lr0 in groups:
+            g['lr'] = lr0 * frac
+        mask = nopeak_mask(inX.size(1), opt.device)
+        with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
+            pred = model(inX, mask)
+            loss = F.cross_entropy(pred.view(-1, opt.vocab_size), out.reshape(-1))
+        (loss / grad_accum).backward()
+        micro += 1
+        if micro % grad_accum != 0:
+            continue
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
+        for o in opt.optimizers:
+            o.step()
+            o.zero_grad()
+        cd += 1
+        if cd % opt.printevery == 0:
+            print(f"cooldown | step {cd}/{cooldown_steps} | loss {loss.item():.4f}")
+        if cd >= cooldown_steps:
+            break
+
+
 def train_model(model, opt):
     print("training model...")
     model.train()
@@ -87,8 +142,33 @@ def train_model(model, opt):
     val_every = getattr(opt, 'val_every', 0)
     val_batches = getattr(opt, 'val_batches', 50)
 
+    early_stop = getattr(opt, 'early_stop', 0)
+    stopper = (EarlyStopper(early_stop, getattr(opt, 'early_stop_delta', 0.005))
+               if early_stop else None)
+    cooldown_steps = getattr(opt, 'early_stop_cooldown', 300)
+    if stopper is not None and not val_every:
+        val_every = 1000
+        print("early stop needs periodic validation — defaulting -val_every to 1000")
+
     step = 0
     micro = 0
+    stop_training = False
+
+    def eval_and_check(max_batches):
+        nonlocal stop_training
+        val_loss = validate_model(model, opt, max_batches=max_batches)
+        model.train()
+        if stopper is not None:
+            if stopper.check(val_loss):
+                path = _checkpoint_path(opt, 'best')
+                save_checkpoint(model, opt.optimizers, step, path,
+                                config=opt.model_config)
+                print(f"new best val loss {val_loss:.4f} — saved {path}")
+            elif stopper.triggered:
+                print(f"early stop: val loss stagnant for {stopper.bad_evals} "
+                      f"evals (best {stopper.best:.4f})")
+                stop_training = True
+        return val_loss
     for epoch in range(opt.epochs):
         epoch_loss = 0
         epoch_tokens = 0
@@ -131,16 +211,22 @@ def train_model(model, opt):
                 save_checkpoint(model, opt.optimizers, step, path, config=opt.model_config)
                 print(f"Saved checkpoint: {path}")
             if val_every and step % val_every == 0:
-                validate_model(model, opt, max_batches=val_batches)
-                model.train()
+                eval_and_check(max_batches=val_batches)
+                if stop_training:
+                    break
 
         train_loss = epoch_loss / epoch_tokens
         training_losses.append(train_loss)
         print(f"Epoch {epoch+1} finished: Train Loss = {train_loss:.4f}")
 
         # Validate at the end of each epoch:
-        valid_loss = validate_model(model, opt)
+        valid_loss = eval_and_check(max_batches=None)
         validation_losses.append(valid_loss)
+        if stop_training:
+            break
+
+    if stop_training and cooldown_steps > 0:
+        run_lr_cooldown(model, opt, grad_accum, cooldown_steps)
 
     final_path = _checkpoint_path(opt, 'final')
     save_checkpoint(model, opt.optimizers, step, final_path, config=opt.model_config)

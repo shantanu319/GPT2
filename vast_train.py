@@ -314,6 +314,8 @@ def cmd_train(args):
            f"-seqlen {args.seqlen} -epochs {args.epochs} "
            f"-lr {args.lr} -muon_lr {args.muon_lr} -warmup_steps {args.warmup_steps} "
            f"-save_every {args.save_every} -val_every {args.val_every} "
+           f"-early_stop {args.early_stop} -early_stop_delta {args.early_stop_delta} "
+           f"-early_stop_cooldown {args.early_stop_cooldown} "
            f"-printevery {args.printevery}")
     if args.loadname:
         cmd += f" -loadname {args.loadname}"
@@ -397,7 +399,9 @@ def cmd_pipeline(args):
                     f"-batchsize {args.batchsize} -grad_accum {args.grad_accum} "
                     f"-seqlen {args.seqlen} -epochs {args.epochs} "
                     f"-lr {args.lr} -muon_lr {args.muon_lr} -warmup_steps {args.warmup_steps} "
-                    f"-save_every {args.save_every} -val_every {args.val_every}"),
+                    f"-save_every {args.save_every} -val_every {args.val_every} "
+                    f"-early_stop {args.early_stop} -early_stop_delta {args.early_stop_delta} "
+                    f"-early_stop_cooldown {args.early_stop_cooldown}"),
         sft_args=f"--epochs {args.sft_epochs}",
         dpo_dir_name=args.dpo_dir_name,
         dpo_args=(f"--epochs {args.dpo_epochs} --batchsize {args.dpo_batchsize} "
@@ -583,6 +587,10 @@ def main():
     sp.add_argument("--warmup-steps", type=int, default=1000)
     sp.add_argument("--save-every", type=int, default=2000)
     sp.add_argument("--val-every", type=int, default=2000)
+    sp.add_argument("--early-stop", type=int, default=0,
+                    help="early-stop patience in val evals (0 = disabled)")
+    sp.add_argument("--early-stop-delta", type=float, default=0.005)
+    sp.add_argument("--early-stop-cooldown", type=int, default=300)
     sp.add_argument("--printevery", type=int, default=50)
     sp.add_argument("--dir-name", default="vast_run")
     sp.add_argument("--loadname", default="")
@@ -651,6 +659,10 @@ def main():
     sp.add_argument("--warmup-steps", type=int, default=1000)
     sp.add_argument("--save-every", type=int, default=4000)
     sp.add_argument("--val-every", type=int, default=2000)
+    sp.add_argument("--early-stop", type=int, default=0,
+                    help="early-stop patience in val evals (0 = disabled)")
+    sp.add_argument("--early-stop-delta", type=float, default=0.005)
+    sp.add_argument("--early-stop-cooldown", type=int, default=300)
     sp.add_argument("--sft-epochs", type=int, default=1)
     sp.add_argument("--dpo-dir-name", default="vast_run_dpo")
     sp.add_argument("--dpo-epochs", type=int, default=1)
