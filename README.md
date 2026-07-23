@@ -30,13 +30,13 @@ The three tuned configurations that ship as defaults (vocab 32000 everywhere):
 | | local (`run.sh`) | vast.ai `pipeline` | vast.ai `train` |
 |---|---|---|---|
 | d_model / layers / heads | 256 / 6 / 4 (full MHA) | 640 / 17 / 10 (5 KV) | 640 / 17 / 10 (5 KV) |
-| seqlen / batch | 256 / 32 | 1024 / 64 × grad-accum 2 | 1024 / 128 |
+| seqlen / batch | 256 / 32 | 1024 / 128 (docs capped at ~8M) | 1024 / 128 |
 | epochs | 1 | 1 | 1 |
 | peak LR (Muon / AdamW) | 0.02 / 3e-4 | 0.03 / 3e-4 | 0.03 / 3e-4 |
-| warmup / save / val cadence | 200 / 500 / epoch-end | 1000 / 1000 / 1000 | 1000 / 2000 / 2000 |
+| warmup / save / val cadence | 200 / 500 / epoch-end | 1000 / 4000 / 2000 | 1000 / 2000 / 2000 |
 | parameters | **13.0M** (4.9M non-embedding) | **97.9M** (77.4M non-embedding) | **97.9M** (77.4M non-embedding) |
 
-The two vast.ai columns share the same ~98M shape — `pipeline` (and therefore `watch_pipeline.sh`) passes the same model-shape flags as `train`; they differ only in effective batch (64 × grad-accum 2 vs 128) and checkpoint cadence. Every knob is overridable per-run, e.g. `python vast_train.py pipeline --n-layers 18 --save-every 2000`.
+The two vast.ai columns share the same ~98M shape and batch — `pipeline` (and therefore `watch_pipeline.sh`) passes the same model-shape flags as `train`; they differ only in checkpoint cadence and the pretrain data cap (pipeline defaults to `--max-train-docs 8000000` ≈ 8B tokens, so the cosine schedule is guaranteed to finish; `train`/`prepare` piecemeal stays uncapped unless you pass a cap). Every knob is overridable per-run, e.g. `python vast_train.py pipeline --n-layers 18 --max-train-docs 12000000`.
 
 The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is fused SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and halving the KV cache), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±30. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params). Local default is ~13M at d_model=256; the vast.ai default is ~98M at d_model=640, 17 layers, 10 heads (5 KV) — see the config table above.
 
@@ -80,6 +80,24 @@ The recommended entrypoint for a full run is the watcher — it launches the cha
     ./watch_pipeline.sh                               # launch + watch + auto-pull
     SKIP_LAUNCH=1 ./watch_pipeline.sh                 # just watch an existing run
     tail -f watch_pipeline.log                        # timestamped milestones
+
+Time-boxed run (e.g. ~7h on an H200): the pipeline defaults are pre-sized for exactly
+this. `--max-train-docs 8000000` caps pretrain at ~8M docs ≈ 8B tokens (~80 tokens/param),
+batch 128×1024 = 131k tokens/step, so at the ~350–550k tokens/s an H200 sustains, the
+cosine schedule actually completes inside the budget — you get an annealed ckpt_final.pt,
+not a hot mid-schedule one. (H200 ≈ H100 compute with 1.7× memory bandwidth: expect a
+modest speedup on this small model, not 2×.) Launch:
+
+    python vast_train.py create --query 'gpu_name=H200 cuda_max_good>=12.8'   # disk defaults to 80GB now
+    python vast_train.py push
+    ./watch_pipeline.sh
+
+Budget the day as: prepare ~1–2h (the Python BPE is the bottleneck, not the GPU),
+pretrain ~4–6h, SFT + DPO ~1.5–2h. Checkpoints save every 4000 steps (~20 min) and
+`pull` works at any time, so weights come back even if you destroy the instance early —
+mid-schedule checkpoints are un-annealed but usable. If early `status` checks show
+throughput well below 350k tokens/s, either plan to stop at a periodic checkpoint or
+relaunch with a smaller --max-train-docs.
 
 Piecemeal invocations:
     python vast_train.py prepare                      # just data prep (skips if train.bin exists on the instance)
