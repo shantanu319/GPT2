@@ -6,8 +6,8 @@ convention for ARC-Easy / HellaSwag / PIQA. At <100M params expect modest
 but above-chance numbers; acc_norm is the smoother signal at this scale.
 
 Examples:
-  python evaluate.py --checkpoint modal_out/chat90m_sft/sft_final.pt \
-      --tokenizer modal_out/tokenizer.json --tasks arc_easy,piqa --limit 500
+  python evaluate.py --checkpoint vast_out/saved/vast_run_sft/sft_final.pt \
+      --tokenizer vast_out/tokenizer.json --tasks arc_easy,piqa --limit 500
   python evaluate.py --checkpoint ... --chat        # wrap context in ChatML
 """
 import argparse

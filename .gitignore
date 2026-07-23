@@ -8,4 +8,6 @@ data_cache/
 chat/target/
 learning_curves.png
 modal_out/
+vast_out/
+.vast_instance.json
 .env.local
