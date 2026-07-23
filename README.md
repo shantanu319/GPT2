@@ -1,6 +1,40 @@
 Initially, this repository was an implementation of GPT2, from scratch, using PyTorch. It was trained on the WikiText dataset and then subsequently abandoned. I spent some time revamping the project, adding new features, and training it on the cosmopedia dataset. I also wrote a tokenizer for the model, using the Byte Pair Encoding algorithm. The main changes I made were to modernize it, add RoPE embeddings, SwiGLU activations, and RMSNorm layers. I also added a chat interface for the model, using clap + rustyline (essentially a rust wrapper around the python inference server).
 
-The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is fused SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and halving the KV cache), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±30. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params). Local default is ~8M at d_model=256; the vast.ai default is ~84M at d_model=640, 14 layers, 10 heads (5 KV).
+## Architecture (end to end)
+
+Five stages, glued together by artifacts in `data_cache/cosmopedia/` and checkpoints in `saved/<run>/`:
+
+    HuggingFace streams ─ prepare.py ─► tokenizer.json + train/val/test.bin (uint16 tokens)
+                                        (vocab reserves <|im_start|> <|im_end|> <|endoftext|>)
+                      ─ train.py ─────► saved/<run>/ckpt_step*.pt, ckpt_final.pt   (pretrain)
+    smol-smoltalk ─ sft_prepare.py ─► sft_{train,val}.bin + uint8 loss masks
+                      ─ finetune.py ─► saved/<run>/sft_final.pt                    (chat SFT)
+                                       └► sample.py | chat_server.py + chat/ REPL | evaluate.py
+
+**1. Tokenizer + data (`tokenizer.py`, `prepare.py`, `data.py`).** Stdlib-only byte-level BPE with the GPT-2 pre-tokenization regex: 256 byte ids plus learned merges, vocab 32000 by default, with the 3 chat specials pinned to the top ids (`<|im_start|>`=vocab−3, `<|im_end|>`=vocab−2, `<|endoftext|>`=vocab−1) so SFT never has to resize the embedding. prepare.py streams a seeded (1337) weighted interleave — 55% cosmopedia-v2, 20% fineweb-edu-dedup, 15% FineMath-4+, 5% OpenMathInstruct-2, 5% CAMEL physics (sources that run dry are dropped and the weights renormalize) — trains the BPE on the first 10k mixed docs, then re-tokenizes the whole stream in a single pass, routing doc `i` to val if `i % 500 == 0`, to test if `== 1`, else to train (~0.4% held out; re-runs are byte-identical). The .bin shards are headerless little-endian uint16 with docs separated by a single `<|endoftext|>` id. data.py memmaps them and serves sequential (never shuffled) `(batch, seqlen)` windows, targets = inputs shifted by one.
+
+**2. Model (`model.py`).** Pre-norm decoder-only transformer. Token embedding is tied to the output head, and logits are tanh-soft-capped at ±30. Each of the N layers is RMSNorm → attention → residual, then RMSNorm → SwiGLU → residual. Attention is fused SDPA with GQA (`-kv_heads` KV heads, each shared across a group of query heads), per-head QK RMSNorm, and partial RoPE (only the first ~50% of head dims rotate, base 10000). SwiGLU is bias-free with `d_ff = round64(8/3 · d_model)`. Init is Xavier on all 2D weights except the residual out-projections (attention out, FFN down), which are zeroed so every block starts as identity. `-loops N` optionally re-runs the layer stack N times (depth recurrence: N× depth at 1× params, with a separate KV cache per pass at inference).
+
+**3. Pretraining (`train.py`).** Hybrid optimizer: `torch.optim.Muon` (weight decay 0.01) for every 2D matrix, AdamW (weight decay 0.1, betas 0.9/0.95) for the tied embedding, norms, and biases. Linear warmup then cosine decay to a 10%-of-peak floor, bf16 autocast, gradient clipping at norm 2.0, optional `-grad_accum`. Checkpoints are `{step, model, optimizers, config}` dicts — the embedded `config` (vocab, d_model, n_layers, heads, kv_heads, loops, dropout) is what finetune.py, sample.py, chat_server.py, and evaluate.py all use to rebuild the exact architecture, so inference never re-specifies the shape. (`muon.py` is a hand-rolled Muon kept as a reference; only the tests import it.)
+
+**4. Chat SFT (`sft_prepare.py`, `finetune.py`, `chat_format.py`).** smol-smoltalk conversations are rendered as ChatML — `<|im_start|>role\ncontent<|im_end|>\n` per turn, conversation closed with `<|endoftext|>` — and packed into `sft_*.bin` with an element-aligned uint8 loss mask: loss lands only on assistant body tokens, their closing `<|im_end|>`, and the final EOS. finetune.py rebuilds the model from the pretrain checkpoint's `config`, runs masked cross-entropy (per-token CE × mask, normalized by the mask sum) at lr 3e-5 AdamW / 3e-3 Muon with grad clip 1.0, and saves the same checkpoint format, so every inference tool works on SFT weights unchanged.
+
+**5. Inference + eval (`sample.py`, `chat_server.py`, `chat/`, `evaluate.py`).** Sampling is temperature + top-p (defaults 0.8 / 0.9) with a KV cache; when the window fills (`max_context`, 512 default) the cache is dropped and the last `max_context − 1` tokens are re-prefilled. chat_server.py is a long-lived JSON-lines stdin/stdout process holding multi-turn ChatML state (system turn on the first turn only, generation stops at `<|im_end|>`); the Rust CLI in `chat/` (clap + rustyline) just spawns it as a child and runs the REPL (`/reset`, `/quit`). evaluate.py scores arc_easy / arc_challenge / hellaswag / piqa lm-eval-harness style: argmax over answer choices of summed log-likelihood (`acc`) and per-token log-likelihood (`acc_norm`), with `--chat` to wrap questions in the ChatML template when scoring SFT checkpoints.
+
+The three tuned configurations that ship as defaults (vocab 32000 everywhere):
+
+| | local (`run.sh`) | vast.ai `pipeline` | vast.ai `train` |
+|---|---|---|---|
+| d_model / layers / heads | 256 / 6 / 4 (full MHA) | 512 / 6 / 8 (full MHA) | 640 / 14 / 10 (5 KV) |
+| seqlen / batch | 256 / 32 | 512 / 64 × grad-accum 2 | 1024 / 128 |
+| epochs | 1 | 20 | 1 |
+| peak LR (Muon / AdamW) | 0.02 / 3e-4 | 0.03 / 3e-4 | 0.03 / 3e-4 |
+| warmup / save / val cadence | 200 / 500 / epoch-end | 300 / 1000 / 1000 | 1000 / 2000 / 2000 |
+| parameters | **13.0M** (4.9M non-embedding) | **35.7M** (19.3M non-embedding) | **84.2M** (63.7M non-embedding) |
+
+Note the middle column: `vast_train.py pipeline` (and therefore `watch_pipeline.sh`) does **not** pass model-shape flags, so it trains at `config.py`'s defaults (512/6/8 full MHA, 20 epochs) — the 84M config only applies when you invoke `vast_train.py train` directly or pass the flags yourself.
+
+The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is fused SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and halving the KV cache), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±30. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params). Local default is ~13M at d_model=256; the `vast_train.py train` default is ~84M at d_model=640, 14 layers, 10 heads (5 KV) — see the config table above.
 
 The tokenizer (tokenizer.py) is a minbpe-style byte-level BPE with the GPT-2 pre-tokenization regex bolted on. It's stdlib-only — no tiktoken or sentencepiece — so the merge loop is transparent and hackable. prepare.py streams a weighted mixture of HuggingFace datasets (SmolLM2-style recipe: 55% cosmopedia-v2 synthetic textbooks, 20% fineweb-edu-dedup real web, 15% FineMath-4+, 5% OpenMathInstruct-2 worked math solutions, 5% CAMEL physics Q/A — see SOURCES in prepare.py), trains BPE on the first N mixed docs (10k by default, so the vocab sees LaTeX/digits), then re-tokenizes the mixed stream into train.bin/val.bin/test.bin in a single pass via a deterministic 1-in-N holdout split. Small sources that run dry are dropped and weights renormalized; the interleave is seeded so a re-run is byte-identical. The .bin shards are raw uint16 token arrays separated by <|endoftext|>, which train.py mmaps for zero-copy batch sampling.
 
@@ -9,7 +43,7 @@ Training (train.py) uses a Muon + AdamW hybrid: Muon for the 2D+ weight matrices
 The chat interface is split in two: a long-running Python inference server (chat_server.py) that loads a checkpoint and reads JSON-line prompts from stdin, and a Rust CLI in chat/ (clap + rustyline) that spawns the Python process as a child and pipes a REPL through it. Inference was kept in Python so I don't have to re-implement the transformer in Rust (low-aura move unfortunately). The Rust side just handles the user-facing loop, history, and process lifecycle. Sampling is top-p + temperature (sample.py), with the running token context capped at max_context so long sessions don't blow up the KV window.
 
 to run the pipeline (train, test, and validate):
-    ./run.sh                          # defaults: ~8M params, 1 epoch, full cosmopedia stream
+    ./run.sh                          # defaults: ~13M params, 1 epoch, full cosmopedia stream
     EPOCHS=3 D_MODEL=128 ./run.sh     # override any knob via env
     FORCE_PREPARE=1 ./run.sh          # rebuild BPE + .bin shards
 
