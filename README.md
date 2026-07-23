@@ -99,6 +99,13 @@ mid-schedule checkpoints are un-annealed but usable. If early `status` checks sh
 throughput well below 350k tokens/s, either plan to stop at a periodic checkpoint or
 relaunch with a smaller --max-train-docs.
 
+The watcher is itself time-boxed: if the chain hasn't produced dpo_final.pt within
+MAX_HOURS (default 7), it pulls whatever checkpoints exist (periodic ckpt_step*,
+ckpt_best, any stage finals — `pull` grabs all of saved/) and exits, logging the
+newest remote checkpoints. DESTROY_ON_TIMEOUT=1 also stops the meter automatically:
+
+    MAX_HOURS=8 DESTROY_ON_TIMEOUT=1 ./watch_pipeline.sh
+
 Piecemeal invocations:
     python vast_train.py prepare                      # just data prep (skips if train.bin exists on the instance)
     python vast_train.py train --epochs 2             # just pretrain (~98M defaults; add --detach)
