@@ -112,3 +112,5 @@ cargo run --manifest-path chat/Cargo.toml --release -- \
   --checkpoint ckpt_step21500.pt \
   --data-dir data_cache/cosmopedia \
   --no-cuda
+
+(This checkpoint is a pre-ChatML pretrain model, so the CLI falls back to raw mode. It needs a tokenizer.json in data_cache/cosmopedia — from any prepare run, or pull one from a vast.ai run: `python vast_train.py pull` drops one in vast_out/.)

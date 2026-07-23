@@ -11,3 +11,5 @@ modal_out/
 vast_out/
 .vast_instance.json
 .env.local
+.DS_Store
+watch_pipeline.log
