@@ -56,6 +56,10 @@ SOURCES = [
     Source('fineweb-edu', 'HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup',  0.20, _render_text),
     Source('finemath',    'HuggingFaceTB/finemath',      'finemath-4plus',     0.15, _render_text),
     Source('openmath',    'nvidia/OpenMathInstruct-2',   None,                 0.05, _render_problem_solution),
+    # camel-ai/physics streams at ~1 doc/s; _iter_source_rows fetches its
+    # physics.zip from the hub instead (instant, same doc order). It must stay
+    # in the mixture regardless — the trained tokenizer's BPE corpus included
+    # it, so removing it changes the merges and breaks tokenizer compatibility.
     Source('camel-physics', 'camel-ai/physics',          None,                 0.05, _render_camel),
 ]
 
@@ -115,6 +119,23 @@ def mixed_stream(sources=SOURCES, seed=1337):
 # path for the docs it would have produced).
 # --------------------------------------------------------------------------
 
+def _iter_source_rows(source):
+    """Row iterator for a source. camel-ai/physics streams at ~1 doc/s (its
+    generator crawls), but the whole dataset is one small zip on the hub —
+    download it and iterate the JSONs in sorted order, which is byte-identical
+    to the datasets streaming order (verified)."""
+    if source.path == 'camel-ai/physics':
+        import json
+        import zipfile
+        from huggingface_hub import hf_hub_download
+        zpath = hf_hub_download(source.path, 'physics.zip', repo_type='dataset')
+        with zipfile.ZipFile(zpath) as z:
+            for name in sorted(n for n in z.namelist() if n.endswith('.json')):
+                yield json.loads(z.read(name))
+        return
+    yield from load_dataset(source.path, source.config, split='train', streaming=True)
+
+
 def fetch_source_to_disk(source, quota, cache_dir):
     """Stream up to `quota` rendered docs from one source into a cache file.
 
@@ -125,11 +146,10 @@ def fetch_source_to_disk(source, quota, cache_dir):
     if os.path.exists(path):
         print(f"  reusing cached fetch: {path}")
         return path
-    ds = load_dataset(source.path, source.config, split='train', streaming=True)
     n = 0
     tmp_path = path + '.tmp'
     with open(tmp_path, 'wb') as f:
-        for row in ds:
+        for row in _iter_source_rows(source):
             if n >= quota:
                 break
             b = source.render(row).encode('utf-8')
