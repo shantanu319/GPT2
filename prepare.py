@@ -16,6 +16,7 @@ import argparse
 import multiprocessing as mp
 import os
 import random
+import struct
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -103,6 +104,90 @@ def mixed_stream(sources=SOURCES, seed=1337):
             iters.pop(idx)
 
 
+# --------------------------------------------------------------------------
+# Fast path: per-source parallel fetch to disk, then a local interleave.
+#
+# A single mixed_stream() round-robins five HTTP streams and runs at the pace
+# of the slowest pick (~10 docs/s). Each source streams at thousands of docs/s
+# on its own, so with --max-train-docs set we instead stream each source in a
+# separate process into a length-prefixed cache file, then interleave locally
+# with the SAME seeded weighted logic (byte-identical doc order to the serial
+# path for the docs it would have produced).
+# --------------------------------------------------------------------------
+
+def fetch_source_to_disk(source, quota, cache_dir):
+    """Stream up to `quota` rendered docs from one source into a cache file.
+
+    Format: repeated (uint64 LE byte-length, utf-8 bytes). Resumable — an
+    existing complete-enough cache file is reused."""
+    os.makedirs(cache_dir, exist_ok=True)
+    path = os.path.join(cache_dir, f"fetch_{source.name}.bin")
+    if os.path.exists(path):
+        print(f"  reusing cached fetch: {path}")
+        return path
+    ds = load_dataset(source.path, source.config, split='train', streaming=True)
+    n = 0
+    tmp_path = path + '.tmp'
+    with open(tmp_path, 'wb') as f:
+        for row in ds:
+            if n >= quota:
+                break
+            b = source.render(row).encode('utf-8')
+            f.write(struct.pack('<Q', len(b)))
+            f.write(b)
+            n += 1
+    os.replace(tmp_path, path)  # atomic: a killed fetch never leaves a reusable partial
+    print(f"  fetched {n:,} docs from {source.name} -> {path}")
+    return path
+
+
+def _read_docs(path):
+    with open(path, 'rb') as f:
+        while True:
+            head = f.read(8)
+            if len(head) < 8:
+                return
+            (n,) = struct.unpack('<Q', head)
+            yield f.read(n).decode('utf-8')
+
+
+def local_mixed_stream(fetch_paths, sources, seed=1337, max_docs=None):
+    """mixed_stream over on-disk fetch caches: same rng, same drop-on-exhaust."""
+    rng = random.Random(seed)
+    iters = [(s.name, _read_docs(fetch_paths[s.name]), s.weight) for s in sources]
+    n = 0
+    while iters:
+        if max_docs is not None and n >= max_docs:
+            return
+        names, streams, weights = zip(*iters)
+        idx = rng.choices(range(len(iters)), weights=weights)[0]
+        try:
+            yield next(streams[idx])
+            n += 1
+        except StopIteration:
+            print(f"  source '{names[idx]}' exhausted — renormalizing mixture")
+            iters.pop(idx)
+
+
+def _fetch_one(job):
+    source, quota, cache_dir = job
+    return fetch_source_to_disk(source, quota, cache_dir)
+
+
+def fetch_all(sources, max_docs, cache_dir, workers):
+    """Fetch all sources in parallel; returns {name: cache_path}.
+
+    Quota per source is its weighted share of max_docs (+ headroom for the
+    stochastic interleave); sources that run dry simply produce less, exactly
+    like the serial path."""
+    total_w = sum(s.weight for s in sources)
+    jobs = [(s, int(max_docs * s.weight / total_w * 1.05) + 1000, cache_dir)
+            for s in sources]
+    with mp.get_context('fork').Pool(processes=min(workers, len(jobs))) as pool:
+        paths = pool.map(_fetch_one, jobs)
+    return {s.name: p for s, p in zip(sources, paths)}
+
+
 def _bpe_training_corpus(stream, num_docs):
     texts = []
     for i, text in enumerate(stream):
@@ -166,7 +251,8 @@ def _tokenize_stream_three_bins(
     train_tokens = 0
     val_tokens = 0
     test_tokens = 0
-    with open(train_path, 'wb') as trf, open(val_path, 'wb') as vf, open(test_path, 'wb') as tf:
+    tmp_paths = [p + '.tmp' for p in (train_path, val_path, test_path)]
+    with open(tmp_paths[0], 'wb') as trf, open(tmp_paths[1], 'wb') as vf, open(tmp_paths[2], 'wb') as tf:
         for i, arr in _iter_encoded(tokenizer, tokenizer_path, stream, eos_id,
                                      max_docs, num_workers):
             bucket = i % holdout_period
@@ -182,6 +268,9 @@ def _tokenize_stream_three_bins(
             if (i + 1) % 10000 == 0:
                 total = train_tokens + val_tokens + test_tokens
                 print(f"  tokenized {i + 1} docs, {total:,} tokens total")
+    # Atomic finalize: a killed run never leaves reusable partial shards.
+    for tmp, final in zip(tmp_paths, (train_path, val_path, test_path)):
+        os.replace(tmp, final)
     return train_tokens, val_tokens, test_tokens
 
 
@@ -215,6 +304,22 @@ def main():
     mix_desc = ', '.join(f"{s.name}={s.weight:.0%}" for s in SOURCES)
     print(f"Mixture: {mix_desc}")
 
+    if args.max_train_docs is not None:
+        # Fast path: parallel per-source fetch, then local interleave (same
+        # seeded order as the serial mixed_stream).
+        cache_dir = os.path.join(args.output_dir, 'fetch_cache')
+        print(f"Fetching up to {args.max_train_docs:,} docs "
+              f"(per-source parallel streams)...")
+        fetch_paths = fetch_all(SOURCES, args.max_train_docs, cache_dir,
+                                workers=min(len(SOURCES), num_workers))
+
+        def make_stream():
+            return local_mixed_stream(fetch_paths, SOURCES, seed=args.seed,
+                                      max_docs=args.max_train_docs)
+    else:
+        def make_stream():
+            return mixed_stream(seed=args.seed)
+
     tok_path = os.path.join(args.output_dir, 'tokenizer.json')
     if os.path.exists(tok_path):
         # Resume support: BPE is the expensive phase, so a preempted/restarted
@@ -228,7 +333,7 @@ def main():
     else:
         tokenizer = BPETokenizer(special_tokens=specials)
         print(f"Loading {args.bpe_train_docs} mixed docs for BPE training...")
-        bpe_corpus = _bpe_training_corpus(mixed_stream(seed=args.seed), args.bpe_train_docs)
+        bpe_corpus = _bpe_training_corpus(make_stream(), args.bpe_train_docs)
         print(f"  BPE training corpus: {len(bpe_corpus):,} chars")
 
         target_ordinary_vocab = args.vocab_size - len(tokenizer.special_tokens)
@@ -245,7 +350,7 @@ def main():
     print(f"Tokenizing mixed stream into train/val/test "
           f"(holdout 2-in-{args.holdout_period}, num_workers={num_workers})...")
     n_train, n_val, n_test = _tokenize_stream_three_bins(
-        tokenizer, tok_path, mixed_stream(seed=args.seed), eos_id,
+        tokenizer, tok_path, make_stream(), eos_id,
         train_path, val_path, test_path,
         max_docs=args.max_train_docs, holdout_period=args.holdout_period,
         num_workers=num_workers,

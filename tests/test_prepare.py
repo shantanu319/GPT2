@@ -117,3 +117,32 @@ def test_mixed_stream_renormalizes_on_exhaustion(monkeypatch):
     # tiny exhausts early but the stream still drains the big source
     assert len(out) == 202
     assert out.count('t0') == 1 and out.count('t1') == 1
+
+
+def test_local_fast_path_matches_serial(monkeypatch, tmp_path):
+    """fetch_source_to_disk + local_mixed_stream must reproduce mixed_stream."""
+    import prepare
+    docs = {'a': [f"a{i}" for i in range(200)], 'b': [f"b{i}" for i in range(60)]}
+
+    def fake_load_dataset(path, config, split, streaming):
+        name = 'a' if 'aaa' in path else 'b'
+        yield from ({'text': t} for t in docs[name])
+
+    monkeypatch.setattr(prepare, 'load_dataset', fake_load_dataset)
+    sources = [Source('a', 'aaa_data', None, 0.8, lambda r: r['text']),
+               Source('b', 'bbb_data', None, 0.2, lambda r: r['text'])]
+
+    def fake_open(source):
+        return iter(docs[source.name])
+
+    monkeypatch.setattr(prepare, '_open_stream', fake_open)
+    serial = list(mixed_stream(sources, seed=1337))
+
+    paths = {s.name: prepare.fetch_source_to_disk(s, 10**9, str(tmp_path))
+             for s in sources}
+    local = list(prepare.local_mixed_stream(paths, sources, seed=1337))
+    assert local == serial
+
+    capped = list(prepare.local_mixed_stream(paths, sources, seed=1337,
+                                             max_docs=100))
+    assert capped == serial[:100]

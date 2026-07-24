@@ -253,6 +253,9 @@ def validate_model(model, opt, max_batches=None):
             total_loss += loss.item() * out.size(0)
             total_tokens += out.size(0)
 
+    if total_tokens == 0:
+        print("validation skipped: val set yields no full batches")
+        return float('inf')
     avg_loss = total_loss / total_tokens
     print(f"Validation Loss = {avg_loss:.4f}")
     return avg_loss
