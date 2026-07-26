@@ -53,3 +53,33 @@ def test_data_feeder_accepts_mmap(tmp_path):
         assert x.shape == (2, 7)
         assert y.shape == (2, 7)
         assert torch.equal(x[:, 1:], y[:, :-1])
+
+
+def _window_keys(batches):
+    # First input token of every served row, order-insensitive.
+    return sorted(t for x, _ in batches for t in x[:, 0].tolist())
+
+
+def test_data_feeder_shuffle_same_seed_same_order():
+    data = list(range(24 * 8))
+    a = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=7))
+    b = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=7))
+    assert len(a) == len(b) == 12
+    assert all(torch.equal(xa, xb) and torch.equal(ya, yb) for (xa, ya), (xb, yb) in zip(a, b))
+
+
+def test_data_feeder_shuffle_different_seed_different_order():
+    data = list(range(24 * 8))
+    a = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=1))
+    b = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=2))
+    assert not all(torch.equal(xa, xb) for (xa, _), (xb, _) in zip(a, b))
+
+
+def test_data_feeder_shuffle_covers_all_windows():
+    data = list(range(24 * 8))
+    shuffled = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=3))
+    sequential = list(data_feeder(data, 2, 8, torch.device("cpu")))
+    assert len(shuffled) == len(sequential)
+    assert _window_keys(shuffled) == _window_keys(sequential)
+    # and the order actually changed
+    assert not all(torch.equal(xa, xb) for (xa, _), (xb, _) in zip(shuffled, sequential))
