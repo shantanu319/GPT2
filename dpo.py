@@ -7,13 +7,15 @@ from dpo_prepare.py with the standard DPO objective:
   loss = -log sigmoid( beta * [(logp_pi(chosen) - logp_ref(chosen))
                               - (logp_pi(rejected) - logp_ref(rejected))] )
 
-where logp is the summed log-probability of the completion tokens only
-(prompt masked out per dpo_*_mask.bin). Writes checkpoints in the same
-format as train.py so chat_server/sample/evaluate work unchanged.
+where logp is the mean log-probability over the completion tokens only
+(prompt masked out per dpo_*_mask.bin) — length-normalized so longer
+completions don't accumulate extra negative reward (SimPO, arXiv:2405.14734).
+Writes checkpoints in the same format as train.py so
+chat_server/sample/evaluate work unchanged.
 
 Example:
   python dpo.py --checkpoint saved/sft/sft_final.pt \
-      --data-dir data_cache/cosmopedia --epochs 1 --dir-name dpo
+      --data-dir data_cache/cosmopedia --epochs 2 --dir-name dpo
 """
 import argparse
 import os
@@ -76,12 +78,17 @@ def build_batch(tokens, masks, pairs, pair_ids, max_len, pad_id, device):
 
 
 def sequence_logprobs(model, ids_in, targets, loss_mask, attn_mask, autocast_device):
-    """Summed log p(target | prompt) over completion tokens, per sequence."""
+    """Mean log p(target | prompt) over completion tokens, per sequence.
+
+    Length-normalized (sum / completion-token count) so longer completions
+    don't accumulate more negative log-prob (SimPO, arXiv:2405.14734);
+    padding-invariant, since pads are excluded from both sum and count."""
     with torch.autocast(device_type=autocast_device.type, dtype=torch.bfloat16):
         logits = model(ids_in, attn_mask)
     logp = torch.log_softmax(logits.float(), dim=-1)
     tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    return (tok_logp * loss_mask).sum(dim=-1)
+    counts = loss_mask.sum(dim=-1).clamp(min=1)
+    return (tok_logp * loss_mask).sum(dim=-1) / counts
 
 
 def dpo_loss_and_metrics(policy_logps, ref_logps, beta):
@@ -97,6 +104,18 @@ def dpo_loss_and_metrics(policy_logps, ref_logps, beta):
         margin = (reward_c - reward_r).mean()
         acc = (reward_c > reward_r).float().mean()
     return loss, margin.item(), acc.item()
+
+
+def make_dpo_optimizers(model, muon_lr, adamw_lr):
+    """Published DPO recipes at this scale are AdamW-only: muon_lr <= 0 builds a
+    single AdamW over all trainable params; muon_lr > 0 keeps the SFT split."""
+    if muon_lr > 0:
+        return make_sft_optimizers(model, muon_lr=muon_lr, adamw_lr=adamw_lr)
+    adamw = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad),
+                              lr=adamw_lr, weight_decay=0.1, betas=(0.9, 0.95))
+    for group in adamw.param_groups:
+        group['peak_lr'] = group['lr']
+    return [adamw]
 
 
 @torch.no_grad()
@@ -130,13 +149,14 @@ def main():
     parser.add_argument('--checkpoint', required=True,
                         help='SFT checkpoint (policy init + reference model)')
     parser.add_argument('--data-dir', default='data_cache/cosmopedia')
-    parser.add_argument('--epochs', type=int, default=1)
+    parser.add_argument('--epochs', type=int, default=2)
     parser.add_argument('--batchsize', type=int, default=8,
                         help='Preference pairs per optimizer step')
-    parser.add_argument('--beta', type=float, default=0.1,
+    parser.add_argument('--beta', type=float, default=0.5,
                         help='DPO temperature (KL budget to the reference model)')
     parser.add_argument('--lr', type=float, default=1e-6, help='AdamW peak LR')
-    parser.add_argument('--muon-lr', type=float, default=1e-4, help='Muon peak LR')
+    parser.add_argument('--muon-lr', type=float, default=0.0,
+                        help='Muon peak LR; <= 0 disables Muon (AdamW-only, default)')
     parser.add_argument('--warmup-steps', type=int, default=100)
     parser.add_argument('--max-len', type=int, default=1024,
                         help='Truncate sequences to this many tokens')
@@ -166,6 +186,8 @@ def main():
             vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
             heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
             kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
+            value_residual=cfg.get('value_residual', False),
+            unet_skips=cfg.get('unet_skips', False),
         ).to(device)
         m.load_state_dict(ckpt['model'])
         return m
@@ -185,7 +207,7 @@ def main():
     val_masks = load_bin_u8(os.path.join(args.data_dir, 'dpo_val_mask.bin'))
     val_pairs = load_pairs(os.path.join(args.data_dir, 'dpo_val_pairs.bin'))
 
-    optimizers = make_sft_optimizers(policy, muon_lr=args.muon_lr, adamw_lr=args.lr)
+    optimizers = make_dpo_optimizers(policy, muon_lr=args.muon_lr, adamw_lr=args.lr)
     batches_per_epoch = max(1, len(train_pairs) // args.batchsize)
     total_steps = max(1, args.epochs * batches_per_epoch)
 

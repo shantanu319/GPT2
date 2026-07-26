@@ -74,7 +74,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=2)
     parser.add_argument('--batchsize', type=int, default=32)
     parser.add_argument('--seqlen', type=int, default=512)
-    parser.add_argument('--lr', type=float, default=3e-5, help='AdamW peak LR')
+    parser.add_argument('--lr', type=float, default=3e-4, help='AdamW peak LR')
     parser.add_argument('--muon-lr', type=float, default=0.003, help='Muon peak LR')
     parser.add_argument('--warmup-steps', type=int, default=100)
     parser.add_argument('--save-every', type=int, default=1000)
@@ -98,6 +98,8 @@ def main():
         vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
         heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
         kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
+        value_residual=cfg.get('value_residual', False),
+        unet_skips=cfg.get('unet_skips', False),
     ).to(device)
     model.load_state_dict(ckpt['model'])
     vocab_size = cfg['vocab_size']

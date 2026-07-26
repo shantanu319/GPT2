@@ -121,15 +121,49 @@ def test_sequence_logprobs_padding_invariant():
     assert torch.allclose(padded[1], single(rejected), atol=1e-3)
 
 
+def test_sequence_logprobs_is_mean_not_sum():
+    """sequence_logprobs must be length-normalized: sum / completion-token count."""
+    from dpo import build_batch, sequence_logprobs
+    model = _tiny().eval()
+    device = torch.device('cpu')
+    chosen = (list(range(10, 18)), [0, 0, 0, 0, 1, 1, 1, 1])
+    rejected = (list(range(20, 25)), [0, 0, 1, 1, 1])
+    tokens, masks, pairs = _write_flat(None, [chosen, rejected])
+    ids_in, targets, loss_mask, attn = build_batch(
+        tokens, masks, pairs, [0], max_len=16, pad_id=63, device=device)
+
+    with torch.no_grad():
+        out = sequence_logprobs(model, ids_in, targets, loss_mask, attn, device)
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
+            logits = model(ids_in, attn)
+    logp = torch.log_softmax(logits.float(), dim=-1)
+    tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    summed = (tok_logp * loss_mask).sum(dim=-1)
+    counts = loss_mask.sum(dim=-1)
+
+    assert (counts > 1).all()  # mean and sum genuinely differ here
+    assert torch.allclose(out, summed / counts, atol=1e-3)
+    assert not torch.allclose(out, summed, atol=1e-3)
+
+
+def test_make_dpo_optimizers_adamw_only_when_muon_disabled():
+    from dpo import make_dpo_optimizers
+    opts = make_dpo_optimizers(_tiny(), muon_lr=0.0, adamw_lr=1e-6)
+    assert len(opts) == 1 and isinstance(opts[0], torch.optim.AdamW)
+    assert opts[0].param_groups[0]['peak_lr'] == 1e-6
+    assert len(make_dpo_optimizers(_tiny(), muon_lr=1e-4, adamw_lr=1e-6)) == 2
+
+
 def test_dpo_loss_and_metrics_values():
     from dpo import dpo_loss_and_metrics
-    beta = 0.1
+    beta = 0.5  # current default
     # chosen preferred over rejected -> loss < ln2, acc 1, margin > 0
     pi = torch.tensor([2.0, 1.0])    # [chosen, rejected]
     ref = torch.tensor([0.0, 0.0])
     loss, margin, acc = dpo_loss_and_metrics(pi, ref, beta)
     assert loss.item() < math.log(2)
-    assert margin > 0 and acc == 1.0
+    assert math.isclose(loss.item(), math.log1p(math.exp(-beta * 1.0)), rel_tol=1e-6)
+    assert math.isclose(margin, beta * 1.0, rel_tol=1e-6) and acc == 1.0
     # no preference signal -> loss == ln2
     loss0, margin0, acc0 = dpo_loss_and_metrics(torch.zeros(2), torch.zeros(2), beta)
     assert math.isclose(loss0.item(), math.log(2), rel_tol=1e-6)
