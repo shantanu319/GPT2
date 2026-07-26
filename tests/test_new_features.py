@@ -2,16 +2,17 @@ import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
+from types import SimpleNamespace
 
 from chat_format import (DEFAULT_SYSTEM, EOS_TOKEN, IM_END, IM_START,
                          render_conversation, special_token_map)
 from data import data_feeder_masked
-from model import LOGIT_SOFTCAP, Transformer, nopeak_mask
+from model import LOGIT_SOFTCAP, Transformer, get_model, nopeak_mask
 
 
-def _tiny(vocab=32, d_model=32, n_layers=2, heads=4, kv_heads=None, loops=1):
+def _tiny(vocab=32, d_model=32, n_layers=2, heads=4, kv_heads=None, loops=1, **kw):
     return Transformer(vocab, d_model, n_layers, heads, dropout=0.0,
-                       kv_heads=kv_heads, loops=loops)
+                       kv_heads=kv_heads, loops=loops, **kw)
 
 
 def test_gqa_forward_shape():
@@ -49,6 +50,7 @@ def test_loops_forward_and_kv_cache_match():
 
 def test_logits_softcapped():
     torch.manual_seed(0)
+    assert LOGIT_SOFTCAP == 15.0
     model = _tiny()
     x = torch.randint(0, 32, (1, 4))
     logits = model(x, nopeak_mask(4, torch.device("cpu")))
@@ -64,6 +66,128 @@ def test_backward_with_gqa_and_loops():
     loss = F.cross_entropy(
         model(x, nopeak_mask(8, torch.device("cpu"))).view(-1, V), y.view(-1))
     loss.backward()
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not missing, missing
+
+
+def test_none_mask_matches_nopeak_mask():
+    """Training with mask=None (is_causal path) must match the explicit bool mask."""
+    torch.manual_seed(0)
+    V, T = 32, 8
+    model = _tiny(vocab=V, kv_heads=2).eval()
+    x = torch.randint(0, V, (2, T))
+    explicit = model(x, nopeak_mask(T, torch.device("cpu")))
+    implicit = model(x, None)
+    assert torch.allclose(explicit, implicit, atol=1e-5), (explicit - implicit).abs().max()
+
+
+def test_grad_ckpt_flag_training():
+    torch.manual_seed(0)
+    V = 32
+    model = _tiny(vocab=V, grad_ckpt=True)
+    model.train()
+    x = torch.randint(0, V, (2, 8))
+    y = torch.randint(0, V, (2, 8))
+    loss = F.cross_entropy(model(x, None).view(-1, V), y.view(-1))
+    loss.backward()
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not missing, missing
+
+
+def test_value_residual_forward_backward():
+    torch.manual_seed(0)
+    V = 32
+    model = _tiny(vocab=V, n_layers=3, kv_heads=2, value_residual=True)
+    x = torch.randint(0, V, (2, 8))
+    y = torch.randint(0, V, (2, 8))
+    logits = model(x, None)
+    assert logits.shape == (2, 8, V)
+    F.cross_entropy(logits.view(-1, V), y.view(-1)).backward()
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not missing, missing
+    vres = [n for n, _ in model.named_parameters() if n.endswith('attn_1.vres')]
+    assert vres == ['decoder.layers.1.attn_1.vres', 'decoder.layers.2.attn_1.vres']
+    assert all(p.dim() < 2 for n, p in model.named_parameters() if n in vres)
+
+
+def test_value_residual_kv_cache_match():
+    """Value residual: incremental cached decode must match the full forward."""
+    torch.manual_seed(0)
+    V, T = 32, 6
+    model = _tiny(vocab=V, n_layers=3, kv_heads=2, value_residual=True).eval()
+    x = torch.randint(0, V, (1, T))
+    full = model(x, nopeak_mask(T, torch.device("cpu")))
+
+    model.reset_cache()
+    out = []
+    for t in range(T):
+        step = model(x[:, t:t+1], None, start_pos=t)
+        out.append(step)
+    inc = torch.cat(out, dim=1)
+    assert torch.allclose(full, inc, atol=1e-4), (full - inc).abs().max()
+
+
+def test_get_model_old_opt_has_no_new_params():
+    """An opt namespace lacking the new flags rebuilds the old architecture."""
+    opt = SimpleNamespace(d_model=32, n_layers=3, heads=4, dropout=0.0,
+                          device='cpu', loadname=None)
+    model = get_model(opt, 32)
+    keys = set(model.state_dict())
+    assert not any('vres' in k or 'skip' in k for k in keys)
+
+
+@pytest.mark.parametrize("n_layers", [2, 3])
+def test_unet_skips_forward_backward(n_layers):
+    torch.manual_seed(0)
+    V = 32
+    model = _tiny(vocab=V, n_layers=n_layers, kv_heads=2, unet_skips=True)
+    x = torch.randint(0, V, (2, 8))
+    y = torch.randint(0, V, (2, 8))
+    logits = model(x, None)
+    assert logits.shape == (2, 8, V)
+    F.cross_entropy(logits.view(-1, V), y.view(-1)).backward()
+    missing = [n for n, p in model.named_parameters()
+               if p.requires_grad and p.grad is None]
+    assert not missing, missing
+    assert model.decoder.skip_x0.shape == (n_layers,)
+    assert model.decoder.skip_unet.shape == (n_layers,)
+
+
+def test_flags_off_matches_git_head():
+    """Flags off: state_dict keys and weights identical to the git HEAD model.
+
+    (Logits themselves legitimately differ: HEAD had LOGIT_SOFTCAP=30, now 15.)
+    """
+    import subprocess
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    src = subprocess.run(["git", "show", "HEAD:model.py"], cwd=root,
+                         capture_output=True, text=True, check=True).stdout
+    ns = {}
+    exec(src, ns)
+    torch.manual_seed(0)
+    old = ns["Transformer"](32, 32, 2, 4, 0.0)
+    torch.manual_seed(0)
+    new = _tiny()
+    old_sd, new_sd = old.state_dict(), new.state_dict()
+    assert set(old_sd) == set(new_sd)
+    assert all(torch.equal(old_sd[k], new_sd[k]) for k in old_sd)
+
+
+def test_loops_with_value_residual_and_unet_skips():
+    torch.manual_seed(0)
+    V = 32
+    model = _tiny(vocab=V, n_layers=3, kv_heads=2, loops=2,
+                  value_residual=True, unet_skips=True)
+    x = torch.randint(0, V, (2, 8))
+    y = torch.randint(0, V, (2, 8))
+    logits = model(x, None)
+    assert logits.shape == (2, 8, V)
+    assert torch.isfinite(logits).all()
+    F.cross_entropy(logits.view(-1, V), y.view(-1)).backward()
     missing = [n for n, p in model.named_parameters()
                if p.requires_grad and p.grad is None]
     assert not missing, missing

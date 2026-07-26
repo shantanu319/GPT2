@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 
-LOGIT_SOFTCAP = 30.0  # tanh soft-capping (Gemma-2 / modded-nanogpt)
+LOGIT_SOFTCAP = 15.0  # tanh soft-capping (Gemma-2 / modded-nanogpt record #18)
 
 
 class Embedder(nn.Module):
@@ -60,11 +60,12 @@ class RMSNorm(nn.Module):
         return self.weight * x * rms
 
 
-def attention(q, k, v, mask=None, dropout_p=0.0):
+def attention(q, k, v, mask=None, dropout_p=0.0, is_causal=False):
     # Wrap SDPA so we keep the (1, T, S) bool-mask convention used by nopeak_mask.
     if mask is not None and mask.dim() == 3:
         mask = mask.unsqueeze(1)
-    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p,
+                                          is_causal=is_causal)
 
 
 class MultiHeadAttention(nn.Module):
@@ -112,7 +113,7 @@ class MultiHeadAttention(nn.Module):
         self.k_cache = {}
         self.v_cache = {}
 
-    def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0):
+    def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0, v1=None):
 
         bs = q.size(0)
 
@@ -134,6 +135,13 @@ class MultiHeadAttention(nn.Module):
         q = apply_partial_rope(q, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T], self.rot_dim)
         k = apply_partial_rope(k, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T], self.rot_dim)
 
+        v_pre = v  # this layer's own V (kv-head space), for value-residual mixing
+        if v1 is not None:
+            # Value residual (ResFormer): blend in layer-0 values. Mix BEFORE the
+            # cache append so the cache stores the mixed v used in training.
+            gate = torch.sigmoid(self.vres)
+            v = (1 - gate) * v + gate * v1
+
         if start_pos is not None:
             if cache_idx not in self.k_cache:
                 max_len = self.rope_cos.size(0)
@@ -146,18 +154,25 @@ class MultiHeadAttention(nn.Module):
             k = self.k_cache[cache_idx][:, :, :start_pos+T]
             v = self.v_cache[cache_idx][:, :, :start_pos+T]
 
-        if self.groups > 1:
-            k = k.repeat_interleave(self.groups, dim=1)
-            v = v.repeat_interleave(self.groups, dim=1)
-
         dropout_p = self.dropout.p if self.training else 0.0
-        scores = attention(q, k, v, mask, dropout_p)
+        if mask is None and start_pos is None and q.device.type == 'cuda':
+            # Training fast path: flash SDPA handles GQA without expanding K/V.
+            scores = F.scaled_dot_product_attention(
+                q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True)
+        else:
+            if self.groups > 1:
+                k = k.repeat_interleave(self.groups, dim=1)
+                v = v.repeat_interleave(self.groups, dim=1)
+            # mask None + no cache means causal training; mask None + cache means
+            # single-chunk decode attending over the whole cache (not causal).
+            scores = attention(q, k, v, mask, dropout_p,
+                               is_causal=mask is None and start_pos is None)
         # concatenate heads and put through final linear layer
         concat = scores.transpose(1, 2).contiguous() \
             .view(bs, -1, self.d_model)
         output = self.out(concat)
 
-        return output
+        return output, v_pre
 
 
 def _round_to_multiple(x, multiple):
@@ -198,43 +213,73 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
         self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads, dropout=dropout)
         self.ff = SwiGLU(d_model, dropout=dropout)
 
-    def forward(self, x, mask, start_pos=None, cache_idx=0):
+    def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None):
         x2 = self.norm_1(x)
-        x = x + self.dropout_1(
-            self.attn_1(x2, x2, x2, mask, start_pos=start_pos, cache_idx=cache_idx))
+        att, v = self.attn_1(x2, x2, x2, mask, start_pos=start_pos,
+                             cache_idx=cache_idx, v1=v1)
+        x = x + self.dropout_1(att)
         x2 = self.norm_3(x)
         x = x + self.dropout_3(self.ff(x2))
-        return x
+        return x, v
 
 
 class Decoder(nn.Module):
-    def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1):
+    def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
+                 grad_ckpt=False, value_residual=False, unet_skips=False):
         super().__init__()
         self.N = N
         self.loops = loops
+        self.grad_ckpt = grad_ckpt
+        self.value_residual = value_residual
+        self.unet_skips = unet_skips
         self.embed = Embedder(vocab, d_model)
         self.layers = get_clones(DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads), N)
         self.norm = RMSNorm(d_model)
+        if value_residual:
+            # Per-layer value-mix scalars init 0 (sigmoid=0.5). Layer 0 stays
+            # unmixed (it defines v1), so it gets no scalar.
+            for i in range(1, N):
+                self.layers[i].attn_1.vres = nn.Parameter(torch.zeros(()))
+        if unet_skips:
+            # Skip gates init -1.5 (sigmoid ~0.18): x0 embedding shortcut for
+            # every layer, mirror skips for the second half (modded-nanogpt #11).
+            self.skip_x0 = nn.Parameter(torch.full((N,), -1.5))
+            self.skip_unet = nn.Parameter(torch.full((N,), -1.5))
 
     def forward(self, trg, mask, start_pos=None):
-        x = self.embed(trg)
+        x0 = x = self.embed(trg)
+        half = (self.N + 1) // 2
         # Depth recurrence (parameter-golf): run the stack `loops` times for
         # loops*N effective layers with N layers' worth of params.
         for loop in range(self.loops):
+            v1 = None  # fresh layer-0 values per unrolled pass
+            outs = []  # per-pass layer outputs for mirror skips
             for i in range(self.N):
-                if self.training:
-                    x = checkpoint(self.layers[i], x, mask, start_pos, loop,
-                                   use_reentrant=False)
+                x_in = x
+                if self.unet_skips:
+                    x_in = x + torch.sigmoid(self.skip_x0[i]) * x0
+                    if i >= half:
+                        x_in = x_in + torch.sigmoid(self.skip_unet[i]) * outs[self.N - 1 - i]
+                v1_in = v1 if self.value_residual and i > 0 else None
+                if self.training and self.grad_ckpt:
+                    x, v = checkpoint(self.layers[i], x_in, mask, start_pos, loop,
+                                      v1_in, use_reentrant=False)
                 else:
-                    x = self.layers[i](x, mask, start_pos=start_pos, cache_idx=loop)
+                    x, v = self.layers[i](x_in, mask, start_pos=start_pos,
+                                          cache_idx=loop, v1=v1_in)
+                if i == 0:
+                    v1 = v
+                outs.append(x)
         return self.norm(x)
 
 
 class Transformer(nn.Module):
-    def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1):
+    def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
+                 grad_ckpt=False, value_residual=False, unet_skips=False):
         super().__init__()
         self.decoder = Decoder(vocab, d_model, N, heads, dropout,
-                               kv_heads=kv_heads, loops=loops)
+                               kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
+                               value_residual=value_residual, unet_skips=unet_skips)
         self.out = nn.Linear(d_model, vocab)
         self.out.weight = self.decoder.embed.embed.weight
 
@@ -257,9 +302,13 @@ def get_model(opt, vocab):
 
     kv_heads = getattr(opt, 'kv_heads', None) or opt.heads
     loops = getattr(opt, 'loops', 1) or 1
+    grad_ckpt = bool(getattr(opt, 'grad_ckpt', False))
+    value_residual = bool(getattr(opt, 'value_residual', False))
+    unet_skips = bool(getattr(opt, 'unet_skips', False))
 
     model = Transformer(vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout,
-                        kv_heads=kv_heads, loops=loops)
+                        kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
+                        value_residual=value_residual, unet_skips=unet_skips)
     model.to(opt.device)
 
     if opt.loadname is not None:
