@@ -7,10 +7,10 @@ def parse_args():
                         help='Force CPU even if CUDA or MPS is available')
     parser.add_argument('-epochs', type=int, default=20)
     parser.add_argument('-d_model', type=int, default=512)
-    parser.add_argument('-n_layers', type=int, default=6)
+    parser.add_argument('-n_layers', type=int, default=30)
     parser.add_argument('-heads', type=int, default=8)
-    parser.add_argument('-kv_heads', type=int, default=0,
-                        help='KV heads for GQA (0 = same as heads, i.e. full MHA)')
+    parser.add_argument('-kv_heads', type=int, default=2,
+                        help='KV heads for GQA (0 = same as heads, i.e. full MHA; default 2)')
     parser.add_argument('-loops', type=int, default=1,
                         help='Depth recurrence: run the layer stack this many times')
     parser.add_argument('-dropout', type=float, default=0.0)
@@ -20,6 +20,30 @@ def parse_args():
     parser.add_argument('-printevery', type=int, default=10)
     parser.add_argument('-lr', type=float, default=3e-4, help='AdamW peak learning rate')
     parser.add_argument('-muon_lr', type=float, default=0.03, help='Muon peak learning rate')
+    parser.add_argument('-embed_lr', type=float, default=3e-3,
+                        help='AdamW peak LR for the tied embedding')
+    parser.add_argument('-scalar_lr', type=float, default=0.01,
+                        help='AdamW peak LR for 1D params (norm gains, biases, arch scalars)')
+    parser.add_argument('-muon_impl', choices=['local', 'torch'], default='local',
+                        help='Muon implementation: local muon.py (Polar Express) or torch.optim.Muon')
+    parser.add_argument('-schedule', choices=['wsd', 'cosine'], default='wsd',
+                        help='LR schedule: warmup-stable-decay or warmup+cosine to a 10% floor')
+    parser.add_argument('-decay_frac', type=float, default=0.25,
+                        help='WSD: fraction of total steps spent in the decay phase')
+    parser.add_argument('-momentum_warmup', type=int, default=300,
+                        help='Ramp Muon momentum 0.85 -> 0.95 over this many steps (0 disables)')
+    parser.add_argument('-no_compile', action='store_true',
+                        help='Disable torch.compile on the decoder trunk')
+    parser.add_argument('-grad_ckpt', type=int, default=0,
+                        help='Gradient checkpointing in the decoder (model.py)')
+    parser.add_argument('-value_residual', type=int, default=1,
+                        help='Value residual learning (model.py)')
+    parser.add_argument('-unet_skips', type=int, default=1,
+                        help='U-net skip connections across layers (model.py)')
+    parser.add_argument('-shuffle', type=int, default=1,
+                        help='Serve train windows in a seeded-permuted order per pass')
+    parser.add_argument('-ce_chunk', type=int, default=16384,
+                        help='Rows per chunk in the fused cross-entropy (0 = old unfused path)')
     parser.add_argument('-warmup_steps', type=int, default=100)
     parser.add_argument('-seqlen', type=int, default=512)
     parser.add_argument('-threshold', type=int, default=3)

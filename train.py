@@ -10,7 +10,9 @@ import torch.nn.functional as F
 
 from config import parse_args
 from data import data_feeder, load_bin
-from model import get_model, nopeak_mask
+from fused_ce import chunked_cross_entropy
+from model import LOGIT_SOFTCAP, get_model, nopeak_mask
+from muon import Muon as LocalMuon
 from tokenizer import BPETokenizer
 
 
@@ -27,36 +29,54 @@ def build_vocab_indices(vocab_size, device):
     return torch.arange(vocab_size, device=device)
 
 
-def make_optimizers(model, muon_lr=0.02, adamw_lr=3e-4):
+def make_optimizers(model, muon_lr=0.02, embed_lr=3e-3, scalar_lr=0.01,
+                    muon_impl='local'):
+    """Three param groups: Muon on hidden 2D matrices, AdamW on the tied
+    embedding (higher LR, decayed), AdamW on every ndim<2 scalar (no decay)."""
     embedding_weight = model.decoder.embed.embed.weight
-    muon_params, adamw_params = [], []
+    muon_params, scalar_params = [], []
     for p in model.parameters():
-        if not p.requires_grad:
+        if not p.requires_grad or p is embedding_weight:
             continue
-        if p is embedding_weight or p.ndim < 2:
-            adamw_params.append(p)
+        if p.ndim < 2:
+            scalar_params.append(p)
         else:
             muon_params.append(p)
-    muon = torch.optim.Muon(muon_params, lr=muon_lr, weight_decay=0.01)
-    adamw = torch.optim.AdamW(
-        adamw_params, lr=adamw_lr, weight_decay=0.1, betas=(0.9, 0.95)
-    )
+    if muon_impl == 'local':
+        muon = LocalMuon(muon_params, lr=muon_lr, weight_decay=0.01)
+    else:
+        muon = torch.optim.Muon(muon_params, lr=muon_lr, weight_decay=0.01)
+    groups = [{'params': [embedding_weight], 'lr': embed_lr, 'weight_decay': 0.1}]
+    if scalar_params:
+        groups.append({'params': scalar_params, 'lr': scalar_lr, 'weight_decay': 0.0})
+    adamw = torch.optim.AdamW(groups, lr=scalar_lr, weight_decay=0.0,
+                              betas=(0.8, 0.95), eps=1e-10)
     for opt in (muon, adamw):
         for group in opt.param_groups:
             group['peak_lr'] = group['lr']
     return [muon, adamw]
 
 
-def lr_factor(step, total_steps, warmup_steps=100, min_lr_ratio=0.1):
+def lr_factor(step, total_steps, warmup_steps=100, schedule='wsd',
+              decay_frac=0.25, min_lr_ratio=0.1):
     if step < warmup_steps:
         return (step + 1) / warmup_steps
-    progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-    cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
-    return min_lr_ratio + (1 - min_lr_ratio) * cosine
+    if schedule == 'cosine':
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+        return min_lr_ratio + (1 - min_lr_ratio) * cosine
+    # WSD: constant peak until decay_start, then 1 - sqrt(p) down to ~0.
+    decay_start = (1 - decay_frac) * total_steps
+    if step < decay_start:
+        return 1.0
+    p = (step - decay_start) / max(1, total_steps - decay_start)
+    return 1.0 - math.sqrt(min(1.0, p))
 
 
-def apply_lr_schedule(optimizers, step, total_steps, warmup_steps):
-    factor = lr_factor(step, total_steps, warmup_steps=warmup_steps)
+def apply_lr_schedule(optimizers, step, total_steps, warmup_steps,
+                      schedule='wsd', decay_frac=0.25):
+    factor = lr_factor(step, total_steps, warmup_steps=warmup_steps,
+                       schedule=schedule, decay_frac=decay_frac)
     for opt in optimizers:
         for group in opt.param_groups:
             group['lr'] = group['peak_lr'] * factor
@@ -88,9 +108,11 @@ class EarlyStopper:
 
 def save_checkpoint(model, optimizers, step, path, config=None):
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    # Strip torch.compile's wrapper prefix so checkpoints load into eager models.
+    state = {k.replace('_orig_mod.', ''): v for k, v in model.state_dict().items()}
     torch.save({
         'step': step,
-        'model': model.state_dict(),
+        'model': state,
         'optimizers': [o.state_dict() for o in optimizers],
         'config': config,
     }, path)
@@ -99,6 +121,35 @@ def save_checkpoint(model, optimizers, step, path, config=None):
 def _checkpoint_path(opt, tag):
     base = opt.savename or 'ckpt'
     return os.path.join(opt.dir_name, f'{base}_{tag}.pt')
+
+
+def _batch_loss(model, inX, out, opt):
+    """Fused chunked CE on CUDA (mask=None engages the causal flash path);
+    otherwise the old soft-capped logits + F.cross_entropy route."""
+    if opt.device.type == 'cuda' and getattr(opt, 'ce_chunk', 0) > 0:
+        hidden = model.decoder(inX, None)
+        return chunked_cross_entropy(hidden.view(-1, hidden.size(-1)),
+                                     model.out.weight, out.reshape(-1),
+                                     LOGIT_SOFTCAP, opt.ce_chunk)
+    mask = nopeak_mask(inX.size(1), opt.device)
+    pred = model(inX, mask)
+    return F.cross_entropy(pred.view(-1, opt.vocab_size), out.reshape(-1))
+
+
+def _apply_momentum_warmup(optimizers, step, warmup):
+    """Ramp Muon momentum 0.85 -> 0.95 over the first `warmup` steps."""
+    if not warmup:
+        return
+    if step < warmup:
+        m = 0.85 + 0.10 * (step + 1) / warmup
+    elif step == warmup:
+        m = 0.95
+    else:
+        return
+    for o in optimizers:
+        for g in o.param_groups:
+            if 'momentum' in g:
+                g['momentum'] = m
 
 
 def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
@@ -170,26 +221,28 @@ def train_model(model, opt):
                 stop_training = True
         return val_loss
     for epoch in range(opt.epochs):
-        epoch_loss = 0
+        epoch_loss = torch.zeros((), device=opt.device)
         epoch_tokens = 0
         iter = 0
 
         for o in opt.optimizers:
             o.zero_grad()
 
-        for inX, out in data_feeder(opt.train, opt.batchsize, opt.seqlen, opt.device):
+        for inX, out in data_feeder(opt.train, opt.batchsize, opt.seqlen, opt.device,
+                                    shuffle=bool(getattr(opt, 'shuffle', 0)),
+                                    seed=42 + epoch):
             iter += 1
-            apply_lr_schedule(opt.optimizers, step, opt.total_steps, opt.warmup_steps)
+            apply_lr_schedule(opt.optimizers, step, opt.total_steps, opt.warmup_steps,
+                              schedule=getattr(opt, 'schedule', 'wsd'),
+                              decay_frac=getattr(opt, 'decay_frac', 0.25))
+            _apply_momentum_warmup(opt.optimizers, step,
+                                   getattr(opt, 'momentum_warmup', 0))
 
-            mask = nopeak_mask(inX.size(1), opt.device)
             with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-                pred = model(inX, mask)
-                pred = pred.view(-1, opt.vocab_size)
-                out = out.reshape(-1)
-                loss = F.cross_entropy(pred, out)
+                loss = _batch_loss(model, inX, out, opt)
 
-            epoch_loss += loss.item() * out.size(0)
-            epoch_tokens += out.size(0)
+            epoch_loss += loss.detach() * out.numel()
+            epoch_tokens += out.numel()
 
             (loss / grad_accum).backward()
             micro += 1
@@ -215,7 +268,7 @@ def train_model(model, opt):
                 if stop_training:
                     break
 
-        train_loss = epoch_loss / epoch_tokens
+        train_loss = (epoch_loss / epoch_tokens).item()
         training_losses.append(train_loss)
         print(f"Epoch {epoch+1} finished: Train Loss = {train_loss:.4f}")
 
@@ -238,25 +291,21 @@ def train_model(model, opt):
 def validate_model(model, opt, max_batches=None):
     print("validating model...")
     model.eval()  # Set to evaluation mode so dropout, etc. are disabled
-    total_loss = 0
+    total_loss = torch.zeros((), device=opt.device)
     total_tokens = 0
 
     with torch.no_grad(), torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
         for i, (inX, out) in enumerate(data_feeder(opt.valid, opt.batchsize, opt.seqlen, opt.device)):
             if max_batches is not None and i >= max_batches:
                 break
-            mask = nopeak_mask(inX.size(1), opt.device)
-            pred = model(inX, mask)
-            pred = pred.view(-1, opt.vocab_size)
-            out = out.reshape(-1)
-            loss = F.cross_entropy(pred, out)
-            total_loss += loss.item() * out.size(0)
-            total_tokens += out.size(0)
+            loss = _batch_loss(model, inX, out, opt)
+            total_loss += loss * out.numel()
+            total_tokens += out.numel()
 
     if total_tokens == 0:
         print("validation skipped: val set yields no full batches")
         return float('inf')
-    avg_loss = total_loss / total_tokens
+    avg_loss = (total_loss / total_tokens).item()
     print(f"Validation Loss = {avg_loss:.4f}")
     return avg_loss
 
@@ -283,20 +332,16 @@ def plot_learning_curves(train_losses, valid_losses, test_loss=None, path='learn
 def test_model(model, opt, epoch):
     print("testing model...")
     model.eval()
-    total_loss = 0
+    total_loss = torch.zeros((), device=opt.device)
     total_tokens = 0
 
     with torch.no_grad(), torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
         for x_in, x_out in data_feeder(opt.test, opt.batchsize, opt.seqlen, opt.device):
-            mask = nopeak_mask(x_in.size(1), opt.device)
-            preds = model(x_in, mask)
-            preds = preds.view(-1, opt.vocab_size)
-            x_out = x_out.reshape(-1)
-            loss = F.cross_entropy(preds, x_out)
-            total_loss += loss.item() * x_out.size(0)
-            total_tokens += x_out.size(0)
+            loss = _batch_loss(model, x_in, x_out, opt)
+            total_loss += loss * x_out.numel()
+            total_tokens += x_out.numel()
 
-    avg_loss = total_loss / total_tokens
+    avg_loss = (total_loss / total_tokens).item()
     pplx = math.exp(avg_loss)
     print(f"Epoch {epoch+1}: Test Loss = {avg_loss:.4f} | Perplexity = {pplx:.2f}")
 
@@ -343,6 +388,13 @@ def main():
 
     model = get_model(opt, opt.vocab_size)
 
+    if opt.device.type == 'cuda' and not opt.no_compile:
+        # Compile the trunk only; the fused CE stays eager (custom autograd).
+        try:
+            model.decoder = torch.compile(model.decoder)
+        except Exception as e:
+            print(f"torch.compile failed ({e}); falling back to eager")
+
     opt.model_config = {
         'vocab_size': opt.vocab_size,
         'd_model': opt.d_model,
@@ -351,12 +403,18 @@ def main():
         'kv_heads': opt.kv_heads or opt.heads,
         'loops': opt.loops,
         'dropout': opt.dropout,
+        'value_residual': bool(getattr(opt, 'value_residual', 0)),
+        'unet_skips': bool(getattr(opt, 'unet_skips', 0)),
+        'grad_ckpt': bool(getattr(opt, 'grad_ckpt', 0)),
     }
 
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'total params: {params}')
 
-    opt.optimizers = make_optimizers(model, muon_lr=opt.muon_lr, adamw_lr=opt.lr)
+    opt.optimizers = make_optimizers(model, muon_lr=opt.muon_lr,
+                                     embed_lr=opt.embed_lr,
+                                     scalar_lr=opt.scalar_lr,
+                                     muon_impl=opt.muon_impl)
     batches_per_epoch = max(1, len(opt.train) // (opt.batchsize * opt.seqlen))
     opt.total_steps = max(1, opt.epochs * batches_per_epoch // max(1, opt.grad_accum))
 
