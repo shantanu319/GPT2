@@ -1,20 +1,33 @@
 import torch
 
 
+# Polar Express per-step quintic coefficients (arXiv:2505.16932) — one tuple
+# per iteration; better orthogonalization than the classic single-coefficient
+# Newton-Schulz at GPT-2 scale.
+_POLAR_EXPRESS = [
+    (8.1566, -22.4833, 15.8788),
+    (4.0429, -2.8089, 0.5000),
+    (3.8917, -2.7725, 0.5061),
+    (3.2858, -2.3681, 0.4645),
+    (2.3465, -1.7098, 0.4232),
+]
+
+
 @torch.no_grad()
-def _newton_schulz(G, steps=5, eps=1e-7):
-    # Approximates the orthogonal factor U @ V.T of the SVD G = U S V.T via
-    # a quintic polynomial iteration. Operates on the smaller dim by
-    # transposing tall matrices.
+def _polar_express(G, steps=5, eps=1e-7):
+    # Approximates the orthogonal factor U @ V.T of the SVD G = U S V.T.
+    # Runs in bf16 (inputs pre-normalized with a 1.02 safety factor so the
+    # iteration stays in its convergence basin); operates on the smaller dim
+    # by transposing tall matrices.
     assert G.ndim == 2
-    a, b, c = 3.4445, -4.7750, 2.0315
-    X = G.to(torch.float32)
-    X = X / (X.norm() + eps)
+    X = G.to(torch.bfloat16)
+    X = X / (X.norm() * 1.02 + eps)
     transposed = False
     if X.size(0) > X.size(1):
         X = X.T
         transposed = True
-    for _ in range(steps):
+    for i in range(steps):
+        a, b, c = _POLAR_EXPRESS[i % len(_POLAR_EXPRESS)]
         A = X @ X.T
         B = b * A + c * (A @ A)
         X = a * X + B @ X
@@ -24,15 +37,17 @@ def _newton_schulz(G, steps=5, eps=1e-7):
 
 
 class Muon(torch.optim.Optimizer):
-    """MomentUm Orthogonalized by Newton-schulz.
+    """MomentUm Orthogonalized by Newton-schulz (Polar Express variant).
 
     Only supports 2D matrix parameters. Use AdamW for 1D parameters
     (biases, norm scales) and for embeddings / LM heads — see Keller
     Jordan's paper for the rationale.
     """
 
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
+    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5,
+                 weight_decay=0.0):
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov,
+                        ns_steps=ns_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
     @torch.no_grad()
@@ -43,6 +58,7 @@ class Muon(torch.optim.Optimizer):
             momentum = group['momentum']
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
+            wd = group['weight_decay']
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -59,7 +75,10 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(g)
                 update = g.add(buf, alpha=momentum) if nesterov else buf
 
-                update = _newton_schulz(update, steps=ns_steps)
+                update = _polar_express(update, steps=ns_steps)
+                if wd:
+                    # Decoupled weight decay, applied before the orthogonal update.
+                    p.mul_(1 - lr * wd)
                 # Equalize update magnitude across different matrix shapes.
                 scale = max(1.0, update.shape[0] / update.shape[1]) ** 0.5
                 p.add_(update, alpha=-lr * scale)

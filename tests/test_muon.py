@@ -12,6 +12,39 @@ def test_muon_rejects_1d_params():
         opt.step()
 
 
+def test_muon_weight_decay_shrinks_params():
+    """With zero grads the orthogonal update vanishes, leaving exactly p*(1 - lr*wd)."""
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(16, 8))
+    p0 = p.detach().clone()
+    opt = Muon([p], lr=0.1, weight_decay=0.5)
+    p.grad = torch.zeros_like(p)
+    opt.step()
+    assert torch.allclose(p.detach(), p0 * (1 - 0.1 * 0.5), atol=1e-7)
+
+
+def test_muon_weight_decay_off_by_default():
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(16, 8))
+    p0 = p.detach().clone()
+    opt = Muon([p], lr=0.1)
+    p.grad = torch.zeros_like(p)
+    opt.step()
+    assert torch.equal(p.detach(), p0)
+
+
+def test_muon_bf16_input_smoke():
+    torch.manual_seed(0)
+    p = torch.nn.Parameter(torch.randn(16, 8, dtype=torch.bfloat16))
+    opt = Muon([p], lr=0.05)
+    before = p.detach().clone()
+    p.grad = torch.randn(16, 8, dtype=torch.bfloat16)
+    opt.step()
+    assert p.dtype == torch.bfloat16
+    assert torch.isfinite(p.detach()).all()
+    assert not torch.equal(p.detach(), before)
+
+
 def test_muon_reduces_loss_on_tall_matrix():
     """Muon should fit a linear regression Y = XW^T when W is (out, in) with out > in."""
     torch.manual_seed(0)
