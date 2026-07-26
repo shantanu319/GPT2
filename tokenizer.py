@@ -4,8 +4,18 @@ import re
 from collections import Counter, OrderedDict
 
 
-# GPT-2 style pre-tokenization regex. Pattern is applied before BPE so merges
-# can't cross word boundaries (punctuation, whitespace, etc.).
+# GPT-4 style pre-tokenization regex (cl100k/o200k lineage), in stdlib-re form:
+# letters and digits never share a pre-token, and digit runs are chunked to <=3
+# chars so rare numbers don't fragment arbitrarily (arXiv:2402.14903). Applied
+# before BPE so merges can't cross chunk boundaries. The punctuation class is
+# written (?:[^\s\w]|_) because plain [^\s\w] excludes '_' — without it,
+# underscores would match no alternative and be silently dropped.
+GPT4_SPLIT_PATTERN = (r"'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD]"
+                      r"| ?[^\W\d_]+| ?\d{1,3}| ?(?:[^\s\w]|_)+"
+                      r"|\s+(?!\S)|\s+")
+
+# Legacy GPT-2 pattern, kept for reference; tokenizer.json stores the pattern
+# it was trained with, so old files still load with this one.
 GPT2_SPLIT_PATTERN = r"""'s|'t|'re|'ve|'m|'ll|'d| ?\w+| ?[^\s\w]+|\s+(?!\S)|\s+"""
 
 DEFAULT_CHUNK_CACHE_SIZE = 50_000
@@ -91,7 +101,7 @@ class _LRUCache:
 
 class BPETokenizer:
     def __init__(self, pattern=None, special_tokens=None, cache_size=DEFAULT_CHUNK_CACHE_SIZE):
-        self.pattern = pattern or GPT2_SPLIT_PATTERN
+        self.pattern = pattern or GPT4_SPLIT_PATTERN
         self._compiled = re.compile(self.pattern)
         self.special_tokens = dict(special_tokens or {})
         self.merges = {}  # (int, int) -> int

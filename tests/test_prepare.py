@@ -146,3 +146,8 @@ def test_local_fast_path_matches_serial(monkeypatch, tmp_path):
     capped = list(prepare.local_mixed_stream(paths, sources, seed=1337,
                                              max_docs=100))
     assert capped == serial[:100]
+
+
+def test_default_sources_weights_sum_to_one():
+    import prepare
+    assert abs(sum(s.weight for s in prepare.SOURCES) - 1.0) < 1e-9

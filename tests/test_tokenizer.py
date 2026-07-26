@@ -63,11 +63,11 @@ def test_train_equivalent_to_naive():
     """Incremental train must produce the exact same merges as the
     straightforward per-chunk algorithm — same merges, same ids, same order."""
     from collections import Counter
-    from tokenizer import _get_pair_counts, _merge, _pick_top_pair, GPT2_SPLIT_PATTERN
+    from tokenizer import _get_pair_counts, _merge, _pick_top_pair, GPT4_SPLIT_PATTERN
     import re
 
     def naive_train(text, vocab_size):
-        compiled = re.compile(GPT2_SPLIT_PATTERN)
+        compiled = re.compile(GPT4_SPLIT_PATTERN)
         ids = [list(c.encode('utf-8')) for c in compiled.findall(text)]
         merges = {}
         for i in range(vocab_size - 256):
@@ -197,3 +197,25 @@ def test_train_resets_cache():
     assert len(t._chunk_cache) > 0
     t.train(CORPUS, vocab_size=300)
     assert len(t._chunk_cache) == 0
+
+
+def test_pretokenizer_chunks_digit_runs_to_three():
+    """Digit runs must split into <=3-char pre-tokens (arXiv:2402.14903)."""
+    t = BPETokenizer()
+    assert t._compiled.findall("1234567") == ["123", "456", "7"]
+    assert t._compiled.findall("see 1234567890!") == ["see", " 123", "456", "789", "0", "!"]
+
+
+def test_pretokenizer_separates_letters_and_digits():
+    """Letters and digits must never share a pre-token."""
+    t = BPETokenizer()
+    assert t._compiled.findall("abc123") == ["abc", "123"]
+    assert t._compiled.findall("abc123def") == ["abc", "123", "def"]
+
+
+def test_underscore_roundtrip():
+    """'_' is a word char but not a letter — it must still be consumable."""
+    t = BPETokenizer()
+    t.train(CORPUS, vocab_size=300)
+    for text in ["a_b", "snake_case_function(x, y)"]:
+        assert t.decode(t.encode(text)) == text

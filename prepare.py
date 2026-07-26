@@ -1,8 +1,8 @@
 """Offline data prep: train a BPE tokenizer and emit .bin shards for a mixed corpus.
 
 The corpus is a weighted interleave of several HuggingFace streams (see SOURCES):
-synthetic textbooks (cosmopedia-v2), real educational web text (fineweb-edu-dedup),
-math (FineMath-4+, OpenMathInstruct-2 worked solutions) and physics (CAMEL physics).
+real educational web (fineweb-edu-dedup, DCLM-baseline), synthetic textbooks
+(cosmopedia-v2), educational Python code (codeparrot-clean) and math (FineMath-4+).
 
 Run once to produce:
   {output_dir}/tokenizer.json
@@ -32,6 +32,10 @@ def _render_text(row):
     return row['text']
 
 
+def _render_content(row):
+    return row['content']
+
+
 def _render_problem_solution(row):
     return f"Problem:\n{row['problem']}\n\nSolution:\n{row['generated_solution']}"
 
@@ -49,18 +53,17 @@ class Source:
     render: Callable
 
 
-# Weighted pretraining mixture (SmolLM2-135M-style: keep a synthetic-textbook
-# backbone, add real web for register diversity, then math + physics).
+# Weighted pretraining mixture (SmolLM2-style: FineWeb-Edu + DCLM web backbone —
+# FineWeb-Edu wins ARC/MMLU, DCLM wins HellaSwag/CSQA — plus a synthetic-textbook
+# slice, educational Python code, and a pinch of math; arXiv:2502.02737,
+# arXiv:2408.10914). openmathinstruct/camel-physics renders stay available
+# above but are out of the default mix.
 SOURCES = [
-    Source('cosmopedia',  'HuggingFaceTB/smollm-corpus', 'cosmopedia-v2',      0.55, _render_text),
-    Source('fineweb-edu', 'HuggingFaceTB/smollm-corpus', 'fineweb-edu-dedup',  0.20, _render_text),
-    Source('finemath',    'HuggingFaceTB/finemath',      'finemath-4plus',     0.15, _render_text),
-    Source('openmath',    'nvidia/OpenMathInstruct-2',   None,                 0.05, _render_problem_solution),
-    # camel-ai/physics streams at ~1 doc/s; _iter_source_rows fetches its
-    # physics.zip from the hub instead (instant, same doc order). It must stay
-    # in the mixture regardless — the trained tokenizer's BPE corpus included
-    # it, so removing it changes the merges and breaks tokenizer compatibility.
-    Source('camel-physics', 'camel-ai/physics',          None,                 0.05, _render_camel),
+    Source('fineweb-edu', 'HuggingFaceTB/smollm-corpus',    'fineweb-edu-dedup', 0.42, _render_text),
+    Source('dclm',        'mlfoundations/dclm-baseline-1.0', None,               0.28, _render_text),
+    Source('cosmopedia',  'HuggingFaceTB/smollm-corpus',    'cosmopedia-v2',     0.15, _render_text),
+    Source('code-python', 'codeparrot/codeparrot-clean',    None,                0.10, _render_content),
+    Source('finemath',    'HuggingFaceTB/finemath',         'finemath-4plus',    0.05, _render_text),
 ]
 
 # Worker-process state, populated once per worker by _init_worker.
@@ -299,7 +302,7 @@ def main():
     parser.add_argument('--output-dir', default='data_cache/cosmopedia')
     parser.add_argument('--vocab-size', type=int, default=32000,
                         help='Total vocab size including special tokens')
-    parser.add_argument('--bpe-train-docs', type=int, default=10000,
+    parser.add_argument('--bpe-train-docs', type=int, default=100000,
                         help='Number of docs (from the mixed stream) for BPE training')
     parser.add_argument('--max-train-docs', type=int, default=None,
                         help='Cap for tokenizing the mixed stream (default: full stream)')
