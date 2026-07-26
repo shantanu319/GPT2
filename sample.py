@@ -162,6 +162,8 @@ def main():
         dropout=cfg['dropout'],
         kv_heads=cfg.get('kv_heads'),
         loops=cfg.get('loops', 1),
+        value_residual=cfg.get('value_residual', False),
+        unet_skips=cfg.get('unet_skips', False),
     ).to(device)
     model.load_state_dict(ckpt['model'])
 

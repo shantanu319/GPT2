@@ -120,6 +120,8 @@ def main():
         vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
         heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
         kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
+        value_residual=cfg.get('value_residual', False),
+        unet_skips=cfg.get('unet_skips', False),
     ).to(device).eval()
     model.load_state_dict(ckpt['model'])
 
