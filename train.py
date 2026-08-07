@@ -207,8 +207,8 @@ def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
 def train_model(model, opt):
     print("training model...")
     model.train()
-    training_losses = []
-    validation_losses = []
+    train_curve = []   # (step, batch loss) recorded at each print log
+    val_curve = []     # (step, val loss) recorded at each eval
 
     grad_accum = max(1, getattr(opt, 'grad_accum', 1))
     val_every = getattr(opt, 'val_every', 0)
@@ -230,6 +230,8 @@ def train_model(model, opt):
         nonlocal stop_training
         val_loss = validate_model(model, opt, max_batches=max_batches)
         model.train()
+        if math.isfinite(val_loss):
+            val_curve.append((step, val_loss))
         if stopper is not None:
             if stopper.check(val_loss):
                 path = _checkpoint_path(opt, 'best')
@@ -278,6 +280,7 @@ def train_model(model, opt):
             if iter % opt.printevery == 0:
                 current_pplx = math.exp(loss.item())
                 print(f"Epoch {epoch+1} | iter {iter} | step {step} | Loss: {loss.item():.4f} | pplx: {current_pplx:.2f}")
+                train_curve.append((step, loss.item()))
 
             step += 1
             if opt.save_every and step % opt.save_every == 0:
@@ -290,12 +293,10 @@ def train_model(model, opt):
                     break
 
         train_loss = (epoch_loss / epoch_tokens).item()
-        training_losses.append(train_loss)
         print(f"Epoch {epoch+1} finished: Train Loss = {train_loss:.4f}")
 
         # Validate at the end of each epoch:
-        valid_loss = eval_and_check(max_batches=None)
-        validation_losses.append(valid_loss)
+        eval_and_check(max_batches=None)
         if stop_training:
             break
 
@@ -306,7 +307,7 @@ def train_model(model, opt):
     save_checkpoint(model, opt.optimizers, step, final_path, config=opt.model_config)
     print(f"Saved final checkpoint: {final_path}")
 
-    return training_losses, validation_losses
+    return train_curve, val_curve
 
 
 def validate_model(model, opt, max_batches=None):
@@ -331,17 +332,29 @@ def validate_model(model, opt, max_batches=None):
     return avg_loss
 
 
-def plot_learning_curves(train_losses, valid_losses, test_loss=None, path='learning_curves.png'):
+def plot_learning_curves(train_curve, val_curve, test_loss=None, path='learning_curves.png'):
+    """train_curve / val_curve are (step, loss) lists recorded during training."""
     plt.figure(figsize=(10, 6))
-    epochs = range(1, len(train_losses) + 1)
-    plt.plot(epochs, train_losses, label='Training', marker='o')
-    plt.plot(epochs, valid_losses, label='Validation', marker='o')
+    if train_curve:
+        steps, losses = zip(*train_curve)
+        plt.plot(steps, losses, color='tab:blue', alpha=0.3, linewidth=1,
+                 label='Training (per log step)')
+        window = max(2, len(losses) // 10)
+        smoothed = [
+            sum(losses[max(0, i - window + 1):i + 1]) / len(losses[max(0, i - window + 1):i + 1])
+            for i in range(len(losses))
+        ]
+        plt.plot(steps, smoothed, color='tab:blue', linewidth=2,
+                 label='Training (smoothed)')
+    if val_curve:
+        v_steps, v_losses = zip(*val_curve)
+        plt.plot(v_steps, v_losses, marker='o', color='tab:orange', label='Validation')
     if test_loss is not None:
         plt.axhline(
             y=test_loss, linestyle='--', color='gray',
             label=f'Test (final) = {test_loss:.3f}',
         )
-    plt.xlabel('Epoch')
+    plt.xlabel('Optimizer step')
     plt.ylabel('Cross-Entropy Loss')
     plt.title('Learning Curves')
     plt.legend()
@@ -441,9 +454,9 @@ def main():
     batches_per_epoch = max(1, len(opt.train) // (opt.batchsize * opt.seqlen))
     opt.total_steps = max(1, opt.epochs * batches_per_epoch // max(1, opt.grad_accum))
 
-    train_losses, valid_losses = train_model(model, opt)
+    train_curve, val_curve = train_model(model, opt)
     test_loss = test_model(model, opt, -1)
-    plot_learning_curves(train_losses, valid_losses, test_loss=test_loss)
+    plot_learning_curves(train_curve, val_curve, test_loss=test_loss)
 
 
 if __name__ == "__main__":
