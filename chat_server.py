@@ -157,6 +157,7 @@ def main():
         loops=cfg.get('loops', 1),
         value_residual=cfg.get('value_residual', False),
         unet_skips=cfg.get('unet_skips', False),
+        attn_res=cfg.get('attn_res', 0),
     ).to(device)
     model.load_state_dict(ckpt['model'])
     log(f"model loaded: {sum(p.numel() for p in model.parameters()):,} params")

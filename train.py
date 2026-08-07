@@ -426,6 +426,7 @@ def main():
         'dropout': opt.dropout,
         'value_residual': bool(getattr(opt, 'value_residual', 0)),
         'unet_skips': bool(getattr(opt, 'unet_skips', 0)),
+        'attn_res': getattr(opt, 'attn_res', 0) or 0,
         'grad_ckpt': bool(getattr(opt, 'grad_ckpt', 0)),
     }
 

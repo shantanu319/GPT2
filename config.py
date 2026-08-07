@@ -43,6 +43,10 @@ def parse_args():
                         help='Value residual learning (model.py)')
     parser.add_argument('-unet_skips', type=int, default=1,
                         help='U-net skip connections across layers (model.py)')
+    parser.add_argument('-attn_res', type=int, default=0,
+                        help='Attention Residuals block size (model.py): every N layers, mix '
+                             'all previous block outputs via softmax attention over depth '
+                             '(0 = disabled)')
     parser.add_argument('-shuffle', type=int, default=1,
                         help='Serve train windows in a seeded-permuted order per pass')
     parser.add_argument('-ce_chunk', type=int, default=16384,

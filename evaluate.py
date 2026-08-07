@@ -122,6 +122,7 @@ def main():
         kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
         value_residual=cfg.get('value_residual', False),
         unet_skips=cfg.get('unet_skips', False),
+        attn_res=cfg.get('attn_res', 0),
     ).to(device).eval()
     model.load_state_dict(ckpt['model'])
 
