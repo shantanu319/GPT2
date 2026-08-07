@@ -124,7 +124,7 @@ def main():
     parser.add_argument('--checkpoint', required=True)
     parser.add_argument('--data-dir', required=True)
     parser.add_argument('--max-tokens', type=int, default=100)
-    parser.add_argument('--temperature', type=float, default=0.8)
+    parser.add_argument('--temperature', type=float, default=0.5)
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--no-cuda', action='store_true')

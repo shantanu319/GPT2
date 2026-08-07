@@ -2,7 +2,7 @@
 
 Example:
   python sample.py --checkpoint saved/model/ckpt_final.pt --prompt "Once upon a time" \
-                   --max-tokens 200 --temperature 0.8 --top-p 0.9
+                   --max-tokens 200 --temperature 0.5 --top-p 0.9
 """
 import argparse
 import os
@@ -123,7 +123,7 @@ def main():
     parser.add_argument('--data-dir', default='data_cache/cosmopedia')
     parser.add_argument('--prompt', default='')
     parser.add_argument('--max-tokens', type=int, default=200)
-    parser.add_argument('--temperature', type=float, default=0.8)
+    parser.add_argument('--temperature', type=float, default=0.5)
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--num-samples', type=int, default=1)
     parser.add_argument('--max-context', type=int, default=512)

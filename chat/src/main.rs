@@ -34,7 +34,7 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     max_tokens: usize,
 
-    #[arg(long, default_value_t = 0.8)]
+    #[arg(long, default_value_t = 0.5)]
     temperature: f32,
 
     #[arg(long, default_value_t = 0.9)]
