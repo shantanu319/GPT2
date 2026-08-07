@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from core.kda import KimiDeltaAttention
+
 
 LOGIT_SOFTCAP = 15.0  # tanh soft-capping (Gemma-2 / modded-nanogpt record #18)
 
@@ -202,7 +204,7 @@ def get_clones(module, N):
 # build a decoder layer with two multi-head attention layers and
 # one feed-forward layer
 class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
-    def __init__(self, d_model, heads, dropout=0.1, kv_heads=None):
+    def __init__(self, d_model, heads, dropout=0.1, kv_heads=None, use_kda=False):
         super().__init__()
         self.norm_1 = RMSNorm(d_model)
         self.norm_3 = RMSNorm(d_model)
@@ -210,13 +212,22 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
         self.dropout_1 = nn.Dropout(dropout)
         self.dropout_3 = nn.Dropout(dropout)
 
-        self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads, dropout=dropout)
+        self.is_kda = use_kda
+        if use_kda:
+            self.attn_1 = KimiDeltaAttention(d_model, heads)
+        else:
+            self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads, dropout=dropout)
         self.ff = SwiGLU(d_model, dropout=dropout)
 
     def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None):
         x2 = self.norm_1(x)
-        att, v = self.attn_1(x2, x2, x2, mask, start_pos=start_pos,
-                             cache_idx=cache_idx, v1=v1)
+        if self.is_kda:
+            # KDA ignores the attention mask (the recurrence is inherently
+            # causal) and does not participate in value-residual mixing.
+            att, v = self.attn_1(x2, start_pos=start_pos, cache_idx=cache_idx), None
+        else:
+            att, v = self.attn_1(x2, x2, x2, mask, start_pos=start_pos,
+                                 cache_idx=cache_idx, v1=v1)
         x = x + self.dropout_1(att)
         x2 = self.norm_3(x)
         x = x + self.dropout_3(self.ff(x2))
@@ -225,7 +236,8 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
 
 class Decoder(nn.Module):
     def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
-                 grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0):
+                 grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0,
+                 kda=0):
         super().__init__()
         self.N = N
         self.loops = loops
@@ -233,13 +245,26 @@ class Decoder(nn.Module):
         self.value_residual = value_residual
         self.unet_skips = unet_skips
         self.attn_res = attn_res
+        self.kda = kda
         self.embed = Embedder(vocab, d_model)
-        self.layers = get_clones(DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads), N)
+        if kda:
+            # Every layer is KDA except each kda-th one, which keeps full SDPA
+            # attention: kda=1 -> all KDA, kda=4 -> Kimi-style 3:1 hybrid.
+            self.layers = nn.ModuleList([
+                DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads,
+                             use_kda=not (kda > 1 and i % kda == kda - 1))
+                for i in range(N)
+            ])
+        else:
+            self.layers = get_clones(DecoderLayer(d_model, heads, dropout,
+                                                  kv_heads=kv_heads), N)
         self.norm = RMSNorm(d_model)
         if value_residual:
-            # Per-layer value-mix scalars init 0 (sigmoid=0.5). Layer 0 stays
-            # unmixed (it defines v1), so it gets no scalar.
-            for i in range(1, N):
+            # Per-layer value-mix scalars init 0 (sigmoid=0.5). Only full-
+            # attention layers participate; the first one stays unmixed
+            # (it defines v1), so it gets no scalar.
+            mha_ids = [i for i in range(N) if not self.layers[i].is_kda]
+            for i in mha_ids[1:]:
                 self.layers[i].attn_1.vres = nn.Parameter(torch.zeros(()))
         if unet_skips:
             # Skip gates init -1.5 (sigmoid ~0.18): x0 embedding shortcut for
@@ -286,14 +311,14 @@ class Decoder(nn.Module):
                     x_in = x + torch.sigmoid(self.skip_x0[i]) * x0
                     if i >= half:
                         x_in = x_in + torch.sigmoid(self.skip_unet[i]) * outs[self.N - 1 - i]
-                v1_in = v1 if self.value_residual and i > 0 else None
+                v1_in = v1 if (self.value_residual and not self.layers[i].is_kda) else None
                 if self.training and self.grad_ckpt:
                     x, v = checkpoint(self.layers[i], x_in, mask, start_pos, loop,
                                       v1_in, use_reentrant=False)
                 else:
                     x, v = self.layers[i](x_in, mask, start_pos=start_pos,
                                           cache_idx=loop, v1=v1_in)
-                if i == 0:
+                if v1 is None and v is not None:
                     v1 = v
                 outs.append(x)
                 if self.attn_res and (i % self.attn_res == self.attn_res - 1
@@ -304,12 +329,13 @@ class Decoder(nn.Module):
 
 class Transformer(nn.Module):
     def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
-                 grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0):
+                 grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0,
+                 kda=0):
         super().__init__()
         self.decoder = Decoder(vocab, d_model, N, heads, dropout,
                                kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
                                value_residual=value_residual, unet_skips=unet_skips,
-                               attn_res=attn_res)
+                               attn_res=attn_res, kda=kda)
         self.out = nn.Linear(d_model, vocab)
         self.out.weight = self.decoder.embed.embed.weight
 
@@ -336,11 +362,12 @@ def get_model(opt, vocab):
     value_residual = bool(getattr(opt, 'value_residual', False))
     unet_skips = bool(getattr(opt, 'unet_skips', False))
     attn_res = getattr(opt, 'attn_res', 0) or 0
+    kda = getattr(opt, 'kda', 0) or 0
 
     model = Transformer(vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout,
                         kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
                         value_residual=value_residual, unet_skips=unet_skips,
-                        attn_res=attn_res)
+                        attn_res=attn_res, kda=kda)
     model.to(opt.device)
 
     if opt.loadname is not None:
@@ -351,9 +378,10 @@ def get_model(opt, vocab):
     else:
         for name, p in model.named_parameters():
             if p.dim() > 1:
-                # Zero-init residual-out projections (attn out + FFN down):
+                # Zero-init residual-out projections (attn/KDA out + FFN down):
                 # each block starts as identity, so depth costs nothing at init.
-                if name.endswith('attn_1.out.weight') or name.endswith('ff.w_down.weight'):
+                if name.endswith(('attn_1.out.weight', 'attn_1.o_proj.weight',
+                                  'ff.w_down.weight')):
                     nn.init.zeros_(p)
                 else:
                     nn.init.xavier_uniform_(p)

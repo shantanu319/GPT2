@@ -47,6 +47,10 @@ def parse_args():
                         help='Attention Residuals block size (model.py): every N layers, mix '
                              'all previous block outputs via softmax attention over depth '
                              '(0 = disabled)')
+    parser.add_argument('-kda', type=int, default=0,
+                        help='Kimi Delta Attention (kda.py): use KDA linear attention in '
+                             'all but every Nth layer, which keeps full SDPA attention '
+                             '(0 = disabled, 1 = every layer KDA, 4 = Kimi-style 3:1 hybrid)')
     parser.add_argument('-shuffle', type=int, default=1,
                         help='Serve train windows in a seeded-permuted order per pass')
     parser.add_argument('-ce_chunk', type=int, default=16384,

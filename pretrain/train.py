@@ -47,20 +47,25 @@ def make_optimizers(model, muon_lr=0.02, embed_lr=3e-3, scalar_lr=0.01,
         else:
             muon_params.append(p)
     if muon_per_head and muon_impl == 'local':
-        attn = model.decoder.layers[0].attn_1
+        attns = [layer.attn_1 for layer in model.decoder.layers]
+        mha = next((a for a in attns if hasattr(a, 'h_kv')), None)
+        n_heads = attns[0].h
+        n_kv = mha.h_kv if mha is not None else n_heads
         n_tagged = 0
         for name, p in model.named_parameters():
-            if name.endswith('attn_1.q_linear.weight'):
-                p.muon_head_split = (attn.h, 0)
+            if name.endswith(('attn_1.q_linear.weight', 'attn_1.q_proj.weight')):
+                p.muon_head_split = (n_heads, 0)
             elif name.endswith(('attn_1.k_linear.weight', 'attn_1.v_linear.weight')):
-                p.muon_head_split = (attn.h_kv, 0)
-            elif name.endswith('attn_1.out.weight'):
-                p.muon_head_split = (attn.h, 1)
+                p.muon_head_split = (n_kv, 0)
+            elif name.endswith(('attn_1.k_proj.weight', 'attn_1.v_proj.weight')):
+                p.muon_head_split = (n_heads, 0)
+            elif name.endswith(('attn_1.out.weight', 'attn_1.o_proj.weight')):
+                p.muon_head_split = (n_heads, 1)
             else:
                 continue
             n_tagged += 1
         print(f'per-head Muon: tagged {n_tagged} attention matrices '
-              f'({attn.h} q/out heads, {attn.h_kv} kv heads)')
+              f'({n_heads} q/out heads, {n_kv} kv heads)')
     elif muon_per_head:
         print('warning: -muon_per_head only affects the local Muon; ignoring')
     if muon_impl == 'local':
@@ -440,6 +445,7 @@ def main():
         'value_residual': bool(getattr(opt, 'value_residual', 0)),
         'unet_skips': bool(getattr(opt, 'unet_skips', 0)),
         'attn_res': getattr(opt, 'attn_res', 0) or 0,
+        'kda': getattr(opt, 'kda', 0) or 0,
         'grad_ckpt': bool(getattr(opt, 'grad_ckpt', 0)),
     }
 

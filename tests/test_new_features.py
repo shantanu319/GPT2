@@ -164,7 +164,7 @@ def test_flags_off_matches_git_head():
     import subprocess
     from pathlib import Path
     root = Path(__file__).resolve().parent.parent
-    src = subprocess.run(["git", "show", "HEAD:model.py"], cwd=root,
+    src = subprocess.run(["git", "show", "HEAD:core/model.py"], cwd=root,
                          capture_output=True, text=True, check=True).stdout
     ns = {}
     exec(src, ns)

@@ -1,7 +1,10 @@
+from types import SimpleNamespace
+
 import torch
 import torch.nn.functional as F
 
 from core.kda import KimiDeltaAttention, kda_chunk, kda_recurrence
+from core.model import Transformer, get_model, nopeak_mask
 
 
 def _inputs(B=2, T=128, H=3, K=16, V=16, seed=0):
@@ -137,5 +140,90 @@ def test_module_cache_decode_matches_full_forward():
         outs = [layer(x[:, :7], start_pos=0)]
         for t in range(7, 20):
             outs.append(layer(x[:, t:t + 1], start_pos=t))
+        o_cached = torch.cat(outs, dim=1)
+    assert torch.allclose(o_cached, o_full, atol=1e-4)
+
+
+def _hybrid(N=4, kda=2, **kw):
+    torch.manual_seed(0)
+    return Transformer(vocab=48, d_model=32, N=N, heads=4, dropout=0.0,
+                       kv_heads=2, value_residual=True, unet_skips=True,
+                       kda=kda, **kw)
+
+
+def test_hybrid_layer_pattern():
+    m = _hybrid(N=8, kda=4)
+    kinds = [layer.is_kda for layer in m.decoder.layers]
+    assert kinds == [True, True, True, False, True, True, True, False]
+    assert all(not layer.is_kda for layer in _hybrid(kda=0).decoder.layers)
+    assert all(layer.is_kda for layer in _hybrid(kda=1).decoder.layers)
+
+
+def test_value_residual_only_on_full_attention_layers():
+    m = _hybrid(N=4, kda=2)  # KDA, MHA, KDA, MHA
+    assert not hasattr(m.decoder.layers[0].attn_1, 'vres')
+    assert not hasattr(m.decoder.layers[1].attn_1, 'vres')  # first MHA defines v1
+    assert not hasattr(m.decoder.layers[2].attn_1, 'vres')
+    assert hasattr(m.decoder.layers[3].attn_1, 'vres')
+
+
+def test_hybrid_forward_backward():
+    m = _hybrid()
+    x = torch.randint(0, 48, (2, 20))
+    logits = m(x, nopeak_mask(20, torch.device('cpu')))
+    assert logits.shape == (2, 20, 48)
+    logits.sum().backward()
+    kda_params = [p for layer in m.decoder.layers if layer.is_kda
+                  for p in layer.attn_1.parameters()]
+    assert kda_params  # every KDA parameter must be in the gradient path
+    for p in kda_params:
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+    for name, p in m.named_parameters():
+        if p.grad is not None:
+            assert torch.isfinite(p.grad).all(), name
+
+
+def test_hybrid_get_model_zero_init():
+    opt = SimpleNamespace(d_model=32, heads=4, n_layers=4, dropout=0.0,
+                          kv_heads=2, loops=1, grad_ckpt=0, value_residual=1,
+                          unet_skips=1, attn_res=0, kda=2, device='cpu',
+                          loadname=None)
+    m = get_model(opt, 48)
+    for name, p in m.named_parameters():
+        if name.endswith(('attn_1.out.weight', 'attn_1.o_proj.weight',
+                          'ff.w_down.weight')):
+            assert torch.all(p == 0), name
+
+
+def test_hybrid_checkpoint_config_roundtrip():
+    """The cfg dict embedded in checkpoints must rebuild the exact hybrid."""
+    m = _hybrid()
+    cfg = dict(vocab_size=48, d_model=32, n_layers=4, heads=4, dropout=0.0,
+               kv_heads=2, loops=1, value_residual=True, unet_skips=True,
+               attn_res=0, kda=2)
+    m2 = Transformer(vocab=cfg['vocab_size'], d_model=cfg['d_model'],
+                     N=cfg['n_layers'], heads=cfg['heads'], dropout=cfg['dropout'],
+                     kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
+                     value_residual=cfg.get('value_residual', False),
+                     unet_skips=cfg.get('unet_skips', False),
+                     attn_res=cfg.get('attn_res', 0), kda=cfg.get('kda', 0))
+    m2.load_state_dict(m.state_dict())
+    x = torch.randint(0, 48, (1, 12))
+    with torch.no_grad():
+        assert torch.equal(m(x, nopeak_mask(12, torch.device('cpu'))),
+                           m2(x, nopeak_mask(12, torch.device('cpu'))))
+
+
+def test_model_cache_decode_matches_full_forward():
+    """Whole-model prefill + decode must equal one full forward — exercises the
+    MHA KV cache and the KDA state cache side by side."""
+    m = _hybrid().eval()
+    x = torch.randint(0, 48, (1, 20))  # 20 % 64 != 0: KDA takes the recurrence path
+    with torch.no_grad():
+        o_full = m(x, nopeak_mask(20, torch.device('cpu')))
+        m.reset_cache()
+        outs = [m(x[:, :7], nopeak_mask(7, torch.device('cpu')), start_pos=0)]
+        for t in range(7, 20):
+            outs.append(m(x[:, t:t + 1], None, start_pos=t))
         o_cached = torch.cat(outs, dim=1)
     assert torch.allclose(o_cached, o_full, atol=1e-4)
