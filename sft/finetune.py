@@ -101,6 +101,7 @@ def main():
         value_residual=cfg.get('value_residual', False),
         unet_skips=cfg.get('unet_skips', False),
         attn_res=cfg.get('attn_res', 0),
+        kda=cfg.get('kda', 0),
     ).to(device)
     model.load_state_dict(ckpt['model'])
     vocab_size = cfg['vocab_size']
