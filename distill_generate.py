@@ -64,9 +64,11 @@ SEED_TOPICS = [
 
 
 def load_api_key(env_name):
-    """Resolve the API key without ever printing it: env first, then .env.local."""
-    if os.environ.get(env_name):
-        return os.environ[env_name]
+    """Resolve the API key without ever printing it. .env.local at the repo
+    root wins over the process environment: keys get rotated in the file while
+    shell-level exports go stale (a stale shell OPENAI_API_KEY masked a fresh
+    .env.local key once already)."""
+    file_val = None
     env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env.local')
     if os.path.exists(env_path):
         with open(env_path) as f:
@@ -76,17 +78,46 @@ def load_api_key(env_name):
                     continue
                 k, v = line.split('=', 1)
                 if k.strip() == env_name:
-                    return v.strip().strip('"').strip("'")
+                    file_val = v.strip().strip('"').strip("'")
+    env_val = os.environ.get(env_name)
+    if file_val:
+        if env_val and env_val != file_val:
+            print(f"note: using {env_name} from .env.local (differs from the "
+                  f"shell environment variable)", file=sys.stderr)
+        return file_val
+    if env_val:
+        return env_val
     raise SystemExit(f"error: {env_name} not found in environment or .env.local")
 
 
 def ask_teacher(client, model, messages, max_tokens, temperature):
-    resp = client.chat.completions.create(
-        model=model, messages=messages, max_tokens=max_tokens,
-        temperature=temperature)
-    usage = resp.usage
-    return (resp.choices[0].message.content.strip(),
-            (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0))
+    """One teacher completion, tolerant of API differences across model
+    generations: gpt-5.x wants max_completion_tokens (older models want
+    max_tokens), and reasoning-tier models reject a non-default temperature.
+    Retries with the offending parameter adjusted/dropped, and only when the
+    error actually names such a parameter."""
+    from openai import BadRequestError
+    base = {'model': model, 'messages': messages}
+    attempts = [
+        {'max_completion_tokens': max_tokens, 'temperature': temperature},
+        {'max_completion_tokens': max_tokens},
+        {'max_tokens': max_tokens, 'temperature': temperature},
+        {'max_tokens': max_tokens},
+    ]
+    last_err = None
+    for extra in attempts:
+        try:
+            resp = client.chat.completions.create(**base, **extra)
+            usage = resp.usage
+            return (resp.choices[0].message.content.strip(),
+                    (usage.prompt_tokens, usage.completion_tokens) if usage else (0, 0))
+        except BadRequestError as e:
+            msg = getattr(e, 'message', '') or str(e)
+            if any(p in msg for p in ('max_completion_tokens', 'max_tokens', 'temperature')):
+                last_err = e
+                continue
+            raise
+    raise last_err
 
 
 def iter_no_robots_prompts():
@@ -138,7 +169,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', choices=['no_robots', 'synthetic'],
                         default='no_robots')
-    parser.add_argument('--model', default=os.environ.get('OPENAI_MODEL', 'gpt-4o-mini'),
+    parser.add_argument('--model', default=os.environ.get('OPENAI_MODEL', 'gpt-5.6-luna'),
                         help='teacher model (env OPENAI_MODEL overrides the default)')
     parser.add_argument('--max-examples', type=int, default=1000)
     parser.add_argument('--max-tokens', type=int, default=512)
