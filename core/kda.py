@@ -1,18 +1,9 @@
-"""Kimi Delta Attention (KDA): per-channel gated delta-rule linear attention.
 
-KDA (Kimi Linear, arXiv:2510.26692) extends Gated DeltaNet's scalar per-head
+"""
+KDA (arXiv:2510.26692) extends Gated DeltaNet's scalar per-head
 forget gate with a per-key-dim gate, so each channel of the recurrent state
 decays at its own learned rate. The per-step transition is Diagonal-Plus-Low-
-Rank, which is what keeps the chunked form cheap.
-
-Math adapted from the fla reference implementation (MIT license):
-fla/ops/kda/naive.py + fla/layers/kda.py — reworked to plain PyTorch
-(no einops/Triton) and to this repo's conventions.
-
-Per head, with state S in R^{K x V}:
-    S'  = Diag(exp(g_t)) S_{t-1}                 # per-key-dim decay, g_t <= 0
-    S_t = S' + beta_t k_t (v_t - S'^T k_t)^T     # delta rule: erase old, write new
-    o_t = S_t^T (q_t / sqrt(K))
+Rank
 """
 import math
 
