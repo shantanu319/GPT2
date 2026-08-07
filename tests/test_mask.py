@@ -1,6 +1,6 @@
 import torch
 
-from model import nopeak_mask
+from core.model import nopeak_mask
 
 
 def test_nopeak_mask_shape():

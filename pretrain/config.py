@@ -30,7 +30,7 @@ def parse_args():
                         help='Per-head Muon (local impl only): orthogonalize attention '
                              'projection updates per head instead of as fused matrices')
     parser.add_argument('-schedule', choices=['wsd', 'cosine'], default='wsd',
-                        help='LR schedule: warmup-stable-decay or warmup+cosine to a 10% floor')
+                        help='LR schedule: warmup-stable-decay or warmup+cosine to a 10%% floor')
     parser.add_argument('-decay_frac', type=float, default=0.25,
                         help='WSD: fraction of total steps spent in the decay phase')
     parser.add_argument('-momentum_warmup', type=int, default=300,

@@ -5,7 +5,7 @@ __pycache__/
 saved/
 data_cache/
 *.bin
-chat/target/
+inference/chat/target/
 learning_curves.png
 modal_out/
 vast_out/

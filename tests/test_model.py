@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 
-from model import Transformer, nopeak_mask
+from core.model import Transformer, nopeak_mask
 
 
 def _tiny_transformer(vocab=32, d_model=32, n_layers=2, heads=2, dropout=0.0):

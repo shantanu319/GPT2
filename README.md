@@ -13,7 +13,7 @@ Five stages, glued together by artifacts in `data_cache/cosmopedia/` and checkpo
                                                                      ▲ same bins, distilled answers
     ultrafeedback ─ dpo_prepare.py ─► dpo_{train,val}.bin + masks + pair index
                       ─ dpo.py ──────► saved/<run>/dpo_final.pt                    (DPO)
-                                       └► sample.py | chat_server.py + chat/ REPL | evaluate.py
+                                       └► sample.py | chat_server.py + inference/chat/ REPL | evaluate.py
 
 **1. Tokenizer + data (`tokenizer.py`, `prepare.py`, `data.py`).** Stdlib-only byte-level BPE with the GPT-4-style pre-tokenization regex (letters and digits never share a pre-token, digit runs chunk to ≤3 chars): 256 byte ids plus learned merges, vocab 32000 by default, with the 3 chat specials pinned to the top ids (`<|im_start|>`=vocab−3, `<|im_end|>`=vocab−2, `<|endoftext|>`=vocab−1) so SFT never has to resize the embedding. prepare.py streams a seeded (1337) weighted interleave — 42% fineweb-edu-dedup, 28% DCLM-baseline, 15% cosmopedia-v2, 10% Python code (codeparrot-clean), 5% FineMath-4+ (sources that run dry are dropped and the weights renormalize) — trains the BPE on the first 100k mixed docs, then re-tokenizes the whole stream in a single pass, routing doc `i` to val if `i % 500 == 0`, to test if `== 1`, else to train (~0.4% held out; re-runs are byte-identical). The .bin shards are headerless little-endian uint16 with docs separated by a single `<|endoftext|>` id. data.py memmaps them and serves `(batch, seqlen)` windows — sequential by default, or shuffled with pinned-memory prefetch under `-shuffle` — targets = inputs shifted by one.
 
@@ -25,7 +25,7 @@ Five stages, glued together by artifacts in `data_cache/cosmopedia/` and checkpo
 
 **5. DPO (`dpo_prepare.py`, `dpo.py`).** Posttraining finishes with direct preference optimization. dpo_prepare.py streams HuggingFaceH4/ultrafeedback_binarized (61k GPT-4-ranked pairs), renders each chosen/rejected completion over the same ChatML prompt prefix (system + user, same template as SFT), and writes flat uint16 bins + masks plus an int32 pair index (`chosen_off, chosen_len, rejected_off, rejected_len` per pair) — no padding on disk. dpo.py loads the SFT checkpoint as the policy plus a frozen copy as the reference model, and minimizes `-log σ(β·[(π_c − ref_c) − (π_r − ref_r)])` where each term is the mean log-probability over the completion tokens (length-normalized, SimPO-style: longer completions no longer accumulate extra negative reward). Batches are pairs (8/step default, padded in-memory with a causal ∧ not-pad attention mask), β = 0.5, 2 epochs, lr 1e-6 AdamW-only by default (`--muon-lr > 0` opts back into the Muon split), grad clip 1.0; logs the reward margin and preference accuracy alongside the loss. Same checkpoint format out, so the chat stack runs on DPO weights unchanged.
 
-**6. Inference + eval (`sample.py`, `chat_server.py`, `chat/`, `evaluate.py`).** Sampling is temperature + top-p (defaults 0.5 / 0.9) with a KV cache; when the window fills (`max_context`, 512 default) the cache is dropped and the last `max_context − 1` tokens are re-prefilled. chat_server.py is a long-lived JSON-lines stdin/stdout process holding multi-turn ChatML state (system turn on the first turn only, generation stops at `<|im_end|>`); the Rust CLI in `chat/` (clap + rustyline) just spawns it as a child and runs the REPL (`/reset`, `/quit`). evaluate.py scores arc_easy / arc_challenge / hellaswag / piqa lm-eval-harness style: argmax over answer choices of summed log-likelihood (`acc`) and per-token log-likelihood (`acc_norm`), with `--chat` to wrap questions in the ChatML template when scoring SFT checkpoints.
+**6. Inference + eval (`sample.py`, `chat_server.py`, `inference/chat/`, `evaluate.py`).** Sampling is temperature + top-p (defaults 0.5 / 0.9) with a KV cache; when the window fills (`max_context`, 512 default) the cache is dropped and the last `max_context − 1` tokens are re-prefilled. chat_server.py is a long-lived JSON-lines stdin/stdout process holding multi-turn ChatML state (system turn on the first turn only, generation stops at `<|im_end|>`); the Rust CLI in `inference/chat/` (clap + rustyline) just spawns it as a child and runs the REPL (`/reset`, `/quit`). evaluate.py scores arc_easy / arc_challenge / hellaswag / piqa lm-eval-harness style: argmax over answer choices of summed log-likelihood (`acc`) and per-token log-likelihood (`acc_norm`), with `--chat` to wrap questions in the ChatML template when scoring SFT checkpoints.
 
 The three tuned configurations that ship as defaults (vocab 32000 everywhere):
 
@@ -38,7 +38,7 @@ The three tuned configurations that ship as defaults (vocab 32000 everywhere):
 | warmup / save / val cadence | 200 / 500 / epoch-end | 1000 / 4000 / 2000 | 1000 / 2000 / 2000 |
 | parameters | **13.0M** (4.9M non-embedding) | **101.0M** (84.6M non-embedding) | **101.0M** (84.6M non-embedding) |
 
-The two vast.ai columns share the same ~101M shape and batch — `pipeline` (and therefore `watch_pipeline.sh`) passes the same model-shape flags as `train`; they differ only in checkpoint cadence and the pretrain data cap (pipeline defaults to `--max-train-docs 8000000` ≈ 8B tokens, so the LR schedule is guaranteed to finish; `train`/`prepare` piecemeal stays uncapped unless you pass a cap). Every knob is overridable per-run, e.g. `python vast_train.py pipeline --n-layers 31 --max-train-docs 12000000`.
+The two vast.ai columns share the same ~101M shape and batch — `pipeline` (and therefore `watch_pipeline.sh`) passes the same model-shape flags as `train`; they differ only in checkpoint cadence and the pretrain data cap (pipeline defaults to `--max-train-docs 8000000` ≈ 8B tokens, so the LR schedule is guaranteed to finish; `train`/`prepare` piecemeal stays uncapped unless you pass a cap). Every knob is overridable per-run, e.g. `python vast/vast_train.py pipeline --n-layers 31 --max-train-docs 12000000`.
 
 The model itself lives in model.py and is a pre-norm decoder stack: token embeddings, N decoder layers (attention + SwiGLU feed-forward, each wrapped in RMSNorm with residuals), a final RMSNorm, and an output projection whose weights are tied to the embedding table. Attention is flash SDPA with GQA (`-kv_heads` shares each KV head across several query heads, saving params and shrinking the KV cache; native `enable_gqa` in training), QK-norm on the per-head q/k (lets Muon run hotter), and partial RoPE (only half the head dims rotate — a parameter-golf leaderboard find). Value residual learning mixes the layer-1 value tensor into later layers via per-layer learnable scalars, and U-net skip connections plus an embedding shortcut (each with learnable scalar gates) wire early representations straight into late ones. Residual out-projections are zero-initialized so every block starts as identity, and the tied head is tanh soft-capped at ±15. There's also opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params) and opt-in activation checkpointing (`-grad_ckpt`). Local default is ~13M at d_model=256; the vast.ai default is ~101M at d_model=512, 30 layers, 8 heads (2 KV) — see the config table above.
 
@@ -46,18 +46,18 @@ The tokenizer (tokenizer.py) is a minbpe-style byte-level BPE with the GPT-4-sty
 
 Training (train.py) uses a Muon + AdamW hybrid: Muon for the 2D+ weight matrices, AdamW for embeddings, norms, and scalars — the AdamW groups split by role (embedding lr 3e-3, learnable scalars 0.01, betas (0.8, 0.95), eps 1e-10), Muon momentum warming up 0.85 → 0.95 over the first 300 steps. Muon now defaults to the local Polar-Express implementation in muon.py (`-muon_impl local`; bf16 Newton-Schulz iterations, decoupled weight decay) — muon.py is no longer just a reference artifact — with torch.optim.Muon still selectable. The schedule is WSD by default (warmup → stable → 1−sqrt decay to 0 over the last 25%, `-schedule wsd`; cosine still available), gradients are clipped to a max norm, and the forward pass runs under bfloat16 autocast with a fused chunked cross-entropy (no more 50GB logits stack); CUDA runs are torch.compile'd (`-no_compile` to disable). resolve_device picks CUDA, then MPS, then CPU, so the same script can run on a GPU cluster without any changes. Checkpoints are written every save_every steps with the full model config embedded in the payload, which is what the chat server later reads to rebuild the architecture.
 
-The chat interface is split in two: a long-running Python inference server (chat_server.py) that loads a checkpoint and reads JSON-line prompts from stdin, and a Rust CLI in chat/ (clap + rustyline) that spawns the Python process as a child and pipes a REPL through it. Inference was kept in Python so I don't have to re-implement the transformer in Rust (low-aura move unfortunately). The Rust side just handles the user-facing loop, history, and process lifecycle. Sampling is top-p + temperature (sample.py), with the running token context capped at max_context so long sessions don't blow up the KV window.
+The chat interface is split in two: a long-running Python inference server (chat_server.py) that loads a checkpoint and reads JSON-line prompts from stdin, and a Rust CLI in inference/chat/ (clap + rustyline) that spawns the Python process as a child and pipes a REPL through it. Inference was kept in Python so I don't have to re-implement the transformer in Rust (low-aura move unfortunately). The Rust side just handles the user-facing loop, history, and process lifecycle. Sampling is top-p + temperature (sample.py), with the running token context capped at max_context so long sessions don't blow up the KV window.
 
 to run the pipeline (train, test, and validate):
-    ./run.sh                          # defaults: ~13M params, 1 epoch, full cosmopedia stream
-    EPOCHS=3 D_MODEL=128 ./run.sh     # override any knob via env
-    FORCE_PREPARE=1 ./run.sh          # rebuild BPE + .bin shards
+    ./scripts/run.sh                          # defaults: ~13M params, 1 epoch, full cosmopedia stream
+    EPOCHS=3 D_MODEL=128 ./scripts/run.sh     # override any knob via env
+    FORCE_PREPARE=1 ./scripts/run.sh          # rebuild BPE + .bin shards
 
 Total Run:
 D_MODEL=384 N_LAYERS=5 HEADS=6 \
 SEQLEN=512 BATCHSIZE=16 \
 EPOCHS=1 WARMUP_STEPS=300 \
-./run.sh
+./scripts/run.sh
 
 Running on a vast.ai GPU:
 
@@ -70,17 +70,17 @@ Also: an SSH pubkey at ~/.ssh/id_ed25519.pub (attached to instances at create ti
 
 Sanity-check the whole loop first — it provisions a cheap GPU, runs a tiny train on it, pulls the checkpoint back, and destroys the instance (~6 min, under $0.01):
 
-    python vast_train.py smoke
+    python vast/vast_train.py smoke
 
 Then the usual flow. The current instance is tracked in .vast_instance.json so the commands chain; the meter runs until `destroy`, so pull artifacts first. Offers are filtered to GPUs torch 2.11 supports (compute_cap>=750):
 
-    python vast_train.py create       # provision cheapest matching GPU (e.g. --query 'gpu_name=H100_SXM cuda_max_good>=12.8')
-    python vast_train.py push         # rsync code + data_cache up
-    python vast_train.py pipeline     # whole chain, detached on the instance (survives laptop sleep)
+    python vast/vast_train.py create       # provision cheapest matching GPU (e.g. --query 'gpu_name=H100_SXM cuda_max_good>=12.8')
+    python vast/vast_train.py push         # rsync code + data_cache up
+    python vast/vast_train.py pipeline     # whole chain, detached on the instance (survives laptop sleep)
 
 The recommended entrypoint for a full run is the watcher — it launches the chain detached (each stage skips itself if its artifact already exists), polls for dpo_final.pt, then pulls everything into ./vast_out:
-    ./watch_pipeline.sh                               # launch + watch + auto-pull
-    SKIP_LAUNCH=1 ./watch_pipeline.sh                 # just watch an existing run
+    ./scripts/watch_pipeline.sh                               # launch + watch + auto-pull
+    SKIP_LAUNCH=1 ./scripts/watch_pipeline.sh                 # just watch an existing run
     tail -f watch_pipeline.log                        # timestamped milestones
 
 Time-boxed run (e.g. ~7h on an H200): the pipeline defaults are pre-sized for exactly
@@ -90,9 +90,9 @@ WSD schedule actually completes inside the budget — you get an annealed ckpt_f
 not a hot mid-schedule one. (H200 ≈ H100 compute with 1.7× memory bandwidth: expect a
 modest speedup on this small model, not 2×.) Launch:
 
-    python vast_train.py create --query 'gpu_name=H200 cuda_max_good>=12.8'   # disk defaults to 80GB now
-    python vast_train.py push
-    ./watch_pipeline.sh
+    python vast/vast_train.py create --query 'gpu_name=H200 cuda_max_good>=12.8'   # disk defaults to 80GB now
+    python vast/vast_train.py push
+    ./scripts/watch_pipeline.sh
 
 Budget the day as: prepare ~1–2h (the Python BPE is the bottleneck, not the GPU),
 pretrain ~4–6h, SFT + DPO ~1.5–2h. Checkpoints save every 4000 steps (~20 min) and
@@ -106,17 +106,17 @@ MAX_HOURS (default 7), it pulls whatever checkpoints exist (periodic ckpt_step*,
 ckpt_best, any stage finals — `pull` grabs all of saved/) and exits, logging the
 newest remote checkpoints. DESTROY_ON_TIMEOUT=1 also stops the meter automatically:
 
-    MAX_HOURS=8 DESTROY_ON_TIMEOUT=1 ./watch_pipeline.sh
+    MAX_HOURS=8 DESTROY_ON_TIMEOUT=1 ./scripts/watch_pipeline.sh
 
 Piecemeal invocations:
-    python vast_train.py prepare                      # just data prep (skips if train.bin exists on the instance)
-    python vast_train.py train --epochs 2             # just pretrain (~101M defaults; add --detach)
-    python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
-    python vast_train.py dpo-prepare                  # just tokenize preference pairs
-    python vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt
-    python vast_train.py status                       # instance state + pipeline log tail
-    python vast_train.py pull                         # rsync saved/ + tokenizer.json into ./vast_out
-    python vast_train.py destroy                      # stop billing
+    python vast/vast_train.py prepare                      # just data prep (skips if train.bin exists on the instance)
+    python vast/vast_train.py train --epochs 2             # just pretrain (~101M defaults; add --detach)
+    python vast/vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
+    python vast/vast_train.py dpo-prepare                  # just tokenize preference pairs
+    python vast/vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt
+    python vast/vast_train.py status                       # instance state + pipeline log tail
+    python vast/vast_train.py pull                         # rsync saved/ + tokenizer.json into ./vast_out
+    python vast/vast_train.py destroy                      # stop billing
 
 Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping at ±15, GQA (`-kv_heads`, default 2 of 8 heads on vast.ai — saves params + shrinks the KV cache), partial RoPE (rotate half the head dims), value residual learning (layer-1 V mixed into later layers via per-layer learnable scalars), U-net skip connections + an embedding shortcut with learnable scalar gates, opt-in block Attention Residuals (`-attn_res B` — softmax attention over previous block outputs replaces uniform residual accumulation, arXiv:2603.15031), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds the local Polar-Express Muon as default (`-muon_impl local`), with opt-in per-head orthogonalization (`-muon_per_head` — attention projection updates are Newton-Schulz'd per head, in the style of Kimi K3's Per-Head Muon), a WSD schedule (`-schedule wsd`), Muon weight decay, torch.compile + fused chunked cross-entropy, shuffled pinned-prefetch data feeding (`-shuffle`), opt-in activation checkpointing (`-grad_ckpt`), gradient accumulation (`-grad_accum`), and capped mid-epoch validation (`-val_every`).
 
@@ -133,26 +133,26 @@ Teacher distillation (optional; needs OPENAI_API_KEY in .env.local — which tak
     general-knowledge gap), --source no_robots re-answers ~9.5k human-written prompts (targets task/style variety).
     sft_prepare.py --input-jsonl packs the JSONL through the same masking path, so the bins drop straight into finetune.py:
 
-    python3 distill_generate.py --source synthetic --max-examples 5000   # add --resume to continue an interrupted run
-    python3 distill_generate.py --source no_robots --max-examples 5000
+    python3 -m sft.distill_generate --source synthetic --max-examples 5000   # add --resume to continue an interrupted run
+    python3 -m sft.distill_generate --source no_robots --max-examples 5000
     cat data_cache/distill/teacher_*.jsonl > data_cache/distill/teacher_all.jsonl
-    python3 sft_prepare.py --input-jsonl data_cache/distill/teacher_all.jsonl --output-dir data_cache/distill
-    python3 finetune.py --checkpoint saved/<run>/ckpt_final.pt --data-dir data_cache/distill --dir-name sft_distill
+    python3 -m sft.sft_prepare --input-jsonl data_cache/distill/teacher_all.jsonl --output-dir data_cache/distill
+    python3 -m sft.finetune --checkpoint saved/<run>/ckpt_final.pt --data-dir data_cache/distill --dir-name sft_distill
     # to mix with smol-smoltalk instead of training on distilled data alone, cat the headerless bins
     # (tokens with tokens, masks with masks) into one directory and point --data-dir there.
 
-    python vast_train.py pipeline                                    # full chain: prepare -> pretrain -> sft_prepare -> sft -> dpo_prepare -> dpo
-    python vast_train.py sft-prepare                                 # just tokenize chat data
-    python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt --dir-name sft_run
-    python vast_train.py dpo-prepare                                 # just tokenize preference pairs
-    python vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt --dir-name dpo_run
+    python vast/vast_train.py pipeline                                    # full chain: prepare -> pretrain -> sft_prepare -> sft -> dpo_prepare -> dpo
+    python vast/vast_train.py sft-prepare                                 # just tokenize chat data
+    python vast/vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt --dir-name sft_run
+    python vast/vast_train.py dpo-prepare                                 # just tokenize preference pairs
+    python vast/vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt --dir-name dpo_run
 
     # local chat with an SFT checkpoint (ChatML template auto-enabled when specials exist):
-    python sample.py --checkpoint sft_final.pt --prompt "hi there" --chat
-    python chat_server.py --checkpoint sft_final.pt --data-dir data_cache/cosmopedia   # add --raw for pretrain ckpts
+    python -m inference.sample --checkpoint sft_final.pt --prompt "hi there" --chat
+    python -m inference.chat_server --checkpoint sft_final.pt --data-dir data_cache/cosmopedia   # add --raw for pretrain ckpts
 
 Evaluation (evaluate.py): zero-shot multiple-choice in the lm-evaluation-harness style — each answer choice is scored by total log-likelihood (acc) and per-token log-likelihood (acc_norm), the standard for sub-100M models where generation evals are mostly noise. Supports arc_easy, arc_challenge, hellaswag, piqa; --chat wraps each question in the ChatML template so SFT checkpoints are scored in-distribution. Expect modest but above-chance numbers at this scale; compare base vs SFT vs DPO to check posttraining didn't cost capability.
-    python evaluate.py --checkpoint vast_out/saved/vast_run_sft/sft_final.pt \
+    python -m inference.evaluate --checkpoint vast_out/saved/vast_run_sft/sft_final.pt \
         --tokenizer vast_out/tokenizer.json --tasks arc_easy,hellaswag,piqa --limit 500
 
 The test suite runs with plain `pytest` (tests/ covers the tokenizer, data packing and masks, the model, Muon — including per-head orthogonalization — block AttnRes, distillation, sampling, and the train/DPO loops; network-dependent tests are marked `slow` and deselected by default).
@@ -161,9 +161,9 @@ If you want to try it yourself, download the latest weights here:
 https://drive.google.com/file/d/1dS8MitkyJ7bBKZWqizLYizwkZ7WSJR_f/view?usp=sharing
 
 Put them in the root directory of this project, then run the CLI by running this command in the terminal (also from the root dir):
-cargo run --manifest-path chat/Cargo.toml --release -- \
+cargo run --manifest-path inference/chat/Cargo.toml --release -- \
   --checkpoint ckpt_step21500.pt \
   --data-dir data_cache/cosmopedia \
   --no-cuda
 
-(This checkpoint is a pre-ChatML pretrain model, so the CLI falls back to raw mode. It needs a tokenizer.json in data_cache/cosmopedia — from any prepare run, or pull one from a vast.ai run: `python vast_train.py pull` drops one in vast_out/.)
+(This checkpoint is a pre-ChatML pretrain model, so the CLI falls back to raw mode. It needs a tokenizer.json in data_cache/cosmopedia — from any prepare run, or pull one from a vast.ai run: `python vast/vast_train.py pull` drops one in vast_out/.

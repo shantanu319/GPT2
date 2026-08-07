@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from muon import Muon, _polar_express
+from pretrain.muon import Muon, _polar_express
 
 
 def test_muon_rejects_1d_params():

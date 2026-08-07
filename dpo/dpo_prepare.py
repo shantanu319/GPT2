@@ -21,10 +21,10 @@ import os
 import numpy as np
 from datasets import load_dataset
 
-from chat_format import DEFAULT_SYSTEM, EOS_TOKEN, IM_END, IM_START
-from data import BIN_DTYPE
-from sft_prepare import encode_conversation
-from tokenizer import BPETokenizer
+from core.chat_format import DEFAULT_SYSTEM, EOS_TOKEN, IM_END, IM_START
+from core.data import BIN_DTYPE
+from core.tokenizer import BPETokenizer
+from sft.sft_prepare import encode_conversation
 
 DATASET_PATH = 'HuggingFaceH4/ultrafeedback_binarized'
 DATASET_SPLIT = 'train_prefs'

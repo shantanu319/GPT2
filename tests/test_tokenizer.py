@@ -1,4 +1,4 @@
-from tokenizer import BPETokenizer
+from core.tokenizer import BPETokenizer
 
 
 CORPUS = (
@@ -63,7 +63,7 @@ def test_train_equivalent_to_naive():
     """Incremental train must produce the exact same merges as the
     straightforward per-chunk algorithm — same merges, same ids, same order."""
     from collections import Counter
-    from tokenizer import _get_pair_counts, _merge, _pick_top_pair, GPT4_SPLIT_PATTERN
+    from core.tokenizer import _get_pair_counts, _merge, _pick_top_pair, GPT4_SPLIT_PATTERN
     import re
 
     def naive_train(text, vocab_size):
@@ -159,7 +159,7 @@ def test_chunk_cache_bounded_by_max_size():
 
 
 def test_contains_pair_helper():
-    from tokenizer import _contains_pair
+    from core.tokenizer import _contains_pair
     assert _contains_pair((1, 2, 3, 4), (2, 3))
     assert _contains_pair([1, 2, 3, 4], (1, 2))
     assert not _contains_pair((1, 2, 3), (3, 4))

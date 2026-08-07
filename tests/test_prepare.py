@@ -1,9 +1,9 @@
 """Tests for prepare.py — focus on parity between serial and parallel encode."""
 import numpy as np
 
-from data import BIN_DTYPE
-from prepare import _iter_encoded, _tokenize_stream_three_bins, mixed_stream, Source
-from tokenizer import BPETokenizer
+from core.data import BIN_DTYPE
+from core.tokenizer import BPETokenizer
+from pretrain.prepare import _iter_encoded, _tokenize_stream_three_bins, mixed_stream, Source
 
 
 CORPUS = (
@@ -86,7 +86,7 @@ def test_three_bins_parallel_byte_equal_to_serial(tmp_path):
 
 
 def _fake_sources(monkeypatch, docs_by_name, weights):
-    import prepare
+    import pretrain.prepare as prepare
 
     def fake_open(source):
         return iter(docs_by_name[source.name])
@@ -121,7 +121,7 @@ def test_mixed_stream_renormalizes_on_exhaustion(monkeypatch):
 
 def test_local_fast_path_matches_serial(monkeypatch, tmp_path):
     """fetch_source_to_disk + local_mixed_stream must reproduce mixed_stream."""
-    import prepare
+    import pretrain.prepare as prepare
     docs = {'a': [f"a{i}" for i in range(200)], 'b': [f"b{i}" for i in range(60)]}
 
     def fake_load_dataset(path, config, split, streaming):
@@ -149,5 +149,5 @@ def test_local_fast_path_matches_serial(monkeypatch, tmp_path):
 
 
 def test_default_sources_weights_sum_to_one():
-    import prepare
+    import pretrain.prepare as prepare
     assert abs(sum(s.weight for s in prepare.SOURCES) - 1.0) < 1e-9

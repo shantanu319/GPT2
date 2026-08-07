@@ -1,7 +1,7 @@
 """Generate text from a trained checkpoint using temperature + nucleus (top-p) sampling.
 
 Example:
-  python sample.py --checkpoint saved/model/ckpt_final.pt --prompt "Once upon a time" \
+  python -m inference.sample --checkpoint saved/model/ckpt_final.pt --prompt "Once upon a time" \
                    --max-tokens 200 --temperature 0.5 --top-p 0.9
 """
 import argparse
@@ -10,8 +10,8 @@ import os
 import torch
 import torch.nn.functional as F
 
-from model import Transformer, nopeak_mask
-from tokenizer import BPETokenizer
+from core.model import Transformer, nopeak_mask
+from core.tokenizer import BPETokenizer
 
 
 def top_p_filter(probs, top_p):
@@ -173,7 +173,7 @@ def main():
     prompt = args.prompt
     stop_ids = set()
     if args.chat:
-        from chat_format import DEFAULT_SYSTEM, IM_END, render_conversation
+        from core.chat_format import DEFAULT_SYSTEM, IM_END, render_conversation
         prompt = render_conversation(
             [{'role': 'system', 'content': DEFAULT_SYSTEM},
              {'role': 'user', 'content': args.prompt}],

@@ -8,12 +8,12 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-from config import parse_args
-from data import data_feeder, load_bin
-from fused_ce import chunked_cross_entropy
-from model import LOGIT_SOFTCAP, get_model, nopeak_mask
-from muon import Muon as LocalMuon
-from tokenizer import BPETokenizer
+from core.data import data_feeder, load_bin
+from core.model import LOGIT_SOFTCAP, get_model, nopeak_mask
+from core.tokenizer import BPETokenizer
+from pretrain.config import parse_args
+from pretrain.fused_ce import chunked_cross_entropy
+from pretrain.muon import Muon as LocalMuon
 
 
 def resolve_device(no_cuda):
@@ -408,7 +408,7 @@ def main():
     for p in (tok_path, train_bin, val_bin, test_bin):
         if not os.path.exists(p):
             raise FileNotFoundError(
-                f"missing {p} — run `python prepare.py --output-dir {opt.data_dir}` first"
+                f"missing {p} — run `python -m pretrain.prepare --output-dir {opt.data_dir}` first"
             )
 
     tokenizer = BPETokenizer()

@@ -14,7 +14,7 @@ Writes checkpoints in the same format as train.py so
 chat_server/sample/evaluate work unchanged.
 
 Example:
-  python dpo.py --checkpoint saved/sft/sft_final.pt \
+  python -m dpo.dpo --checkpoint saved/sft/sft_final.pt \
       --data-dir data_cache/cosmopedia --epochs 2 --dir-name dpo
 """
 import argparse
@@ -24,12 +24,12 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from chat_format import EOS_TOKEN
-from data import load_bin, load_bin_u8
-from finetune import make_sft_optimizers
-from model import Transformer
-from tokenizer import BPETokenizer
-from train import lr_factor, resolve_device, save_checkpoint
+from core.chat_format import EOS_TOKEN
+from core.data import load_bin, load_bin_u8
+from core.model import Transformer
+from core.tokenizer import BPETokenizer
+from pretrain.train import lr_factor, resolve_device, save_checkpoint
+from sft.finetune import make_sft_optimizers
 
 PAIRS_DTYPE = np.int32
 

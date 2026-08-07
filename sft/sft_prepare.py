@@ -26,9 +26,9 @@ import os
 import numpy as np
 from datasets import load_dataset
 
-from chat_format import EOS_TOKEN, IM_END, IM_START
-from data import BIN_DTYPE
-from tokenizer import BPETokenizer
+from core.chat_format import EOS_TOKEN, IM_END, IM_START
+from core.data import BIN_DTYPE
+from core.tokenizer import BPETokenizer
 
 DATASET_PATH = 'HuggingFaceTB/smol-smoltalk'
 

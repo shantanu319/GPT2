@@ -1,6 +1,6 @@
 to run the chat (latest SFT weights from the 98M H200 run + regenerated tokenizer):
 
-cargo run --manifest-path chat/Cargo.toml --release -- \
+cargo run --manifest-path inference/chat/Cargo.toml --release -- \
   --checkpoint vast_out/saved/vast_run_sft/sft_step10000.pt \
   --data-dir data_cache/cosmopedia
 
@@ -10,7 +10,7 @@ For the raw pretrain model instead: --checkpoint vast_out/saved/vast_run/ckpt_fi
 
 For a local pretrain checkpoint (run in raw mode, no chat template):
 
-cargo run --manifest-path chat/Cargo.toml --release -- \
+cargo run --manifest-path inference/chat/Cargo.toml --release -- \
   --checkpoint saved/<run>/ckpt_final.pt \
   --data-dir data_cache/cosmopedia \
   --no-cuda

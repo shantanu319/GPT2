@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from data import BIN_DTYPE, data_feeder, load_bin
+from core.data import BIN_DTYPE, data_feeder, load_bin
 
 
 def test_data_feeder_batch_shapes():

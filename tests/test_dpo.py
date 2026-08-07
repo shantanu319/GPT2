@@ -3,7 +3,7 @@ import math
 import numpy as np
 import torch
 
-from model import Transformer
+from core.model import Transformer
 
 
 def _tiny(vocab=64, d_model=32, n_layers=2, heads=4):
@@ -26,7 +26,7 @@ ROW = {
 
 
 def test_split_prompt_completion():
-    from dpo_prepare import split_prompt_completion
+    from dpo.dpo_prepare import split_prompt_completion
     prompt, completion = split_prompt_completion(ROW['chosen'])
     assert [m['role'] for m in prompt] == ['user']
     assert completion == 'good'
@@ -38,7 +38,7 @@ def test_split_prompt_completion():
 
 
 def test_encode_pair_shares_prompt_and_masks_completion():
-    from dpo_prepare import encode_pair
+    from dpo.dpo_prepare import encode_pair
     c_ids, c_mask, r_ids, r_mask = encode_pair(FakeTok(), ROW, IM_START, IM_END, EOS)
 
     # prompt prefix (system + user + assistant header) is identical on both sides
@@ -68,7 +68,7 @@ def _write_flat(tmp_path, seqs):
 
 
 def test_build_batch_shapes_and_padding(tmp_path):
-    from dpo import build_batch
+    from dpo.dpo import build_batch
     chosen = (list(range(10, 18)), [0, 0, 0, 0, 1, 1, 1, 1])       # 8 tokens
     rejected = (list(range(20, 25)), [0, 0, 1, 1, 1])              # 5 tokens
     tokens, masks, pairs = _write_flat(tmp_path, [chosen, rejected])
@@ -93,7 +93,7 @@ def test_build_batch_shapes_and_padding(tmp_path):
 
 
 def test_sequence_logprobs_padding_invariant():
-    from dpo import build_batch, sequence_logprobs
+    from dpo.dpo import build_batch, sequence_logprobs
     model = _tiny().eval()
     device = torch.device('cpu')
     chosen = (list(range(10, 18)), [0, 0, 0, 0, 1, 1, 1, 1])
@@ -123,7 +123,7 @@ def test_sequence_logprobs_padding_invariant():
 
 def test_sequence_logprobs_is_mean_not_sum():
     """sequence_logprobs must be length-normalized: sum / completion-token count."""
-    from dpo import build_batch, sequence_logprobs
+    from dpo.dpo import build_batch, sequence_logprobs
     model = _tiny().eval()
     device = torch.device('cpu')
     chosen = (list(range(10, 18)), [0, 0, 0, 0, 1, 1, 1, 1])
@@ -147,7 +147,7 @@ def test_sequence_logprobs_is_mean_not_sum():
 
 
 def test_make_dpo_optimizers_adamw_only_when_muon_disabled():
-    from dpo import make_dpo_optimizers
+    from dpo.dpo import make_dpo_optimizers
     opts = make_dpo_optimizers(_tiny(), muon_lr=0.0, adamw_lr=1e-6)
     assert len(opts) == 1 and isinstance(opts[0], torch.optim.AdamW)
     assert opts[0].param_groups[0]['peak_lr'] == 1e-6
@@ -155,7 +155,7 @@ def test_make_dpo_optimizers_adamw_only_when_muon_disabled():
 
 
 def test_dpo_loss_and_metrics_values():
-    from dpo import dpo_loss_and_metrics
+    from dpo.dpo import dpo_loss_and_metrics
     beta = 0.5  # current default
     # chosen preferred over rejected -> loss < ln2, acc 1, margin > 0
     pi = torch.tensor([2.0, 1.0])    # [chosen, rejected]

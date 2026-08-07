@@ -1,8 +1,8 @@
-//! Tiny CLI wrapper around chat_server.py. Spawns the Python process once,
+//! Tiny CLI wrapper around the chat server. Spawns the Python process once,
 //! keeps the model warm, and speaks a line-oriented JSON protocol on stdin/stdout.
 //!
 //! Run from repo root:
-//!   cargo run --manifest-path chat/Cargo.toml --release -- \
+//!   cargo run --manifest-path inference/chat/Cargo.toml --release -- \
 //!     --checkpoint saved/model/ckpt_final.pt \
 //!     --data-dir data_cache/cosmopedia
 //!
@@ -28,7 +28,7 @@ struct Args {
     #[arg(long, default_value = "data_cache/cosmopedia")]
     data_dir: String,
 
-    #[arg(long, default_value = "chat_server.py")]
+    #[arg(long, default_value = "inference.chat_server")]
     server: String,
 
     #[arg(long, default_value_t = 100)]
@@ -72,7 +72,7 @@ struct Server {
 impl Server {
     fn spawn(args: &Args) -> Result<Self> {
         let mut cmd = Command::new("python3");
-        cmd.arg("-u").arg(&args.server)
+        cmd.arg("-u").arg("-m").arg(&args.server)
             .arg("--checkpoint").arg(&args.checkpoint)
             .arg("--data-dir").arg(&args.data_dir)
             .arg("--max-tokens").arg(args.max_tokens.to_string())
@@ -122,7 +122,7 @@ impl Server {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    eprintln!("Launching chat_server.py...");
+    eprintln!("Launching inference.chat_server...");
     let mut server = Server::spawn(&args)?;
 
     match server.recv()? {

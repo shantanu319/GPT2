@@ -20,10 +20,10 @@ import sys
 
 import torch
 
-from chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from model import Transformer, nopeak_mask
-from sample import _sample_next
-from tokenizer import BPETokenizer
+from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
+from core.model import Transformer, nopeak_mask
+from core.tokenizer import BPETokenizer
+from inference.sample import _sample_next
 
 
 def log(msg):

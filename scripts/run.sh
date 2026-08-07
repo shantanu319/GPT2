@@ -4,9 +4,9 @@
 # All knobs are env-var overridable. Defaults target a ~13M-param
 # cosmopedia run that should finish overnight on an M3 Air CPU.
 #
-#   ./run.sh                             # full pipeline with defaults
-#   EPOCHS=3 D_MODEL=128 ./run.sh        # override a few knobs
-#   FORCE_PREPARE=1 ./run.sh             # re-run prepare even if .bin exists
+#   ./scripts/run.sh                             # full pipeline with defaults
+#   EPOCHS=3 D_MODEL=128 ./scripts/run.sh        # override a few knobs
+#   FORCE_PREPARE=1 ./scripts/run.sh             # re-run prepare even if .bin exists
 
 set -euo pipefail
 
@@ -44,14 +44,14 @@ if [[ "${FORCE_PREPARE}" == "1" ]] || [[ ! -f "${DATA_DIR}/train.bin" ]]; then
         --bpe-train-docs "${BPE_TRAIN_DOCS}"
     )
     [[ -n "${MAX_TRAIN_DOCS}" ]] && prepare_args+=(--max-train-docs "${MAX_TRAIN_DOCS}")
-    python3 prepare.py "${prepare_args[@]}"
+    python3 -m pretrain.prepare "${prepare_args[@]}"
 else
     echo "=== Data already prepared in ${DATA_DIR} (set FORCE_PREPARE=1 to redo)"
 fi
 
 # --- Step 2: train + validate + test (train.py does all three) ---
 echo "=== Training"
-MPLBACKEND=Agg python3 -u train.py \
+MPLBACKEND=Agg python3 -u -m pretrain.train \
     -data_dir "${DATA_DIR}" \
     -d_model "${D_MODEL}" \
     -n_layers "${N_LAYERS}" \

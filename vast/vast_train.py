@@ -7,23 +7,23 @@ Replaces the old Modal setup. One-time setup:
 The module keeps track of one "current" instance in .vast_instance.json so the
 commands chain naturally:
 
-    python vast_train.py offers                          # browse cheap GPU offers
-    python vast_train.py create                          # provision + wait for SSH
-    python vast_train.py push                            # rsync code + data up
-    python vast_train.py prepare                         # build tokenizer + .bin shards
-    python vast_train.py train --epochs 2                # pretrain (streams logs)
-    python vast_train.py train --detach                  #   ... or in background
-    python vast_train.py sft-prepare
-    python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
-    python vast_train.py dpo-prepare
-    python vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt
-    python vast_train.py pull                            # rsync saved/ back to ./vast_out/
-    python vast_train.py destroy                         # stop billing
+    python vast/vast_train.py offers                          # browse cheap GPU offers
+    python vast/vast_train.py create                          # provision + wait for SSH
+    python vast/vast_train.py push                            # rsync code + data up
+    python vast/vast_train.py prepare                         # build tokenizer + .bin shards
+    python vast/vast_train.py train --epochs 2                # pretrain (streams logs)
+    python vast/vast_train.py train --detach                  #   ... or in background
+    python vast/vast_train.py sft-prepare
+    python vast/vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt
+    python vast/vast_train.py dpo-prepare
+    python vast/vast_train.py dpo --checkpoint saved/vast_run_sft/sft_final.pt
+    python vast/vast_train.py pull                            # rsync saved/ back to ./vast_out/
+    python vast/vast_train.py destroy                         # stop billing
 
-    python vast_train.py pipeline                        # the whole chain, detached
-    ./watch_pipeline.sh                                  # launch + watch + auto-pull
+    python vast/vast_train.py pipeline                        # the whole chain, detached
+    ./scripts/watch_pipeline.sh                                  # launch + watch + auto-pull
 
-    python vast_train.py smoke                           # end-to-end sanity check
+    python vast/vast_train.py smoke                           # end-to-end sanity check
 """
 import argparse
 import json
@@ -57,7 +57,7 @@ SSH_OPTS = [
 
 RSYNC_EXCLUDES = [
     ".git", ".claude", "__pycache__", "**/__pycache__", ".pytest_cache",
-    "chat/target", "saved", "modal_out", "vast_out", "data_cache/local_chat",
+    "inference/chat/target", "saved", "modal_out", "vast_out", "data_cache/local_chat",
     ".env.local", STATE_FILE, "watch_pipeline.log", ".DS_Store",
 ]
 
@@ -75,7 +75,7 @@ step() {{ echo "[pipeline $(date +%H:%M:%S)] $*"; }}
 
 if [ ! -f "$DATA/train.bin" ]; then
   step "prepare"
-  python -u prepare.py --output-dir "$DATA" {prepare_args} || exit 1
+  python -u -m pretrain.prepare --output-dir "$DATA" {prepare_args} || exit 1
 fi
 
 if [ ! -f "saved/$DIR/ckpt_final.pt" ]; then
@@ -88,28 +88,28 @@ if [ ! -f "saved/$DIR/ckpt_final.pt" ]; then
     step "resuming pretrain from $extra"
   fi
   step "pretrain"
-  python -u train.py -data_dir "$DATA" -dir_name "$DIR" {train_args} $extra || exit 1
+  python -u -m pretrain.train -data_dir "$DATA" -dir_name "$DIR" {train_args} $extra || exit 1
 fi
 
 if [ ! -f "$DATA/sft_train.bin" ]; then
   step "sft_prepare"
-  python -u sft_prepare.py --output-dir "$DATA" || exit 1
+  python -u -m sft.sft_prepare --output-dir "$DATA" || exit 1
 fi
 
 if [ ! -f "saved/$SFT/sft_final.pt" ]; then
   step "sft"
-  python -u finetune.py --checkpoint "saved/$DIR/ckpt_final.pt" --data-dir "$DATA" \
+  python -u -m sft.finetune --checkpoint "saved/$DIR/ckpt_final.pt" --data-dir "$DATA" \
     --dir-name "$SFT" {sft_args} || exit 1
 fi
 
 if [ ! -f "$DATA/dpo_train.bin" ]; then
   step "dpo_prepare"
-  python -u dpo_prepare.py --output-dir "$DATA" || exit 1
+  python -u -m dpo.dpo_prepare --output-dir "$DATA" || exit 1
 fi
 
 if [ ! -f "saved/$DPO/dpo_final.pt" ]; then
   step "dpo"
-  python -u dpo.py --checkpoint "saved/$SFT/sft_final.pt" --data-dir "$DATA" \
+  python -u -m dpo.dpo --checkpoint "saved/$SFT/sft_final.pt" --data-dir "$DATA" \
     --dir-name "$DPO" {dpo_args} || exit 1
 fi
 
@@ -140,7 +140,7 @@ def hf_env():
 def load_state(required=True):
     if not os.path.exists(STATE_FILE):
         if required:
-            sys.exit(f"no {STATE_FILE} — run `python vast_train.py create` first")
+            sys.exit(f"no {STATE_FILE} — run `python vast/vast_train.py create` first")
         return None
     with open(STATE_FILE) as f:
         return json.load(f)
@@ -262,8 +262,8 @@ def cmd_create(args):
         state = wait_ready(client, instance_id)
     except RuntimeError as e:
         sys.exit(f"{e}\ninstance {instance_id} may still be loading — check "
-                 f"`python vast_train.py status --id {instance_id}`, or destroy "
-                 f"with `python vast_train.py destroy --id {instance_id}`")
+                 f"`python vast/vast_train.py status --id {instance_id}`, or destroy "
+                 f"with `python vast/vast_train.py destroy --id {instance_id}`")
     state["label"] = args.label
     save_state(state)
     print(f"ssh ready: root@{state['ssh_host']} -p {state['ssh_port']} "
@@ -271,7 +271,7 @@ def cmd_create(args):
 
     print("bootstrapping python deps (datasets, matplotlib)...")
     run_remote(state, "pip install -q --break-system-packages datasets matplotlib")
-    print("instance ready — next: `python vast_train.py push`")
+    print("instance ready — next: `python vast/vast_train.py push`")
 
 
 def cmd_push(args):
@@ -296,7 +296,7 @@ def cmd_prepare(args):
         if rc == 0:
             print("train.bin already exists on the instance (pass --force to rebuild)")
             return
-    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u prepare.py --output-dir {DATA_DIR} "
+    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u -m pretrain.prepare --output-dir {DATA_DIR} "
            f"--vocab-size {args.vocab_size} --bpe-train-docs {args.bpe_train_docs} "
            f"--holdout-period {args.holdout_period}")
     if args.max_train_docs > 0:
@@ -306,7 +306,7 @@ def cmd_prepare(args):
 
 def cmd_train(args):
     state = load_state()
-    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u train.py "
+    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u -m pretrain.train "
            f"-data_dir {DATA_DIR} -dir_name {args.dir_name} "
            f"-d_model {args.d_model} -n_layers {args.n_layers} -heads {args.heads} "
            f"-kv_heads {args.kv_heads} -loops {args.loops} "
@@ -321,7 +321,7 @@ def cmd_train(args):
         cmd += f" -loadname {args.loadname}"
     if args.detach:
         run_remote(state, f"nohup {cmd} > train_{args.dir_name}.log 2>&1 & echo detached pid $!")
-        print(f"detached; watch with `python vast_train.py ssh tail -f train_{args.dir_name}.log`")
+        print(f"detached; watch with `python vast/vast_train.py ssh tail -f train_{args.dir_name}.log`")
     else:
         run_remote(state, cmd)
 
@@ -333,7 +333,7 @@ def cmd_sft_prepare(args):
         if rc == 0:
             print("sft_train.bin already exists on the instance (pass --force to rebuild)")
             return
-    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u sft_prepare.py --output-dir {DATA_DIR} "
+    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u -m sft.sft_prepare --output-dir {DATA_DIR} "
            f"--holdout-period {args.holdout_period}")
     if args.max_conversations > 0:
         cmd += f" --max-conversations {args.max_conversations}"
@@ -342,7 +342,7 @@ def cmd_sft_prepare(args):
 
 def cmd_sft(args):
     state = load_state()
-    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u finetune.py "
+    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u -m sft.finetune "
            f"--checkpoint {args.checkpoint} --data-dir {DATA_DIR} "
            f"--epochs {args.epochs} --batchsize {args.batchsize} --seqlen {args.seqlen} "
            f"--lr {args.lr} --muon-lr {args.muon_lr} --warmup-steps {args.warmup_steps} "
@@ -350,7 +350,7 @@ def cmd_sft(args):
            f"--dir-name {args.dir_name}")
     if args.detach:
         run_remote(state, f"nohup {cmd} > sft_{args.dir_name}.log 2>&1 & echo detached pid $!")
-        print(f"detached; watch with `python vast_train.py ssh tail -f sft_{args.dir_name}.log`")
+        print(f"detached; watch with `python vast/vast_train.py ssh tail -f sft_{args.dir_name}.log`")
     else:
         run_remote(state, cmd)
 
@@ -362,7 +362,7 @@ def cmd_dpo_prepare(args):
         if rc == 0:
             print("dpo_train.bin already exists on the instance (pass --force to rebuild)")
             return
-    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u dpo_prepare.py --output-dir {DATA_DIR} "
+    cmd = (f"cd {REMOTE_ROOT} && {hf_env()}python -u -m dpo.dpo_prepare --output-dir {DATA_DIR} "
            f"--holdout-period {args.holdout_period}")
     if args.max_pairs > 0:
         cmd += f" --max-pairs {args.max_pairs}"
@@ -371,7 +371,7 @@ def cmd_dpo_prepare(args):
 
 def cmd_dpo(args):
     state = load_state()
-    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u dpo.py "
+    cmd = (f"cd {REMOTE_ROOT} && MPLBACKEND=Agg {hf_env()}python -u -m dpo.dpo "
            f"--checkpoint {args.checkpoint} --data-dir {DATA_DIR} "
            f"--epochs {args.epochs} --batchsize {args.batchsize} --beta {args.beta} "
            f"--lr {args.lr} --muon-lr {args.muon_lr} --warmup-steps {args.warmup_steps} "
@@ -379,7 +379,7 @@ def cmd_dpo(args):
            f"--dir-name {args.dir_name}")
     if args.detach:
         run_remote(state, f"nohup {cmd} > dpo_{args.dir_name}.log 2>&1 & echo detached pid $!")
-        print(f"detached; watch with `python vast_train.py ssh tail -f dpo_{args.dir_name}.log`")
+        print(f"detached; watch with `python vast/vast_train.py ssh tail -f dpo_{args.dir_name}.log`")
     else:
         run_remote(state, cmd)
 
@@ -412,7 +412,7 @@ def cmd_pipeline(args):
     run_remote(state, f"cd {REMOTE_ROOT} && nohup bash remote_pipeline.sh > pipeline.log 2>&1 & "
                       "echo pipeline detached pid $!")
     print("pipeline running server-side (survives laptop sleep). "
-          "Watch with ./watch_pipeline.sh or `python vast_train.py status`")
+          "Watch with ./scripts/watch_pipeline.sh or `python vast/vast_train.py status`")
 
 
 def cmd_status(args):
@@ -510,7 +510,7 @@ def cmd_smoke(args):
             "print('synthetic shards ready, vocab', t.vocab_size)\""
         )
         run_remote(state, gen_bins)
-        run_remote(state, f"cd {REMOTE_ROOT} && MPLBACKEND=Agg python -u train.py "
+        run_remote(state, f"cd {REMOTE_ROOT} && MPLBACKEND=Agg python -u -m pretrain.train "
                           "-data_dir data_cache/smoke -d_model 64 -n_layers 2 -heads 2 "
                           "-batchsize 8 -seqlen 64 -epochs 1 -warmup_steps 5 "
                           "-save_every 0 -val_every 0 -printevery 100 -dir_name smoke")
@@ -532,7 +532,7 @@ def cmd_smoke(args):
             clear_state()
         elif instance_id:
             print(f"[smoke] --keep: instance {instance_id} left running "
-                  "(destroy with `python vast_train.py destroy`)")
+                  "(destroy with `python vast/vast_train.py destroy`)")
 
 
 # --------------------------------------------------------------------------

@@ -13,14 +13,14 @@ Output: one JSONL per conversation, {"messages": [{role, content}, ...]} with a
 fixed system prompt (chat_format.DEFAULT_SYSTEM) so the data lands exactly on
 the distribution the chat server uses. Pack it into SFT shards with:
 
-  python3 sft_prepare.py --input-jsonl data_cache/distill/teacher_sft.jsonl
+  python3 -m sft.sft_prepare --input-jsonl data_cache/distill/teacher_sft.jsonl
 
 API key resolution order for --api-key-env (default OPENAI_API_KEY): process
 environment, then .env.local at the repo root. The key is never printed.
 
 Example:
-  python3 distill_generate.py --source no_robots --max-examples 2000
-  python3 distill_generate.py --source synthetic --max-examples 2000
+  python3 -m sft.distill_generate --source no_robots --max-examples 2000
+  python3 -m sft.distill_generate --source synthetic --max-examples 2000
 """
 import argparse
 import json
@@ -29,7 +29,7 @@ import random
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from chat_format import DEFAULT_SYSTEM
+from core.chat_format import DEFAULT_SYSTEM
 
 # Keep teacher answers short and plain: a ~100M student imitates surface form
 # long before it absorbs content, so targets should be simple and declarative.
@@ -69,7 +69,8 @@ def load_api_key(env_name):
     shell-level exports go stale (a stale shell OPENAI_API_KEY masked a fresh
     .env.local key once already)."""
     file_val = None
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env.local')
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env_path = os.path.join(repo_root, '.env.local')
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:

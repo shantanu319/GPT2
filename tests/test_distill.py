@@ -7,11 +7,11 @@ import sys
 
 import numpy as np
 
-from chat_format import special_token_map
-from data import BIN_DTYPE
-from distill_generate import parse_synthetic_qa
-from sft_prepare import encode_conversation
-from tokenizer import BPETokenizer
+from core.chat_format import special_token_map
+from core.data import BIN_DTYPE
+from core.tokenizer import BPETokenizer
+from sft.distill_generate import parse_synthetic_qa
+from sft.sft_prepare import encode_conversation
 
 CORPUS = (
     "the quick brown fox jumps over the lazy dog "
@@ -46,7 +46,7 @@ def _make_jsonl(tmp_path, convos):
 
 
 def test_sft_prepare_input_jsonl_packs_like_hf_stream(tmp_path, monkeypatch):
-    import sft_prepare
+    import sft.sft_prepare as sft_prepare
 
     specials = special_token_map(512)  # 509/510/511, outside the trained vocab
     tok = BPETokenizer(special_tokens=specials)
@@ -94,7 +94,7 @@ def test_sft_prepare_input_jsonl_packs_like_hf_stream(tmp_path, monkeypatch):
 
 
 def test_sft_prepare_input_jsonl_holdout_split(tmp_path, monkeypatch):
-    import sft_prepare
+    import sft.sft_prepare as sft_prepare
 
     specials = special_token_map(512)
     tok = BPETokenizer(special_tokens=specials)

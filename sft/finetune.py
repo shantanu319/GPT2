@@ -6,7 +6,7 @@ sft_train.bin with cross-entropy computed only on assistant tokens
 as train.py so chat_server/sample work unchanged.
 
 Example:
-  python finetune.py --checkpoint saved/model/ckpt_final.pt \
+  python -m sft.finetune --checkpoint saved/model/ckpt_final.pt \
       --data-dir data_cache/cosmopedia --epochs 2 --dir-name sft
 """
 import argparse
@@ -16,10 +16,10 @@ import os
 import torch
 import torch.nn.functional as F
 
-from data import data_feeder_masked, load_bin, load_bin_u8
-from model import Transformer, nopeak_mask
-from tokenizer import BPETokenizer
-from train import lr_factor, resolve_device, save_checkpoint
+from core.data import data_feeder_masked, load_bin, load_bin_u8
+from core.model import Transformer, nopeak_mask
+from core.tokenizer import BPETokenizer
+from pretrain.train import lr_factor, resolve_device, save_checkpoint
 
 
 def masked_loss(pred, target, mask, vocab_size):

@@ -13,6 +13,8 @@ dims and init conventions are annotated, plus a color legend.
 Output: architecture.png / architecture.pdf
 """
 
+import os
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -275,6 +277,7 @@ for x, y, c, label in legend_items:
                                 fc=c, ec="black", lw=1.0, zorder=3))
     txt(x + 2.8, y, label, 7.5, ha="left")
 
-plt.savefig("architecture.png", dpi=300, bbox_inches="tight", facecolor="white")
-plt.savefig("architecture.pdf", bbox_inches="tight", facecolor="white")
+out_dir = os.path.dirname(os.path.abspath(__file__))
+plt.savefig(os.path.join(out_dir, "architecture.png"), dpi=300, bbox_inches="tight", facecolor="white")
+plt.savefig(os.path.join(out_dir, "architecture.pdf"), bbox_inches="tight", facecolor="white")
 print("wrote architecture.png and architecture.pdf")

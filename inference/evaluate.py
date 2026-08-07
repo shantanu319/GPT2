@@ -6,18 +6,18 @@ convention for ARC-Easy / HellaSwag / PIQA. At <100M params expect modest
 but above-chance numbers; acc_norm is the smoother signal at this scale.
 
 Examples:
-  python evaluate.py --checkpoint vast_out/saved/vast_run_sft/sft_final.pt \
+  python -m inference.evaluate --checkpoint vast_out/saved/vast_run_sft/sft_final.pt \
       --tokenizer vast_out/tokenizer.json --tasks arc_easy,piqa --limit 500
-  python evaluate.py --checkpoint ... --chat        # wrap context in ChatML
+  python -m inference.evaluate --checkpoint ... --chat        # wrap context in ChatML
 """
 import argparse
 
 import torch
 import torch.nn.functional as F
 
-from chat_format import DEFAULT_SYSTEM, IM_START, render_turn
-from model import Transformer, nopeak_mask
-from tokenizer import BPETokenizer
+from core.chat_format import DEFAULT_SYSTEM, IM_START, render_turn
+from core.model import Transformer, nopeak_mask
+from core.tokenizer import BPETokenizer
 
 
 def _arc(split='test', name='ARC-Easy'):
@@ -108,7 +108,7 @@ def main():
     parser.add_argument('--no-cuda', action='store_true')
     args = parser.parse_args()
 
-    from train import resolve_device
+    from pretrain.train import resolve_device
     device = resolve_device(args.no_cuda)
 
     tokenizer = BPETokenizer()

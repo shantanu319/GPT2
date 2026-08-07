@@ -4,10 +4,10 @@ import torch
 import torch.nn.functional as F
 from types import SimpleNamespace
 
-from chat_format import (DEFAULT_SYSTEM, EOS_TOKEN, IM_END, IM_START,
-                         render_conversation, special_token_map)
-from data import data_feeder_masked
-from model import LOGIT_SOFTCAP, Transformer, get_model, nopeak_mask
+from core.chat_format import (DEFAULT_SYSTEM, EOS_TOKEN, IM_END, IM_START,
+                              render_conversation, special_token_map)
+from core.data import data_feeder_masked
+from core.model import LOGIT_SOFTCAP, Transformer, get_model, nopeak_mask
 
 
 def _tiny(vocab=32, d_model=32, n_layers=2, heads=4, kv_heads=None, loops=1, **kw):
@@ -224,7 +224,7 @@ def test_data_feeder_masked_alignment():
 
 
 def test_masked_loss_ignores_unmasked():
-    from finetune import masked_loss
+    from sft.finetune import masked_loss
     V = 10
     pred = torch.randn(1, 4, V)
     target = torch.randint(0, V, (1, 4))
@@ -238,7 +238,7 @@ def test_masked_loss_ignores_unmasked():
 
 
 def test_sft_encode_conversation_masks_assistant():
-    from sft_prepare import encode_conversation
+    from sft.sft_prepare import encode_conversation
 
     class FakeTok:
         def encode_ordinary(self, text):

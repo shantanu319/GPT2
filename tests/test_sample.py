@@ -1,6 +1,6 @@
 import torch
 
-from sample import top_p_filter
+from inference.sample import top_p_filter
 
 
 def test_top_p_filter_zeros_out_tail():

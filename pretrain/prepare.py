@@ -23,9 +23,9 @@ from typing import Callable, Optional
 import numpy as np
 from datasets import load_dataset
 
-from chat_format import EOS_TOKEN, special_token_map
-from data import BIN_DTYPE
-from tokenizer import BPETokenizer
+from core.chat_format import EOS_TOKEN, special_token_map
+from core.data import BIN_DTYPE
+from core.tokenizer import BPETokenizer
 
 
 def _render_text(row):

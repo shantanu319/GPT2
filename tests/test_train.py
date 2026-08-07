@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from train import EarlyStopper, build_vocab_indices, lr_factor, resolve_device
+from pretrain.train import EarlyStopper, build_vocab_indices, lr_factor, resolve_device
 
 
 def test_resolve_device_prefers_cpu_when_disabled(monkeypatch):
@@ -102,8 +102,8 @@ def test_early_stopper_delta_is_relative():
 def test_run_lr_cooldown_anneals_to_zero():
     import argparse
     import numpy as np
-    from model import Transformer
-    from train import make_optimizers, run_lr_cooldown
+    from core.model import Transformer
+    from pretrain.train import make_optimizers, run_lr_cooldown
     torch.manual_seed(0)
     V = 32
     opt = argparse.Namespace(
@@ -130,7 +130,7 @@ def _softcapped_ce_reference(hidden, weight, targets, softcap):
 
 
 def test_chunked_cross_entropy_matches_reference():
-    from fused_ce import _chunked_cross_entropy, chunked_cross_entropy
+    from pretrain.fused_ce import _chunked_cross_entropy, chunked_cross_entropy
     torch.manual_seed(0)
     N, d, V, softcap = 130, 32, 257, 15.0
     weight = torch.randn(V, d)
