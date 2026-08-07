@@ -225,13 +225,14 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
 
 class Decoder(nn.Module):
     def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
-                 grad_ckpt=False, value_residual=False, unet_skips=False):
+                 grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0):
         super().__init__()
         self.N = N
         self.loops = loops
         self.grad_ckpt = grad_ckpt
         self.value_residual = value_residual
         self.unet_skips = unet_skips
+        self.attn_res = attn_res
         self.embed = Embedder(vocab, d_model)
         self.layers = get_clones(DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads), N)
         self.norm = RMSNorm(d_model)
@@ -245,16 +246,41 @@ class Decoder(nn.Module):
             # every layer, mirror skips for the second half (modded-nanogpt #11).
             self.skip_x0 = nn.Parameter(torch.full((N,), -1.5))
             self.skip_unet = nn.Parameter(torch.full((N,), -1.5))
+        if attn_res:
+            # Attention Residuals (Moonshot/Kimi, arXiv:2603.15031), block variant:
+            # at each boundary of `attn_res` layers, the running stream is replaced
+            # by a per-token softmax-weighted mix over all previous block outputs
+            # (queries from the current stream, keys from each candidate). Standard
+            # residual adds still apply within blocks. With zero-init residual
+            # out-projections every block starts as identity, so all candidates are
+            # equal at init and the mix starts neutral.
+            self.attnres_wq = nn.Linear(d_model, d_model, bias=False)
+            self.attnres_wk = nn.Linear(d_model, d_model, bias=False)
+
+    def _depth_mix(self, block_outs):
+        """Softmax attention over depth: mix stacked block outputs (J, ...) into
+        one stream, per token. The last candidate is always the current stream."""
+        cands = torch.stack(block_outs, dim=0)                  # (J, B, T, d)
+        q = self.attnres_wq(cands[-1])                          # (B, T, d)
+        k = self.attnres_wk(cands)                              # (J, B, T, d)
+        logits = torch.einsum('btd,jbtd->btj', q, k) / (q.size(-1) ** 0.5)
+        w = torch.softmax(logits, dim=-1)
+        return torch.einsum('btj,jbtd->btd', w, cands)
 
     def forward(self, trg, mask, start_pos=None):
         x0 = x = self.embed(trg)
         half = (self.N + 1) // 2
+        # Block outputs feed AttnRes boundaries; accumulates across the whole
+        # unrolled depth when loops > 1. h_0 is the embedding output.
+        block_outs = [x0] if self.attn_res else None
         # Depth recurrence (parameter-golf): run the stack `loops` times for
         # loops*N effective layers with N layers' worth of params.
         for loop in range(self.loops):
             v1 = None  # fresh layer-0 values per unrolled pass
             outs = []  # per-pass layer outputs for mirror skips
             for i in range(self.N):
+                if self.attn_res and i % self.attn_res == 0 and len(block_outs) > 1:
+                    x = self._depth_mix(block_outs)
                 x_in = x
                 if self.unet_skips:
                     x_in = x + torch.sigmoid(self.skip_x0[i]) * x0
@@ -270,16 +296,20 @@ class Decoder(nn.Module):
                 if i == 0:
                     v1 = v
                 outs.append(x)
+                if self.attn_res and (i % self.attn_res == self.attn_res - 1
+                                      or i == self.N - 1):
+                    block_outs.append(x)
         return self.norm(x)
 
 
 class Transformer(nn.Module):
     def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
-                 grad_ckpt=False, value_residual=False, unet_skips=False):
+                 grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0):
         super().__init__()
         self.decoder = Decoder(vocab, d_model, N, heads, dropout,
                                kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
-                               value_residual=value_residual, unet_skips=unet_skips)
+                               value_residual=value_residual, unet_skips=unet_skips,
+                               attn_res=attn_res)
         self.out = nn.Linear(d_model, vocab)
         self.out.weight = self.decoder.embed.embed.weight
 
@@ -305,10 +335,12 @@ def get_model(opt, vocab):
     grad_ckpt = bool(getattr(opt, 'grad_ckpt', False))
     value_residual = bool(getattr(opt, 'value_residual', False))
     unet_skips = bool(getattr(opt, 'unet_skips', False))
+    attn_res = getattr(opt, 'attn_res', 0) or 0
 
     model = Transformer(vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout,
                         kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
-                        value_residual=value_residual, unet_skips=unet_skips)
+                        value_residual=value_residual, unet_skips=unet_skips,
+                        attn_res=attn_res)
     model.to(opt.device)
 
     if opt.loadname is not None:
