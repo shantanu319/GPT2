@@ -30,9 +30,13 @@ def build_vocab_indices(vocab_size, device):
 
 
 def make_optimizers(model, muon_lr=0.02, embed_lr=3e-3, scalar_lr=0.01,
-                    muon_impl='local'):
+                    muon_impl='local', muon_per_head=False):
     """Three param groups: Muon on hidden 2D matrices, AdamW on the tied
-    embedding (higher LR, decayed), AdamW on every ndim<2 scalar (no decay)."""
+    embedding (higher LR, decayed), AdamW on every ndim<2 scalar (no decay).
+
+    muon_per_head tags attention projection weights with muon_head_split so the
+    local Muon orthogonalizes each head's slice independently (q/k/v split along
+    output rows, the out projection along input columns)."""
     embedding_weight = model.decoder.embed.embed.weight
     muon_params, scalar_params = [], []
     for p in model.parameters():
@@ -42,6 +46,23 @@ def make_optimizers(model, muon_lr=0.02, embed_lr=3e-3, scalar_lr=0.01,
             scalar_params.append(p)
         else:
             muon_params.append(p)
+    if muon_per_head and muon_impl == 'local':
+        attn = model.decoder.layers[0].attn_1
+        n_tagged = 0
+        for name, p in model.named_parameters():
+            if name.endswith('attn_1.q_linear.weight'):
+                p.muon_head_split = (attn.h, 0)
+            elif name.endswith(('attn_1.k_linear.weight', 'attn_1.v_linear.weight')):
+                p.muon_head_split = (attn.h_kv, 0)
+            elif name.endswith('attn_1.out.weight'):
+                p.muon_head_split = (attn.h, 1)
+            else:
+                continue
+            n_tagged += 1
+        print(f'per-head Muon: tagged {n_tagged} attention matrices '
+              f'({attn.h} q/out heads, {attn.h_kv} kv heads)')
+    elif muon_per_head:
+        print('warning: -muon_per_head only affects the local Muon; ignoring')
     if muon_impl == 'local':
         muon = LocalMuon(muon_params, lr=muon_lr, weight_decay=0.01)
     else:
@@ -414,7 +435,8 @@ def main():
     opt.optimizers = make_optimizers(model, muon_lr=opt.muon_lr,
                                      embed_lr=opt.embed_lr,
                                      scalar_lr=opt.scalar_lr,
-                                     muon_impl=opt.muon_impl)
+                                     muon_impl=opt.muon_impl,
+                                     muon_per_head=bool(getattr(opt, 'muon_per_head', 0)))
     batches_per_epoch = max(1, len(opt.train) // (opt.batchsize * opt.seqlen))
     opt.total_steps = max(1, opt.epochs * batches_per_epoch // max(1, opt.grad_accum))
 

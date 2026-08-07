@@ -26,6 +26,9 @@ def parse_args():
                         help='AdamW peak LR for 1D params (norm gains, biases, arch scalars)')
     parser.add_argument('-muon_impl', choices=['local', 'torch'], default='local',
                         help='Muon implementation: local muon.py (Polar Express) or torch.optim.Muon')
+    parser.add_argument('-muon_per_head', type=int, default=0,
+                        help='Per-head Muon (local impl only): orthogonalize attention '
+                             'projection updates per head instead of as fused matrices')
     parser.add_argument('-schedule', choices=['wsd', 'cosine'], default='wsd',
                         help='LR schedule: warmup-stable-decay or warmup+cosine to a 10% floor')
     parser.add_argument('-decay_frac', type=float, default=0.25,
