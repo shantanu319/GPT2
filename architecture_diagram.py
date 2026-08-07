@@ -2,7 +2,13 @@
 
 Decoder-only transformer: tied embedding -> N x [RMSNorm -> GQA -> + -> RMSNorm ->
 SwiGLU -> +] -> final RMSNorm -> tied Linear -> logit soft-cap -> Softmax.
-Side connections: gated x0 skip, gated mirror (U-net) skip, residuals.
+Side connections: gated x0 skip, gated mirror (U-net) skip, residuals, value residual.
+
+This version expands the condensed blocks: attention is drawn as its full internal
+pipeline (projections -> QK-RMSNorm -> partial RoPE -> value-residual mix -> masked
+SDPA -> out projection) and the FFN as the actual SwiGLU dataflow (W_gate -> SiLU and
+W_up -> elementwise multiply -> dropout -> W_down). Skip gates, tensor shapes, head
+dims and init conventions are annotated, plus a color legend.
 
 Output: architecture.png / architecture.pdf
 """
@@ -19,22 +25,23 @@ YELLOW = "#FCF3CF"    # norms
 ORANGE = "#FDEBD0"    # attention
 BLUE = "#D6EAF8"      # feed-forward
 PURPLE = "#E8DAEF"    # linear
-GREEN = "#D5F5E3"     # softmax
 TEAL = "#D1F2EB"      # soft-cap
+GREEN = "#D5F5E3"     # softmax
 GRAY = "#F4F6F6"      # stack background
+WHITE = "#FFFFFF"     # sub-boxes inside containers
 
-CX = 46  # main column center
+CX = 62  # main column center
 
-fig, ax = plt.subplots(figsize=(10, 15))
-ax.set_xlim(0, 100)
-ax.set_ylim(-2, 134)
+fig, ax = plt.subplots(figsize=(15, 22))
+ax.set_xlim(0, 150)
+ax.set_ylim(-3, 216)
 ax.axis("off")
 
 
-def box(cx, y0, w, h, fc, lw=2.2, zorder=2):
+def box(cx, y0, w, h, fc, lw=2.0, zorder=2, alpha=1.0):
     ax.add_patch(FancyBboxPatch((cx - w / 2, y0), w, h,
                                 boxstyle="round,pad=0,rounding_size=1.0",
-                                fc=fc, ec="black", lw=lw, zorder=zorder))
+                                fc=fc, ec="black", lw=lw, zorder=zorder, alpha=alpha))
 
 
 def txt(x, y, s, fs=10, bold=False, italic=False, **kw):
@@ -67,108 +74,206 @@ def add_node(x, y):
     ax.text(x, y, "+", fontsize=15, weight="bold", ha="center", va="center", zorder=6)
 
 
+def gate(x, y):
+    ax.add_patch(Circle((x, y), 1.6, fc=TEAL, ec="black", lw=2.0, zorder=5))
+    ax.text(x, y, "σ", fontsize=13, weight="bold", ha="center", va="center", zorder=6)
+
+
+def mul_node(x, y):
+    ax.add_patch(Circle((x, y), 1.6, fc="white", ec="black", lw=2.2, zorder=5))
+    ax.text(x, y, "⊙", fontsize=14, weight="bold", ha="center", va="center", zorder=6)
+
+
 # ---------------- title / caption ----------------
-txt(50, 131, "Decoder-Only Transformer — Model Architecture", 13, bold=True)
-txt(50, -1.2, "defaults: d_model=512 · N=30 layers · 8 Q heads / 2 KV heads · tied embeddings", 8.5)
+txt(70, 212, "Decoder-Only Transformer — Model Architecture", 14, bold=True)
+txt(75, -1.8, "defaults: d_model=512 · N=30 layers · 8 Q heads / 2 KV heads (d_k=64) · d_ff=1408 · "
+              "tied embeddings · zero-init attn-out & FFN-down projections", 9)
 
 # ---------------- inputs / embedding ----------------
-txt(CX, 3, "Inputs (token ids)", 10)
-arrow((CX, 4.5), (CX, 7))
-box(CX, 7, 30, 5, PINK)
-txt(CX, 9.5, "Token Embedding\n(tied weights)", 10)
+txt(CX, 2.5, "Inputs (token ids) — shape (B, T)", 10)
+arrow((CX, 4), (CX, 6.5))
+box(CX, 6.5, 38, 5.5, PINK)
+txt(CX, 9.25, "Token Embedding\n(vocab × d_model, tied weights)", 10)
 
-txt(71, 10, "no additive positional encoding —\npositions enter via partial RoPE\ninside attention", 8, italic=True, ha="left")
+txt(122, 9.25, "no additive positional encoding —\npositions enter via partial RoPE\ninside attention",
+    8, italic=True, ha="left")
 
-# ---------------- decoder stack background (N x) ----------------
-ax.add_patch(FancyBboxPatch((25, 18), 44, 72,
+# ---------------- decoder stack background (N x, looped L times) ----------------
+ax.add_patch(FancyBboxPatch((24, 16), 96, 120,
                             boxstyle="round,pad=0,rounding_size=2.0",
                             fc=GRAY, ec="black", lw=2.5, zorder=1))
-txt(17, 57, "N×", 15, bold=True)
-txt(17, 52, "loop L×\n(depth recurrence)", 8)
+txt(14, 80, "N×", 16, bold=True)
+txt(14, 72, "loop L×\n(depth recurrence,\nshared weights)", 8)
 
-# ---------------- main flow into the stack ----------------
-arrow((CX, 12), (CX, 20.5))
+# ---------------- layer-input add node (x + gated skips) ----------------
+arrow((CX, 12), (CX, 18.4))
+add_node(CX, 20)
 
-# RMSNorm 1
-box(CX, 20.5, 30, 5, YELLOW)
-txt(CX, 23, "RMSNorm", 10)
+# gated x0 skip: embedding output -> every layer input (left)
+path([(43, 9.25), (8, 9.25), (8, 20), (50, 20)])
+gate(53, 20)
+arrow((54.6, 20), (60.4, 20))
+txt(53, 16.9, "x0", 6.5)
+txt(5, 14.6, "gated x0 skip — embedding output → every layer input", 8, rotation=90)
+
+# gated mirror (U-net) skip: first-half layer output -> second-half layer input (right)
+path([(CX, 132), (132, 132), (132, 20), (73.4, 20)], dashed=True)
+gate(70, 20)
+arrow((68.4, 20), (63.6, 20))
+txt(70, 16.9, "unet", 6.5)
+txt(136, 90, "gated mirror (U-net) skip — second-half layer i ← output of layer N−1−i", 8, rotation=90)
+txt(36, 13.8, "all skip gates: σ(g), g init −1.5 (σ ≈ 0.18)", 7.5, italic=True)
+
+# ---------------- RMSNorm 1 ----------------
+arrow((CX, 21.6), (CX, 23.5))
+box(CX, 23.5, 36, 4.5, YELLOW)
+txt(CX, 25.75, "RMSNorm (pre-norm)", 10)
 
 # split into Q/K/V arrows like the original figure
-arrow((CX, 25.5), (CX, 28.5))
-ax.plot([CX, CX], [28.5, 29.8], color="black", lw=2.2, zorder=3)
-ax.plot([40, 52], [29.8, 29.8], color="black", lw=2.2, zorder=3)
-for x in (40, 46, 52):
-    arrow((x, 29.8), (x, 31))
+arrow((CX, 28), (CX, 30.5))
+ax.plot([CX, CX], [30.5, 31.5], color="black", lw=2.2, zorder=3)
+ax.plot([48, 76], [31.5, 31.5], color="black", lw=2.2, zorder=3)
+for x in (48, 62, 76):
+    arrow((x, 31.5), (x, 33))
+txt(49.8, 32.3, "Q", 7.5, ha="left")
+txt(63.8, 32.3, "K", 7.5, ha="left")
+txt(77.8, 32.3, "V", 7.5, ha="left")
 
-# attention sublayer
-box(CX, 31, 30, 16, ORANGE)
-txt(CX, 44, "Grouped-Query Attention", 10.5, bold=True)
-txt(CX, 41.2, "causal mask · 8 Q heads / 2 KV heads", 8.5)
-txt(CX, 38.6, "QK-RMSNorm · partial RoPE (½ dims)", 8.5)
-txt(CX, 36, "value residual: blend layer-0 V", 8.5)
-txt(CX, 33.4, "(flash SDPA)", 8, italic=True)
+# ---------------- attention sublayer (expanded pipeline) ----------------
+box(CX, 33, 52, 42, ORANGE, lw=2.2, zorder=1.5, alpha=0.55)
+txt(CX, 72.5, "Grouped-Query Attention (GQA)", 11, bold=True)
 
-arrow((CX, 47), (CX, 50))
-add_node(CX, 51.5)
+# projections
+box(CX, 34.5, 44, 4, WHITE)
+txt(CX, 36.5, "Linear projections\nQ: d→8×64 · K,V: d→2×64", 8.5)
+arrow((CX, 38.5), (CX, 40), lw=1.6)
+
+# QK norm
+box(CX, 40, 44, 4, WHITE)
+txt(CX, 42, "QK-RMSNorm (per-head, over d_k=64)", 8.5)
+arrow((CX, 44), (CX, 45.5), lw=1.6)
+
+# partial RoPE
+box(CX, 45.5, 44, 4, WHITE)
+txt(CX, 47.5, "Partial RoPE on Q, K — rotate 32 of 64 dims", 8.5)
+arrow((CX, 49.5), (CX, 51), lw=1.6)
+
+# value residual mix
+box(CX, 51, 44, 4, WHITE)
+txt(CX, 53, "Value residual (ResFormer): V ← (1−σ(θ))·V + σ(θ)·v₁\n(v₁ = layer-0 values · θ init 0 ⇒ σ=0.5)", 8)
+path([(30, 53), (39.8, 53)], dashed=True)
+txt(34.5, 49.8, "v₁ from layer 0", 6.5, italic=True)
+arrow((CX, 55), (CX, 56.5), lw=1.6)
+
+# scaled dot-product attention
+box(CX, 56.5, 44, 7, WHITE)
+txt(CX, 60, "Scaled Dot-Product Attention\nsoftmax(QKᵀ/√d_k)·V — causal mask\n1 KV head shared per 4 Q heads · flash SDPA", 8.5)
+arrow((CX, 63.5), (CX, 65), lw=1.6)
+
+# output projection
+box(CX, 65, 44, 4, WHITE)
+txt(CX, 67, "Concat heads → output projection (zero-init)", 8.5)
+
+arrow((CX, 75), (CX, 77.4))
+add_node(CX, 79)
+txt(68, 82, "x ← x + dropout(attn)", 8, ha="left")
 
 # residual 1 (around norm+attention), right side
-path([(CX, 19.2), (64, 19.2), (64, 51.5), (47.8, 51.5)])
+path([(CX, 22.5), (100, 22.5), (100, 79), (63.8, 79)])
 
-arrow((CX, 53.2), (CX, 55))
+# ---------------- RMSNorm 2 ----------------
+arrow((CX, 80.6), (CX, 83))
+box(CX, 83, 36, 4.5, YELLOW)
+txt(CX, 85.25, "RMSNorm (pre-norm)", 10)
 
-# RMSNorm 2
-box(CX, 55, 30, 5, YELLOW)
-txt(CX, 57.5, "RMSNorm", 10)
+# ---------------- SwiGLU FFN (expanded dataflow) ----------------
+arrow((CX, 87.5), (CX, 90))
+box(CX, 90, 52, 34, BLUE, lw=2.2, zorder=1.5, alpha=0.55)
+txt(CX, 121.5, "SwiGLU Feed-Forward", 11, bold=True)
 
-arrow((CX, 60), (CX, 63))
+# branch split into W_gate / W_up
+ax.plot([CX, CX], [90, 91.5], color="black", lw=2.2, zorder=3)
+ax.plot([50, 74], [91.5, 91.5], color="black", lw=2.2, zorder=3)
+arrow((50, 91.5), (50, 93))
+arrow((74, 91.5), (74, 93))
 
-# SwiGLU FFN
-box(CX, 63, 30, 12, BLUE)
-txt(CX, 72, "SwiGLU Feed-Forward", 10.5, bold=True)
-txt(CX, 69.3, "SiLU(x·W_gate) ⊙ (x·W_up)", 8.5)
-txt(CX, 66.8, "· W_down   (d_ff = 8/3 · d_model)", 8.5)
-txt(CX, 64.5, "output projections zero-init", 8, italic=True)
+box(50, 93, 17, 4.5, WHITE)
+txt(50, 95.25, "W_gate\nd→d_ff", 8.5)
+box(74, 93, 17, 4.5, WHITE)
+txt(74, 95.25, "W_up\nd→d_ff", 8.5)
 
-arrow((CX, 75), (CX, 78))
-add_node(CX, 79.5)
+txt(92, 95.25, "d_ff = ⌈8/3·d_model⌉₆₄ = 1408\n(param-matched to a\n4·d 2-matmul FFN)", 7.5, italic=True, ha="left")
+
+arrow((50, 97.5), (50, 99.5), lw=1.6)
+box(50, 99.5, 17, 4, WHITE)
+txt(50, 101.5, "SiLU", 8.5)
+
+# elementwise multiply of SiLU(W_gate x) and (W_up x)
+arrow((50, 103.5), (60, 105.5), lw=1.6)
+path([(74, 97.5), (74, 106), (63.8, 106)], lw=1.6)
+mul_node(CX, 106)
+txt(66.5, 106, "elementwise\nmultiply", 7, ha="left")
+arrow((CX, 107.6), (CX, 109.5), lw=1.6)
+
+box(CX, 109.5, 44, 3.5, WHITE)
+txt(CX, 111.25, "Dropout", 8.5)
+arrow((CX, 113), (CX, 114.5), lw=1.6)
+
+box(CX, 114.5, 44, 4, WHITE)
+txt(CX, 116.5, "W_down: d_ff→d (zero-init)", 8.5)
+
+arrow((CX, 124), (CX, 124.9))
+add_node(CX, 126.5)
+txt(56, 129.5, "x ← x + dropout(ffn)", 8, ha="right")
 
 # residual 2 (around norm+FFN), left side
-path([(CX, 53.8), (28, 53.8), (28, 79.5), (44.2, 79.5)])
-
-# ---------------- side connections ----------------
-# gated x0 skip: embedding output -> every layer input (left)
-path([(31, 9.5), (8, 9.5), (8, 22), (25, 22)])
-ax.text(5.5, 15.8, "gated x0 skip\n(every layer input)", rotation=90,
-        fontsize=8, ha="center", va="center")
-
-# gated mirror (U-net) skip: first-half layer output -> second-half layer input (right, outside)
-path([(69, 84), (76, 84), (76, 23), (69.4, 23)], dashed=True)
-ax.text(79, 53.5, "gated mirror skip\n(second half ← mirrored\nfirst-half layer)",
-        rotation=90, fontsize=8, ha="center", va="center")
+path([(CX, 81.8), (28, 81.8), (28, 126.5), (60.4, 126.5)])
 
 # ---------------- trunk after the stack ----------------
-arrow((CX, 81.2), (CX, 92))
+arrow((CX, 128.1), (CX, 140))
 
-box(CX, 92, 30, 5, YELLOW)
-txt(CX, 94.5, "RMSNorm (final)", 10)
+box(CX, 140, 36, 4.5, YELLOW)
+txt(CX, 142.25, "RMSNorm (final)", 10)
+txt(84, 146, "(B, T, d_model)", 8, italic=True, ha="left")
 
-arrow((CX, 97), (CX, 100))
+arrow((CX, 144.5), (CX, 147))
 
-box(CX, 100, 30, 5, PURPLE)
-txt(CX, 102.5, "Linear (tied to embedding)", 10)
+box(CX, 147, 40, 5, PURPLE)
+txt(CX, 149.5, "LM head: z = x·W_eᵀ\n(weights tied to embedding)", 9.5)
 
-arrow((CX, 105), (CX, 108))
+arrow((CX, 152), (CX, 154.5))
 
-box(CX, 108, 30, 5, TEAL)
-txt(CX, 110.5, "logit soft-cap: 15·tanh(z/15)", 9.5)
+box(CX, 154.5, 40, 4.5, TEAL)
+txt(CX, 156.75, "logit soft-cap: z ← 15·tanh(z/15)", 9.5)
+txt(86, 159.5, "(B, T, vocab)", 8, italic=True, ha="left")
 
-arrow((CX, 113), (CX, 116))
+arrow((CX, 159), (CX, 161.5))
 
-box(CX, 116, 30, 5, GREEN)
-txt(CX, 118.5, "Softmax", 10)
+box(CX, 161.5, 40, 4.5, GREEN)
+txt(CX, 163.75, "Softmax", 10)
 
-arrow((CX, 121), (CX, 124.5))
-txt(CX, 126.8, "Output Probabilities", 11)
+arrow((CX, 166), (CX, 168.5))
+txt(CX, 171, "Output Probabilities — p(next token | context)", 11)
+
+# ---------------- legend ----------------
+ax.add_patch(FancyBboxPatch((98, 174), 50, 15,
+                            boxstyle="round,pad=0,rounding_size=1.5",
+                            fc="white", ec="black", lw=1.5, zorder=2))
+txt(123, 186.5, "Legend", 9, bold=True)
+legend_items = [
+    (101, 183.5, PINK, "Embedding"),
+    (101, 180.5, YELLOW, "RMSNorm"),
+    (101, 177.5, ORANGE, "Attention"),
+    (101, 175.5, BLUE, "Feed-Forward"),
+    (124, 183.5, PURPLE, "Linear"),
+    (124, 180.5, TEAL, "Soft-cap / gates"),
+    (124, 177.5, GREEN, "Softmax"),
+]
+for x, y, c, label in legend_items:
+    ax.add_patch(FancyBboxPatch((x, y - 0.8), 1.8, 1.6,
+                                boxstyle="round,pad=0,rounding_size=0.3",
+                                fc=c, ec="black", lw=1.0, zorder=3))
+    txt(x + 2.8, y, label, 7.5, ha="left")
 
 plt.savefig("architecture.png", dpi=300, bbox_inches="tight", facecolor="white")
 plt.savefig("architecture.pdf", bbox_inches="tight", facecolor="white")
