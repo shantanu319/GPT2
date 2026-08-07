@@ -259,3 +259,100 @@ def test_sft_encode_conversation_masks_assistant():
     # assistant im_end has loss, role headers don't
     im_end_flags = [m for i, m in zip(ids, mask) if i == im_end]
     assert im_end_flags == [0, 1]
+
+
+def _zero_residual_projections(model):
+    """Replicate get_model's zero-init (weights and biases) so every block is
+    exactly the identity at init."""
+    for layer in model.decoder.layers:
+        for lin in (layer.attn_1.out,):
+            torch.nn.init.zeros_(lin.weight)
+            torch.nn.init.zeros_(lin.bias)
+        torch.nn.init.zeros_(layer.ff.w_down.weight)
+
+
+def test_attn_res_forward_backward():
+    torch.manual_seed(0)
+    V, B, T = 32, 2, 8
+    model = _tiny(vocab=V, n_layers=4, attn_res=2, loops=2,
+                  value_residual=True, unet_skips=True)
+    x = torch.randint(0, V, (B, T))
+    logits = model(x, nopeak_mask(T, torch.device("cpu")))
+    assert logits.shape == (B, T, V)
+    assert torch.isfinite(logits).all()
+    logits.sum().backward()
+    for proj in (model.decoder.attnres_wq, model.decoder.attnres_wk):
+        assert proj.weight.grad is not None
+        assert proj.weight.grad.abs().sum() > 0
+
+
+def test_attn_res_uneven_blocks():
+    """N not divisible by the block size: last block is shorter."""
+    torch.manual_seed(0)
+    model = _tiny(vocab=32, n_layers=5, attn_res=3)
+    x = torch.randint(0, 32, (2, 8))
+    logits = model(x, nopeak_mask(8, torch.device("cpu")))
+    assert logits.shape == (2, 8, 32)
+    assert torch.isfinite(logits).all()
+
+
+def test_attn_res_disabled_is_unchanged():
+    torch.manual_seed(0)
+    a = _tiny(vocab=32, n_layers=4)
+    torch.manual_seed(0)
+    b = _tiny(vocab=32, n_layers=4, attn_res=0)
+    assert not hasattr(a.decoder, 'attnres_wq')
+    x = torch.randint(0, 32, (2, 8))
+    mask = nopeak_mask(8, torch.device("cpu"))
+    assert torch.equal(a(x, mask), b(x, mask))
+
+
+def test_attn_res_neutral_at_init():
+    """With identity blocks (zero-init residual projections) every block output
+    equals x0, so the depth mix — a convex combination of identical tensors —
+    must leave the stream unchanged."""
+    torch.manual_seed(0)
+    plain = _tiny(vocab=32, n_layers=4)
+    _zero_residual_projections(plain)
+    mixed = _tiny(vocab=32, n_layers=4, attn_res=2)
+    # copy shared params exactly (separate RNG streams would otherwise diverge
+    # on non-tied draws like out.bias); attnres_* keys keep their own init
+    mixed.load_state_dict(plain.state_dict(), strict=False)
+    _zero_residual_projections(mixed)
+    x = torch.randint(0, 32, (2, 8))
+    mask = nopeak_mask(8, torch.device("cpu"))
+    assert torch.allclose(plain(x, mask), mixed(x, mask), atol=1e-5)
+
+
+def test_attn_res_depth_mix_semantics():
+    torch.manual_seed(0)
+    model = _tiny(vocab=32, n_layers=4, attn_res=2)
+    dec = model.decoder
+    with torch.no_grad():
+        dec.attnres_wq.weight.copy_(torch.eye(32))
+        dec.attnres_wk.weight.copy_(torch.eye(32))
+
+    t = torch.randn(2, 5, 32)
+    assert torch.allclose(dec._depth_mix([t, t, t]), t, atol=1e-5)
+
+    # query (last candidate) dominates -> output ~= last candidate
+    a = torch.zeros(2, 5, 32)
+    b = torch.randn(2, 5, 32) * 5
+    assert torch.allclose(dec._depth_mix([a, b]), b, atol=1e-3)
+
+
+def test_attn_res_kv_cache_matches_full_forward():
+    """The depth mix is per-token, so incremental cached decoding must match
+    the full forward exactly."""
+    torch.manual_seed(0)
+    V, T = 32, 6
+    model = _tiny(vocab=V, n_layers=4, loops=2, attn_res=2).eval()
+    x = torch.randint(0, V, (1, T))
+    full = model(x, nopeak_mask(T, torch.device("cpu")))
+
+    model.reset_cache()
+    out = []
+    for t in range(T):
+        out.append(model(x[:, t:t+1], None, start_pos=t))
+    inc = torch.cat(out, dim=1)
+    assert torch.allclose(full, inc, atol=1e-4), (full - inc).abs().max()
