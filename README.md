@@ -127,6 +127,20 @@ Posttraining (SFT + DPO, target: chat-able under 100M params):
     dpo_prepare.py tokenizes HuggingFaceH4/ultrafeedback_binarized into chosen/rejected pairs (dpo_*.bin + pair index),
     dpo.py loads the SFT checkpoint as policy + frozen reference and runs DPO (β=0.5, 2 epochs, AdamW-only) on length-normalized completion log-probs.
 
+Teacher distillation (optional; needs OPENAI_API_KEY in .env.local — which takes precedence over any stale exported shell key):
+    distill_generate.py answers prompts with a GPT teacher (default gpt-5.6-luna; override with --model / OPENAI_MODEL)
+    and writes ChatML-ready JSONL: --source synthetic invents beginner-level QA from a seed topic list (targets the
+    general-knowledge gap), --source no_robots re-answers ~9.5k human-written prompts (targets task/style variety).
+    sft_prepare.py --input-jsonl packs the JSONL through the same masking path, so the bins drop straight into finetune.py:
+
+    python3 distill_generate.py --source synthetic --max-examples 5000   # add --resume to continue an interrupted run
+    python3 distill_generate.py --source no_robots --max-examples 5000
+    cat data_cache/distill/teacher_*.jsonl > data_cache/distill/teacher_all.jsonl
+    python3 sft_prepare.py --input-jsonl data_cache/distill/teacher_all.jsonl --output-dir data_cache/distill
+    python3 finetune.py --checkpoint saved/<run>/ckpt_final.pt --data-dir data_cache/distill --dir-name sft_distill
+    # to mix with smol-smoltalk instead of training on distilled data alone, cat the headerless bins
+    # (tokens with tokens, masks with masks) into one directory and point --data-dir there.
+
     python vast_train.py pipeline                                    # full chain: prepare -> pretrain -> sft_prepare -> sft -> dpo_prepare -> dpo
     python vast_train.py sft-prepare                                 # just tokenize chat data
     python vast_train.py sft --checkpoint saved/vast_run/ckpt_final.pt --dir-name sft_run
