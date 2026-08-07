@@ -10,10 +10,17 @@ each conversation in ChatML, and writes:
 Loss is masked to assistant message bodies (+ <|im_end|> + final <|endoftext|>),
 so the model learns to *respond*, not to imitate the user.
 
+With --input-jsonl the HF stream is replaced by a local JSONL of
+{"messages": [{role, content}, ...]} per line — e.g. teacher-distilled
+conversations from distill_generate.py. Everything else (masking, holdout
+split, shard layout) is identical, and since shards are headerless packed
+arrays, smol-smoltalk and distilled bins can be concatenated directly.
+
 Run after prepare.py (re-uses tokenizer.json; vocab must include
 <|im_start|> / <|im_end|> — i.e. rebuilt with the current prepare.py).
 """
 import argparse
+import json
 import os
 
 import numpy as np
@@ -49,6 +56,10 @@ def encode_conversation(tokenizer, messages, im_start_id, im_end_id, eos_id):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', default='data_cache/cosmopedia')
+    parser.add_argument('--input-jsonl', default=None,
+                        help='Read conversations from a JSONL file (one '
+                             '{"messages": [...]} object per line, e.g. from '
+                             'distill_generate.py) instead of streaming smol-smoltalk')
     parser.add_argument('--max-conversations', type=int, default=None)
     parser.add_argument('--holdout-period', type=int, default=200,
                         help='1-in-N conversations go to the val shard')
@@ -67,7 +78,15 @@ def main():
     im_end_id = tokenizer.special_tokens[IM_END]
     eos_id = tokenizer.special_tokens[EOS_TOKEN]
 
-    ds = load_dataset(DATASET_PATH, split='train', streaming=True)
+    if args.input_jsonl:
+        def ds():
+            with open(args.input_jsonl) as f:
+                for line in f:
+                    if line.strip():
+                        yield json.loads(line)
+        ds = ds()
+    else:
+        ds = load_dataset(DATASET_PATH, split='train', streaming=True)
 
     paths = {
         'train': (os.path.join(args.output_dir, 'sft_train.bin'),
