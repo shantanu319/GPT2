@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
+from core.chat_format import EOS_TOKEN
 from core.data import data_feeder, load_bin
 from core.model import LOGIT_SOFTCAP, get_model, nopeak_mask
 from core.tokenizer import BPETokenizer
@@ -149,17 +150,28 @@ def _checkpoint_path(opt, tag):
     return os.path.join(opt.dir_name, f'{base}_{tag}.pt')
 
 
-def _batch_loss(model, inX, out, opt):
+def _batch_loss(model, inX, out, opt, seg=None):
     """Fused chunked CE on CUDA (mask=None engages the causal flash path);
-    otherwise the old soft-capped logits + F.cross_entropy route."""
+    otherwise the old soft-capped logits + F.cross_entropy route. With seg
+    (document segment ids) the decoder builds the intra-document mask itself."""
     if opt.device.type == 'cuda' and getattr(opt, 'ce_chunk', 0) > 0:
-        hidden = model.decoder(inX, None)
+        hidden = model.decoder(inX, None, seg_ids=seg)
         return chunked_cross_entropy(hidden.view(-1, hidden.size(-1)),
                                      model.out.weight, out.reshape(-1),
                                      LOGIT_SOFTCAP, opt.ce_chunk)
-    mask = nopeak_mask(inX.size(1), opt.device)
-    pred = model(inX, mask)
+    if seg is not None:
+        pred = model(inX, None, seg_ids=seg)
+    else:
+        mask = nopeak_mask(inX.size(1), opt.device)
+        pred = model(inX, mask)
     return F.cross_entropy(pred.view(-1, opt.vocab_size), out.reshape(-1))
+
+
+def _feeder(opt, data, **kw):
+    """data_feeder with the run's doc-masking setting applied (None = off;
+    main() sets opt.eos_id from the tokenizer when -doc_mask is on)."""
+    return data_feeder(data, opt.batchsize, opt.seqlen, opt.device,
+                       eos_id=getattr(opt, 'eos_id', None), **kw)
 
 
 def _apply_momentum_warmup(optimizers, step, warmup):
@@ -186,14 +198,13 @@ def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
     for o in opt.optimizers:
         o.zero_grad()
     cd, micro = 0, 0
-    for inX, out in data_feeder(opt.train, opt.batchsize, opt.seqlen, opt.device):
+    for inX, out, *rest in _feeder(opt, opt.train):
+        seg = rest[0] if rest else None
         frac = max(0.0, 1.0 - (cd + 1) / cooldown_steps)
         for g, lr0 in groups:
             g['lr'] = lr0 * frac
-        mask = nopeak_mask(inX.size(1), opt.device)
         with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-            pred = model(inX, mask)
-            loss = F.cross_entropy(pred.view(-1, opt.vocab_size), out.reshape(-1))
+            loss = _batch_loss(model, inX, out, opt, seg=seg)
         (loss / grad_accum).backward()
         micro += 1
         if micro % grad_accum != 0:
@@ -256,9 +267,10 @@ def train_model(model, opt):
         for o in opt.optimizers:
             o.zero_grad()
 
-        for inX, out in data_feeder(opt.train, opt.batchsize, opt.seqlen, opt.device,
-                                    shuffle=bool(getattr(opt, 'shuffle', 0)),
-                                    seed=42 + epoch):
+        for inX, out, *rest in _feeder(opt, opt.train,
+                                       shuffle=bool(getattr(opt, 'shuffle', 0)),
+                                       seed=42 + epoch):
+            seg = rest[0] if rest else None
             iter += 1
             apply_lr_schedule(opt.optimizers, step, opt.total_steps, opt.warmup_steps,
                               schedule=getattr(opt, 'schedule', 'wsd'),
@@ -267,7 +279,7 @@ def train_model(model, opt):
                                    getattr(opt, 'momentum_warmup', 0))
 
             with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-                loss = _batch_loss(model, inX, out, opt)
+                loss = _batch_loss(model, inX, out, opt, seg=seg)
 
             epoch_loss += loss.detach() * out.numel()
             epoch_tokens += out.numel()
@@ -322,10 +334,11 @@ def validate_model(model, opt, max_batches=None):
     total_tokens = 0
 
     with torch.no_grad(), torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-        for i, (inX, out) in enumerate(data_feeder(opt.valid, opt.batchsize, opt.seqlen, opt.device)):
+        for i, (inX, out, *rest) in enumerate(_feeder(opt, opt.valid)):
+            seg = rest[0] if rest else None
             if max_batches is not None and i >= max_batches:
                 break
-            loss = _batch_loss(model, inX, out, opt)
+            loss = _batch_loss(model, inX, out, opt, seg=seg)
             total_loss += loss * out.numel()
             total_tokens += out.numel()
 
@@ -375,8 +388,9 @@ def test_model(model, opt, epoch):
     total_tokens = 0
 
     with torch.no_grad(), torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-        for x_in, x_out in data_feeder(opt.test, opt.batchsize, opt.seqlen, opt.device):
-            loss = _batch_loss(model, x_in, x_out, opt)
+        for x_in, x_out, *rest in _feeder(opt, opt.test):
+            seg = rest[0] if rest else None
+            loss = _batch_loss(model, x_in, x_out, opt, seg=seg)
             total_loss += loss * x_out.numel()
             total_tokens += x_out.numel()
 
@@ -420,6 +434,8 @@ def main():
     tokenizer.load(tok_path)
     opt.tokenizer = tokenizer
     opt.vocab_size = tokenizer.vocab_size
+    # Intra-document masking: feeders derive segment ids from EOS positions.
+    opt.eos_id = tokenizer.special_tokens[EOS_TOKEN] if opt.doc_mask else None
 
     opt.train = load_bin(train_bin)
     opt.valid = load_bin(val_bin)

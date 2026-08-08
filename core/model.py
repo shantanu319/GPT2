@@ -30,11 +30,16 @@ def precompute_rope_freqs(head_dim, max_seq_len, base=10000.0):
 
 
 def apply_rope(x, cos, sin):
-    # x: (..., T, D) with D even; cos/sin: (T, D/2)
+    # x: (..., T, D) with D even; cos/sin: (T, D/2) or (B, T, D/2) for
+    # per-token positions (RoPE reset at document boundaries).
     x1 = x[..., 0::2]
     x2 = x[..., 1::2]
-    cos = cos[None, None, :, :]
-    sin = sin[None, None, :, :]
+    if cos.dim() == 2:
+        cos = cos[None, None, :, :]
+        sin = sin[None, None, :, :]
+    else:
+        cos = cos[:, None, :, :]
+        sin = sin[:, None, :, :]
     rotated_1 = x1 * cos - x2 * sin
     rotated_2 = x1 * sin + x2 * cos
     return torch.stack((rotated_1, rotated_2), dim=-1).flatten(-2)
@@ -115,7 +120,8 @@ class MultiHeadAttention(nn.Module):
         self.k_cache = {}
         self.v_cache = {}
 
-    def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0, v1=None):
+    def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0, v1=None,
+                pos_ids=None):
 
         bs = q.size(0)
 
@@ -133,9 +139,16 @@ class MultiHeadAttention(nn.Module):
         k = self.k_norm(k)
 
         T = q.size(2)
-        pos = start_pos if start_pos is not None else 0
-        q = apply_partial_rope(q, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T], self.rot_dim)
-        k = apply_partial_rope(k, self.rope_cos[pos:pos+T], self.rope_sin[pos:pos+T], self.rot_dim)
+        if pos_ids is not None:
+            # Per-token positions (reset at document boundaries); training only.
+            cos = self.rope_cos[pos_ids]
+            sin = self.rope_sin[pos_ids]
+        else:
+            pos = start_pos if start_pos is not None else 0
+            cos = self.rope_cos[pos:pos+T]
+            sin = self.rope_sin[pos:pos+T]
+        q = apply_partial_rope(q, cos, sin, self.rot_dim)
+        k = apply_partial_rope(k, cos, sin, self.rot_dim)
 
         v_pre = v  # this layer's own V (kv-head space), for value-residual mixing
         if v1 is not None:
@@ -219,15 +232,18 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
             self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads, dropout=dropout)
         self.ff = SwiGLU(d_model, dropout=dropout)
 
-    def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None):
+    def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None, seg_ids=None,
+                pos_ids=None):
         x2 = self.norm_1(x)
         if self.is_kda:
             # KDA ignores the attention mask (the recurrence is inherently
-            # causal) and does not participate in value-residual mixing.
-            att, v = self.attn_1(x2, start_pos=start_pos, cache_idx=cache_idx), None
+            # causal; seg_ids resets its state at document boundaries) and does
+            # not participate in value-residual mixing.
+            att, v = self.attn_1(x2, start_pos=start_pos, cache_idx=cache_idx,
+                                 seg_ids=seg_ids), None
         else:
             att, v = self.attn_1(x2, x2, x2, mask, start_pos=start_pos,
-                                 cache_idx=cache_idx, v1=v1)
+                                 cache_idx=cache_idx, v1=v1, pos_ids=pos_ids)
         x = x + self.dropout_1(att)
         x2 = self.norm_3(x)
         x = x + self.dropout_3(self.ff(x2))
@@ -292,7 +308,14 @@ class Decoder(nn.Module):
         w = torch.softmax(logits, dim=-1)
         return torch.einsum('btj,jbtd->btd', w, cands)
 
-    def forward(self, trg, mask, start_pos=None):
+    def forward(self, trg, mask, start_pos=None, seg_ids=None):
+        pos_ids = None
+        if seg_ids is not None:
+            # Document-aware training: no attention across boundaries, RoPE
+            # positions restart at each new segment (KDA gets seg_ids directly).
+            assert start_pos is None, "seg_ids is only supported in training windows"
+            mask = segment_mask(seg_ids)
+            pos_ids = segment_pos_ids(seg_ids)
         x0 = x = self.embed(trg)
         half = (self.N + 1) // 2
         # Block outputs feed AttnRes boundaries; accumulates across the whole
@@ -314,10 +337,11 @@ class Decoder(nn.Module):
                 v1_in = v1 if (self.value_residual and not self.layers[i].is_kda) else None
                 if self.training and self.grad_ckpt:
                     x, v = checkpoint(self.layers[i], x_in, mask, start_pos, loop,
-                                      v1_in, use_reentrant=False)
+                                      v1_in, seg_ids, pos_ids, use_reentrant=False)
                 else:
                     x, v = self.layers[i](x_in, mask, start_pos=start_pos,
-                                          cache_idx=loop, v1=v1_in)
+                                          cache_idx=loop, v1=v1_in, seg_ids=seg_ids,
+                                          pos_ids=pos_ids)
                 if v1 is None and v is not None:
                     v1 = v
                 outs.append(x)
@@ -339,8 +363,8 @@ class Transformer(nn.Module):
         self.out = nn.Linear(d_model, vocab)
         self.out.weight = self.decoder.embed.embed.weight
 
-    def forward(self, vocab, mask, start_pos=None):
-        d_output = self.decoder(vocab, mask, start_pos=start_pos)
+    def forward(self, vocab, mask, start_pos=None, seg_ids=None):
+        d_output = self.decoder(vocab, mask, start_pos=start_pos, seg_ids=seg_ids)
         output = self.out(d_output)
         # Soft-cap logits so no token can dominate early; keeps loss landscape smooth.
         output = LOGIT_SOFTCAP * torch.tanh(output / LOGIT_SOFTCAP)
@@ -393,3 +417,28 @@ def nopeak_mask(size, device):
     mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).unsqueeze(0)
     mask = (mask == 0)
     return mask
+
+
+def segment_mask(seg_ids):
+    """(B, T) segment ids -> (B, T, T) bool mask: causal AND same-segment.
+
+    Blocks attention across document/conversation boundaries in packed
+    training windows (True = attend, SDPA convention)."""
+    T = seg_ids.size(1)
+    same = seg_ids[:, :, None] == seg_ids[:, None, :]
+    causal = torch.tril(torch.ones(T, T, dtype=torch.bool, device=seg_ids.device))
+    return same & causal
+
+
+def segment_pos_ids(seg_ids):
+    """(B, T) segment ids -> (B, T) intra-segment position ids (RoPE reset).
+
+    Position 0 of the window counts as a segment start — the first segment in
+    a window may be a document continuation, which is the same assumption the
+    windowing already makes."""
+    T = seg_ids.size(1)
+    arange = torch.arange(T, device=seg_ids.device)
+    is_start = torch.ones_like(seg_ids, dtype=torch.bool)
+    is_start[:, 1:] = seg_ids[:, 1:] != seg_ids[:, :-1]
+    starts = torch.cummax(arange.unsqueeze(0) * is_start, dim=1).values
+    return arange.unsqueeze(0) - starts

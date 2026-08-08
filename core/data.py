@@ -55,16 +55,34 @@ def _window_order(num_sequences, batch_size, shuffle, seed):
     return list(range(n_batches))
 
 
+def segment_ids_np(tokens2d, eos_id):
+    """Per-token document segment ids for a (rows, T) token array.
+
+    Derived from EOS positions, so no separate boundary sidecar is needed:
+    EOS is the last token of its segment, the next token starts a new one
+    (exclusive cumsum over EOS flags)."""
+    is_eos = tokens2d == eos_id
+    return np.cumsum(is_eos, axis=1, dtype=np.int64) - is_eos.astype(np.int64)
+
+
+def segment_ids_torch(tokens2d, eos_id):
+    """Torch twin of segment_ids_np (CPU feeder path)."""
+    is_eos = tokens2d == eos_id
+    return torch.cumsum(is_eos.long(), dim=1) - is_eos.long()
+
+
 def _slice(data, b, batch_size, seq_len, dtype):
     lo, hi = b * batch_size * seq_len, (b + 1) * batch_size * seq_len
     return np.asarray(data[lo:hi]).astype(dtype, copy=False)
 
 
-def data_feeder_masked(data, mask, batch_size, seq_len, device):
+def data_feeder_masked(data, mask, batch_size, seq_len, device, eos_id=None):
     """Like data_feeder, but also yields a loss mask aligned with the targets.
 
     data: uint16 token memmap; mask: uint8 memmap of the same length
-    (1 = compute loss on this token when it appears as a target)."""
+    (1 = compute loss on this token when it appears as a target).
+    When eos_id is given, also yields per-token segment ids aligned with the
+    inputs (documents/conversations end at EOS; see segment_ids_np)."""
     total = min(len(data), len(mask))
     num_sequences = total // seq_len
     order = _window_order(num_sequences, batch_size, shuffle=False, seed=0)
@@ -78,34 +96,50 @@ def data_feeder_masked(data, mask, batch_size, seq_len, device):
             mbatch = torch.tensor(np.asarray(mask[b * batch_size * seq_len:
                                                   (b + 1) * batch_size * seq_len]),
                                   dtype=torch.bool, device=device).view(batch_size, seq_len)
-            yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:]
+            if eos_id is None:
+                yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:]
+            else:
+                seg = segment_ids_torch(batch, eos_id)
+                yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:], seg[:, :-1]
         return
 
-    ring = _PinnedRing([(batch_size * seq_len, torch.int64),
-                        (batch_size * seq_len, torch.bool)], device)
     n = batch_size * seq_len
+    specs = [(n, torch.int64), (n, torch.bool)]
+    if eos_id is not None:
+        specs.append((n, torch.int64))
+    ring = _PinnedRing(specs, device)
 
     def arrays(b):
         lo, hi = b * n, (b + 1) * n
-        return [_slice(data, b, batch_size, seq_len, np.int64),
-                np.asarray(mask[lo:hi])]
+        toks = _slice(data, b, batch_size, seq_len, np.int64)
+        out = [toks, np.asarray(mask[lo:hi])]
+        if eos_id is not None:
+            out.append(segment_ids_np(toks.reshape(batch_size, seq_len),
+                                      eos_id).reshape(-1))
+        return out
 
     pending = ring.push(0, arrays(order[0]))
     for i, b in enumerate(order):
-        batch, mbatch = pending
+        arrays_out = pending
         if i + 1 < len(order):
             pending = ring.push((i + 1) % 2, arrays(order[i + 1]))
-        batch = batch.view(batch_size, seq_len)
-        mbatch = mbatch.view(batch_size, seq_len)
-        yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:]
+        batch = arrays_out[0].view(batch_size, seq_len)
+        mbatch = arrays_out[1].view(batch_size, seq_len)
+        if eos_id is None:
+            yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:]
+        else:
+            seg = arrays_out[2].view(batch_size, seq_len)
+            yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:], seg[:, :-1]
 
 
-def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42):
+def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42, eos_id=None):
     """Yields (inputs, targets) windows of (batch_size, seq_len), shifted by one.
 
     shuffle=True serves the windows in a seeded-permuted order for the pass
     (reproducible given the same seed). On CUDA, H2D copies go through pinned
-    staging buffers with a 1-batch lookahead so transfer overlaps compute."""
+    staging buffers with a 1-batch lookahead so transfer overlaps compute.
+    When eos_id is given, also yields per-token segment ids aligned with the
+    inputs (documents end at EOS; see segment_ids_np)."""
     total = len(data)
     num_sequences = total // seq_len
     order = _window_order(num_sequences, batch_size, shuffle, seed)
@@ -116,15 +150,35 @@ def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42):
         for b in order:
             batch = torch.tensor(_slice(data, b, batch_size, seq_len, np.int64),
                                  device=device).view(batch_size, seq_len)
-            yield batch[:, :-1], batch[:, 1:]
+            if eos_id is None:
+                yield batch[:, :-1], batch[:, 1:]
+            else:
+                seg = segment_ids_torch(batch, eos_id)
+                yield batch[:, :-1], batch[:, 1:], seg[:, :-1]
         return
 
-    ring = _PinnedRing([(batch_size * seq_len, torch.int64)], device)
-    pending = ring.push(0, [_slice(data, order[0], batch_size, seq_len, np.int64)])
+    n = batch_size * seq_len
+    specs = [(n, torch.int64)]
+    if eos_id is not None:
+        specs.append((n, torch.int64))
+    ring = _PinnedRing(specs, device)
+
+    def arrays(b):
+        toks = _slice(data, b, batch_size, seq_len, np.int64)
+        out = [toks]
+        if eos_id is not None:
+            out.append(segment_ids_np(toks.reshape(batch_size, seq_len),
+                                      eos_id).reshape(-1))
+        return out
+
+    pending = ring.push(0, arrays(order[0]))
     for i, b in enumerate(order):
-        (batch,) = pending
+        arrays_out = pending
         if i + 1 < len(order):
-            pending = ring.push((i + 1) % 2,
-                                [_slice(data, order[i + 1], batch_size, seq_len, np.int64)])
-        batch = batch.view(batch_size, seq_len)
-        yield batch[:, :-1], batch[:, 1:]
+            pending = ring.push((i + 1) % 2, arrays(order[i + 1]))
+        batch = arrays_out[0].view(batch_size, seq_len)
+        if eos_id is None:
+            yield batch[:, :-1], batch[:, 1:]
+        else:
+            seg = arrays_out[1].view(batch_size, seq_len)
+            yield batch[:, :-1], batch[:, 1:], seg[:, :-1]

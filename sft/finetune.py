@@ -16,6 +16,7 @@ import os
 import torch
 import torch.nn.functional as F
 
+from core.chat_format import EOS_TOKEN
 from core.data import data_feeder_masked, load_bin, load_bin_u8
 from core.model import Transformer, nopeak_mask
 from core.tokenizer import BPETokenizer
@@ -27,6 +28,14 @@ def masked_loss(pred, target, mask, vocab_size):
                            reduction='none')
     mask = mask.reshape(-1).float()
     return (loss * mask).sum() / mask.sum().clamp(min=1)
+
+
+def forward_with_seg(model, x, seg, device):
+    """Intra-conversation attention when seg is present (packed conversations
+    must not merge into one mega-conversation); plain causal otherwise."""
+    if seg is not None:
+        return model(x, None, seg_ids=seg)
+    return model(x, nopeak_mask(x.size(1), device))
 
 
 def make_sft_optimizers(model, muon_lr, adamw_lr):
@@ -49,16 +58,18 @@ def make_sft_optimizers(model, muon_lr, adamw_lr):
 
 
 @torch.no_grad()
-def validate(model, val, val_mask, opt, device, vocab_size, max_batches=100):
+def validate(model, val, val_mask, opt, device, vocab_size, max_batches=100,
+             eos_id=None):
     model.eval()
     total, count = 0.0, 0
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        for i, (x, y, m) in enumerate(
-                data_feeder_masked(val, val_mask, opt.batchsize, opt.seqlen, device)):
+        for i, (x, y, m, *rest) in enumerate(
+                data_feeder_masked(val, val_mask, opt.batchsize, opt.seqlen, device,
+                                   eos_id=eos_id)):
             if i >= max_batches:
                 break
-            mask = nopeak_mask(x.size(1), device)
-            loss = masked_loss(model(x, mask), y, m, vocab_size)
+            seg = rest[0] if rest else None
+            loss = masked_loss(forward_with_seg(model, x, seg, device), y, m, vocab_size)
             total += loss.item()
             count += 1
     model.train()
@@ -82,6 +93,9 @@ def main():
     parser.add_argument('--printevery', type=int, default=50)
     parser.add_argument('--dir-name', default='sft')
     parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--no-doc-mask', action='store_true',
+                        help='Disable intra-conversation attention (allow attention '
+                             'across packed conversations separated by <|endoftext|>)')
     args = parser.parse_args()
 
     device = resolve_device(args.no_cuda)
@@ -112,6 +126,7 @@ def main():
     train_mask = load_bin_u8(os.path.join(args.data_dir, 'sft_train_mask.bin'))
     val = load_bin(os.path.join(args.data_dir, 'sft_val.bin'))
     val_mask = load_bin_u8(os.path.join(args.data_dir, 'sft_val_mask.bin'))
+    eos_id = None if args.no_doc_mask else tokenizer.special_tokens[EOS_TOKEN]
 
     optimizers = make_sft_optimizers(model, muon_lr=args.muon_lr, adamw_lr=args.lr)
     batches_per_epoch = max(1, len(train) // (args.batchsize * args.seqlen))
@@ -123,16 +138,17 @@ def main():
     model.train()
     step = 0
     for epoch in range(args.epochs):
-        for x, y, m in data_feeder_masked(train, train_mask, args.batchsize,
-                                          args.seqlen, device):
+        for x, y, m, *rest in data_feeder_masked(train, train_mask, args.batchsize,
+                                                 args.seqlen, device, eos_id=eos_id):
+            seg = rest[0] if rest else None
             factor = lr_factor(step, total_steps, warmup_steps=args.warmup_steps)
             for opt in optimizers:
                 for group in opt.param_groups:
                     group['lr'] = group['peak_lr'] * factor
 
-            mask = nopeak_mask(x.size(1), device)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = masked_loss(model(x, mask), y, m, vocab_size)
+                loss = masked_loss(forward_with_seg(model, x, seg, device), y, m,
+                                   vocab_size)
 
             for opt in optimizers:
                 opt.zero_grad()
@@ -150,11 +166,11 @@ def main():
                 save_checkpoint(model, optimizers, step, path, config=cfg)
                 print(f"saved {path}")
             if args.val_every and step % args.val_every == 0:
-                validate(model, val, val_mask, args, device, vocab_size)
+                validate(model, val, val_mask, args, device, vocab_size, eos_id=eos_id)
 
     final = os.path.join(save_dir, 'sft_final.pt')
     save_checkpoint(model, optimizers, step, final, config=cfg)
-    validate(model, val, val_mask, args, device, vocab_size)
+    validate(model, val, val_mask, args, device, vocab_size, eos_id=eos_id)
     print(f"saved final SFT checkpoint: {final}")
 
 

@@ -12,12 +12,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def kda_recurrence(q, k, v, g, beta, initial_state=None):
+def kda_recurrence(q, k, v, g, beta, initial_state=None, seg_ids=None):
     """Sequential KDA scan in fp32 — the reference path, also used for cached
     inference (prefill chunks and single-token decode).
 
     q, k: [B, T, H, K]; v: [B, T, H, V]; g: [B, T, H, K] log-decay (<= 0);
     beta: [B, T, H]; initial_state: [B, H, K, V] or None.
+    seg_ids: optional [B, T] document segment ids — the carried state is
+    dropped at every segment start (document-boundary reset).
     Returns (o [B, T, H, V], S [B, H, K, V])."""
     B, T, H, K = q.shape
     q, k, v, g, beta = (x.float() for x in (q, k, v, g, beta))
@@ -28,17 +30,27 @@ def kda_recurrence(q, k, v, g, beta, initial_state=None):
     o = torch.zeros_like(v)
     for t in range(T):
         qt, kt, vt, gt, bt = q[:, t], k[:, t], v[:, t], g[:, t], beta[:, t]
-        S = S * gt.exp().unsqueeze(-1)
+        decay = gt.exp()
+        if seg_ids is not None and t > 0:
+            reset = (seg_ids[:, t] != seg_ids[:, t - 1]).to(decay.dtype)
+            decay = decay * (1 - reset).view(B, 1, 1)
+        S = S * decay.unsqueeze(-1)
         err = vt - torch.einsum('bhk,bhkv->bhv', kt, S)
         S = S + torch.einsum('bhk,bhv->bhkv', bt.unsqueeze(-1) * kt, err)
         o[:, t] = torch.einsum('bhk,bhkv->bhv', qt, S)
     return o, S
 
 
-def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64):
+def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None):
     """Chunked-parallel KDA in fp32 — the training path: all positions of a
     chunk are processed with batched matmuls, only the inter-chunk scan is
-    sequential. Requires T % chunk_size == 0; same signature as kda_recurrence."""
+    sequential. Requires T % chunk_size == 0; same signature as kda_recurrence.
+
+    With seg_ids ([B, T] document segment ids) the scan is exactly equivalent
+    to running the recurrence per segment: cross-segment pairs are removed
+    from the intra-chunk solves, and the inter-chunk state read/carry/write
+    is gated so no state crosses a boundary (segment starts read a zero
+    state; a chunk passes on only its final segment's contributions)."""
     B, T, H, K = q.shape
     V = v.size(-1)
     BT = chunk_size
@@ -53,6 +65,22 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64):
     beta = beta.view(B, NT, BT, H).permute(0, 3, 1, 2)  # [B, H, NT, BT]
     g = g.cumsum(-2)  # within-chunk cumulative log-decay
 
+    if seg_ids is not None:
+        seg = seg_ids.view(B, NT, BT)
+        # Same-segment pair mask within each chunk: [B, 1, NT, BT, BT] (c, j).
+        same_pair = (seg[:, :, :, None] == seg[:, :, None, :]).unsqueeze(1)
+        # Segment of the position immediately preceding each chunk. Chunk 0
+        # treats its own first segment as preceding (an initial_state, if any,
+        # is assumed to belong to it).
+        seg_prev = torch.cat([seg[:, 0:1, 0], seg[:, :-1, -1]], dim=1)  # [B, NT]
+        # Positions whose segment reaches back before the chunk read the state.
+        read_gate = (seg == seg_prev[:, :, None]).float()[:, None]      # [B,1,NT,BT]
+        seg_last = seg[:, :, -1:]                                       # [B, NT, 1]
+        # The decayed incoming state survives only if no boundary occurred.
+        carry = (seg_last == seg_prev[:, :, None]).float()[:, None]     # [B,1,NT,1]
+        # Only the chunk's final (suffix) segment contributes to the next state.
+        write_gate = (seg == seg_last).float()[:, None]                 # [B,1,NT,BT]
+
     # UT transform for the delta rule. exp(g_c - g_i) is formed per column so no
     # entry ever exponentiates a positive number (a cumsum of non-positive
     # log-decays is non-increasing, so only masked-out entries could overflow).
@@ -63,6 +91,10 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64):
         g_i = g[..., i:i+1, :]    # [B,H,NT,1,K]
         A[..., i] = torch.einsum('...cd,...d->...c', k * (g - g_i).exp(), k_i)
     A = A * beta.unsqueeze(-1)    # row c scaled by beta of the writing position
+    if seg_ids is not None:
+        # Cross-segment pairs drop out of the solve; the inverse stays
+        # block-diagonal, i.e. each segment solves independently.
+        mask_incl = mask_incl | ~same_pair
     A = -A.masked_fill(mask_incl, 0)
     for i in range(1, BT):        # forward substitution: (I + strictly-lower)^{-1}
         A[..., i, :i] = (A[..., i, :i].clone()
@@ -85,10 +117,19 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64):
             g_j = g_i[:, :, j:j+1]       # [B,H,1,K]
             Aqk[..., j] = torch.einsum('...cd,...d->...c', q_i * (g_i - g_j).exp(), k_j)
         Aqk = Aqk.masked_fill(mask_strict, 0)
-        v_i = u_i - w_i @ S              # subtract what the incoming state already knows
-        o[:, :, i] = (q_i * g_i.exp()) @ S + Aqk @ v_i
-        S = S * g_i[:, :, -1].exp().unsqueeze(-1)
-        S = S + ((g_i[:, :, -1:] - g_i).exp() * k_i).transpose(-1, -2) @ v_i
+        if seg_ids is not None:
+            rg = read_gate[:, :, i].unsqueeze(-1)   # [B,H,BT,1]
+            Aqk = Aqk.masked_fill(~same_pair[:, :, i], 0)
+            v_i = u_i - rg * (w_i @ S)  # fresh segments ignore the incoming state
+            o[:, :, i] = rg * ((q_i * g_i.exp()) @ S) + Aqk @ v_i
+            S = carry[:, :, i].unsqueeze(-1) * S * g_i[:, :, -1].exp().unsqueeze(-1)
+            S = S + ((write_gate[:, :, i].unsqueeze(-1) * (g_i[:, :, -1:] - g_i).exp())
+                     * k_i).transpose(-1, -2) @ v_i
+        else:
+            v_i = u_i - w_i @ S         # subtract what the incoming state already knows
+            o[:, :, i] = (q_i * g_i.exp()) @ S + Aqk @ v_i
+            S = S * g_i[:, :, -1].exp().unsqueeze(-1)
+            S = S + ((g_i[:, :, -1:] - g_i).exp() * k_i).transpose(-1, -2) @ v_i
     o = o.permute(0, 2, 3, 1, 4).reshape(B, T, H, V)
     return o, S
 
@@ -154,7 +195,7 @@ class KimiDeltaAttention(nn.Module):
     def reset_cache(self):
         self.s_cache = {}
 
-    def forward(self, x, start_pos=None, cache_idx=0):
+    def forward(self, x, start_pos=None, cache_idx=0, seg_ids=None):
         B, T, _ = x.shape
         H, D = self.h, self.d_k
         q = F.normalize(F.silu(self.q_proj(x)).view(B, T, H, D), dim=-1)
@@ -167,9 +208,10 @@ class KimiDeltaAttention(nn.Module):
 
         if start_pos is None:
             if T % self.chunk_size == 0:
-                o, _ = kda_chunk(q, k, v, g, beta, chunk_size=self.chunk_size)
+                o, _ = kda_chunk(q, k, v, g, beta, chunk_size=self.chunk_size,
+                                 seg_ids=seg_ids)
             else:
-                o, _ = kda_recurrence(q, k, v, g, beta)
+                o, _ = kda_recurrence(q, k, v, g, beta, seg_ids=seg_ids)
         else:
             S = self.s_cache.get(cache_idx)
             o, S = kda_recurrence(q, k, v, g, beta, initial_state=S)

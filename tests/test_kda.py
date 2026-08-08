@@ -144,6 +144,87 @@ def test_module_cache_decode_matches_full_forward():
     assert torch.allclose(o_cached, o_full, atol=1e-4)
 
 
+def _per_segment_reference(q, k, v, g, beta, seg_ids):
+    """Ground truth for segment resets: run the recurrence independently on
+    each segment of each row, stitch outputs, keep each row's final state."""
+    B, T = seg_ids.shape
+    o_rows, S_rows = [], []
+    for b in range(B):
+        cuts = (seg_ids[b, 1:] != seg_ids[b, :-1]).nonzero().flatten() + 1
+        bounds = [0] + cuts.tolist() + [T]
+        outs = []
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            ob, Sb = kda_recurrence(q[b:b + 1, lo:hi], k[b:b + 1, lo:hi],
+                                    v[b:b + 1, lo:hi], g[b:b + 1, lo:hi],
+                                    beta[b:b + 1, lo:hi])
+            outs.append(ob)
+        o_rows.append(torch.cat(outs, dim=1))
+        S_rows.append(Sb)
+    return torch.cat(o_rows, dim=0), torch.cat(S_rows, dim=0)
+
+
+def _seg_ids(*specs, T=128):
+    """Build per-row segment ids; each spec is a list of (start, end, id)."""
+    seg = torch.zeros(len(specs), T, dtype=torch.long)
+    for b, runs in enumerate(specs):
+        for lo, hi, sid in runs:
+            seg[b, lo:hi] = sid
+    return seg
+
+
+def test_chunk_with_segments_matches_per_segment_recurrence():
+    """Boundaries off chunk alignment and multiple segments per chunk."""
+    q, k, v, g, beta = _inputs()  # B=2, T=128
+    seg = _seg_ids([(40, 96, 1), (96, 128, 2)],
+                   [(10, 20, 3), (20, 70, 1), (70, 128, 2)], T=128)
+    o_ref, S_ref = _per_segment_reference(q, k, v, g, beta, seg)
+    o_chk, S_chk = kda_chunk(q, k, v, g, beta, chunk_size=64, seg_ids=seg)
+    assert torch.allclose(o_chk, o_ref, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(S_chk, S_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_chunk_with_chunk_aligned_boundary():
+    q, k, v, g, beta = _inputs()
+    seg = _seg_ids([(64, 128, 1)], [(64, 128, 1)], T=128)
+    o_ref, S_ref = _per_segment_reference(q, k, v, g, beta, seg)
+    o_chk, S_chk = kda_chunk(q, k, v, g, beta, chunk_size=64, seg_ids=seg)
+    assert torch.allclose(o_chk, o_ref, atol=1e-4, rtol=1e-4)
+    assert torch.allclose(S_chk, S_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_recurrence_with_segments_matches_per_segment():
+    q, k, v, g, beta = _inputs(T=96)
+    seg = _seg_ids([(30, 60, 1), (60, 96, 2)], [(48, 96, 1)], T=96)
+    o_ref, S_ref = _per_segment_reference(q, k, v, g, beta, seg)
+    o_rec, S_rec = kda_recurrence(q, k, v, g, beta, seg_ids=seg)
+    assert torch.allclose(o_rec, o_ref, atol=1e-5)
+    assert torch.allclose(S_rec, S_ref, atol=1e-5)
+
+
+def test_single_segment_matches_no_segments():
+    q, k, v, g, beta = _inputs()
+    seg = torch.zeros(2, 128, dtype=torch.long)
+    o0, S0 = kda_chunk(q, k, v, g, beta, chunk_size=64)
+    o1, S1 = kda_chunk(q, k, v, g, beta, chunk_size=64, seg_ids=seg)
+    assert torch.equal(o1, o0) and torch.equal(S1, S0)
+    o2, S2 = kda_recurrence(q, k, v, g, beta)
+    o3, S3 = kda_recurrence(q, k, v, g, beta, seg_ids=seg)
+    assert torch.equal(o3, o2) and torch.equal(S3, S2)
+
+
+def test_module_forward_backward_with_segments():
+    torch.manual_seed(0)
+    layer = KimiDeltaAttention(d_model=32, heads=4)
+    x = torch.randn(2, 64, 32, requires_grad=True)
+    seg = _seg_ids([(17, 64, 1)], [(32, 64, 1)], T=64)
+    o = layer(x, seg_ids=seg)
+    assert o.shape == (2, 64, 32)
+    o.sum().backward()
+    assert torch.isfinite(x.grad).all()
+    for name, p in layer.named_parameters():
+        assert p.grad is not None and torch.isfinite(p.grad).all(), name
+
+
 def _hybrid(N=4, kda=2, **kw):
     torch.manual_seed(0)
     return Transformer(vocab=48, d_model=32, N=N, heads=4, dropout=0.0,

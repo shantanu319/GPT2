@@ -83,3 +83,50 @@ def test_data_feeder_shuffle_covers_all_windows():
     assert _window_keys(shuffled) == _window_keys(sequential)
     # and the order actually changed
     assert not all(torch.equal(xa, xb) for (xa, _), (xb, _) in zip(shuffled, sequential))
+
+
+def test_data_feeder_segment_ids():
+    """eos_id makes the feeder also yield segment ids aligned with the inputs:
+    EOS is the last token of its segment, the next token starts a new one."""
+    eos = 99
+    row = [5, 6, eos, 7, 8, eos, 9, 10]  # window segs: 0 0 0 1 1 1 2 2
+    data = row * 4  # 4 identical windows
+    batches = list(data_feeder(data, 2, 8, torch.device("cpu"), eos_id=eos))
+    assert len(batches) == 2
+    for x, y, seg in batches:
+        assert x.shape == (2, 7) and seg.shape == (2, 7)
+        assert torch.equal(x[:, 1:], y[:, :-1])
+        assert seg.tolist() == [[0, 0, 0, 1, 1, 1, 2]] * 2  # inputs = window[:-1]
+
+
+def test_data_feeder_segment_ids_no_eos_in_window():
+    data = list(range(1, 33))  # no 99 anywhere
+    for x, y, seg in data_feeder(data, 2, 8, torch.device("cpu"), eos_id=99):
+        assert torch.all(seg == 0)
+
+
+def test_data_feeder_no_eos_id_keeps_pair():
+    data = list(range(100))
+    for batch in data_feeder(data, 2, 8, torch.device("cpu")):
+        assert len(batch) == 2
+
+
+def test_data_feeder_masked_segment_ids():
+    from core.data import data_feeder_masked
+    eos = 99
+    row = [5, eos, 7, 8, 9, eos, 11, 12]  # window segs: 0 0 1 1 1 1 2 2
+    data = row * 4
+    mask = [1] * len(data)
+    batches = list(data_feeder_masked(data, mask, 2, 8, torch.device("cpu"), eos_id=eos))
+    assert len(batches) == 2
+    for x, y, m, seg in batches:
+        assert x.shape == m.shape == seg.shape == (2, 7)
+        assert seg.tolist() == [[0, 0, 1, 1, 1, 1, 2]] * 2
+
+
+def test_data_feeder_masked_no_eos_id_keeps_triple():
+    from core.data import data_feeder_masked
+    data = list(range(100))
+    mask = [1] * 100
+    for batch in data_feeder_masked(data, mask, 2, 8, torch.device("cpu")):
+        assert len(batch) == 3

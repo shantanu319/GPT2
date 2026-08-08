@@ -53,6 +53,10 @@ def parse_args():
                              '(0 = disabled, 1 = every layer KDA, 4 = Kimi-style 3:1 hybrid)')
     parser.add_argument('-shuffle', type=int, default=1,
                         help='Serve train windows in a seeded-permuted order per pass')
+    parser.add_argument('-doc_mask', type=int, default=1,
+                        help='Intra-document attention: block cross-document attention, '
+                             'reset RoPE positions and KDA state at <|endoftext|> '
+                             'boundaries (0 = old packed-causal behavior)')
     parser.add_argument('-ce_chunk', type=int, default=16384,
                         help='Rows per chunk in the fused cross-entropy (0 = old unfused path)')
     parser.add_argument('-warmup_steps', type=int, default=100)
