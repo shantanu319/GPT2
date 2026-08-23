@@ -41,6 +41,47 @@ def kda_recurrence(q, k, v, g, beta, initial_state=None, seg_ids=None):
     return o, S
 
 
+_SUB_CHUNK = 16  # sub-block size inside a chunk for the decayed-score matrices
+
+
+def _decay_scores(x, y, g, diagonal):
+    """Lower-triangular decayed inner products M[c, j] = sum_d x[c,d] y[j,d]
+    exp(g[c,d] - g[j,d]), zeroed on and above the `diagonal`-th diagonal.
+
+    x, y, g: [..., BT, K], g non-increasing along BT (a cumsum of non-positive
+    log-decays). Sub-blocks below the diagonal factor the decay through their
+    row block's first position, so both exponents stay <= 0 and the block is a
+    single matmul. Only the diagonal sub-blocks keep the per-column form, where
+    a positive exponent can appear but always lands in a masked-out entry."""
+    BT, K = x.shape[-2], x.shape[-1]
+    BC = min(_SUB_CHUNK, BT)
+    assert BT % BC == 0, f"chunk_size={BT} must be a multiple of {BC}"
+    NB = BT // BC
+    xs, ys, gs = (t.unflatten(-2, (NB, BC)) for t in (x, y, g))
+
+    diag = x.new_zeros(*x.shape[:-2], NB, BC, BC)
+    for j in range(BC):
+        # clamp: entries with a positive exponent are all above the diagonal and
+        # get masked out below — clamping keeps them from overflowing to inf,
+        # which would otherwise poison the backward pass with 0 * inf.
+        decay = (gs - gs[..., j:j + 1, :]).clamp(max=0).exp()
+        diag[..., j] = (xs * decay * ys[..., j:j + 1, :]).sum(-1)
+    tri = torch.triu(torch.ones(BC, BC, dtype=torch.bool, device=x.device),
+                     diagonal=diagonal)
+    diag = diag.masked_fill(tri, 0)
+
+    out = x.new_zeros(*x.shape[:-2], BT, BT)
+    for b in range(NB):
+        lo, hi = b * BC, (b + 1) * BC
+        out[..., lo:hi, lo:hi] = diag[..., b, :, :]
+        if b:
+            ref = g[..., lo:lo + 1, :]  # route both decays through the block start
+            left = x[..., lo:hi, :] * (g[..., lo:hi, :] - ref).exp()
+            right = y[..., :lo, :] * (ref - g[..., :lo, :]).exp()
+            out[..., lo:hi, :lo] = left @ right.mT
+    return out
+
+
 def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None):
     """Chunked-parallel KDA in fp32 — the training path: all positions of a
     chunk are processed with batched matmuls, only the inter-chunk scan is
@@ -81,21 +122,14 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
         # Only the chunk's final (suffix) segment contributes to the next state.
         write_gate = (seg == seg_last).float()[:, None]                 # [B,1,NT,BT]
 
-    # UT transform for the delta rule. exp(g_c - g_i) is formed per column so no
-    # entry ever exponentiates a positive number (a cumsum of non-positive
-    # log-decays is non-increasing, so only masked-out entries could overflow).
-    mask_incl = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
-    A = q.new_zeros(B, H, NT, BT, BT)
-    for i in range(BT):
-        k_i = k[..., i, :]        # [B,H,NT,K]
-        g_i = g[..., i:i+1, :]    # [B,H,NT,1,K]
-        A[..., i] = torch.einsum('...cd,...d->...c', k * (g - g_i).exp(), k_i)
+    # UT transform for the delta rule.
+    A = _decay_scores(k, k, g, diagonal=0)
     A = A * beta.unsqueeze(-1)    # row c scaled by beta of the writing position
     if seg_ids is not None:
         # Cross-segment pairs drop out of the solve; the inverse stays
         # block-diagonal, i.e. each segment solves independently.
-        mask_incl = mask_incl | ~same_pair
-    A = -A.masked_fill(mask_incl, 0)
+        A = A.masked_fill(~same_pair, 0)
+    A = -A
     for i in range(1, BT):        # forward substitution: (I + strictly-lower)^{-1}
         A[..., i, :i] = (A[..., i, :i].clone()
                          + (A[..., i, :, None].clone() * A[..., :, :i].clone()).sum(-2))
@@ -108,18 +142,16 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     if initial_state is not None:
         S = S + initial_state.float()
     o = torch.zeros_like(v)       # [B,H,NT,BT,V]
-    mask_strict = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # Intra-chunk query->key weights, decayed. Independent of the running state,
+    # so every chunk's block is built up front instead of inside the scan.
+    Aqk_all = _decay_scores(q, k, g, diagonal=1)
+    if seg_ids is not None:
+        Aqk_all = Aqk_all.masked_fill(~same_pair, 0)
     for i in range(NT):
         q_i, k_i, u_i, g_i, w_i = q[:, :, i], k[:, :, i], u[:, :, i], g[:, :, i], w[:, :, i]
-        Aqk = q.new_zeros(B, H, BT, BT)  # intra-chunk query->key weights, decayed
-        for j in range(BT):
-            k_j = k_i[:, :, j]           # [B,H,K]
-            g_j = g_i[:, :, j:j+1]       # [B,H,1,K]
-            Aqk[..., j] = torch.einsum('...cd,...d->...c', q_i * (g_i - g_j).exp(), k_j)
-        Aqk = Aqk.masked_fill(mask_strict, 0)
+        Aqk = Aqk_all[:, :, i]
         if seg_ids is not None:
             rg = read_gate[:, :, i].unsqueeze(-1)   # [B,H,BT,1]
-            Aqk = Aqk.masked_fill(~same_pair[:, :, i], 0)
             v_i = u_i - rg * (w_i @ S)  # fresh segments ignore the incoming state
             o[:, :, i] = rg * ((q_i * g_i.exp()) @ S) + Aqk @ v_i
             S = carry[:, :, i].unsqueeze(-1) * S * g_i[:, :, -1].exp().unsqueeze(-1)

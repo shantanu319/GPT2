@@ -308,3 +308,16 @@ def test_model_cache_decode_matches_full_forward():
             outs.append(m(x[:, t:t + 1], None, start_pos=t))
         o_cached = torch.cat(outs, dim=1)
     assert torch.allclose(o_cached, o_full, atol=1e-4)
+
+
+def test_chunk_grads_finite_under_steep_decay():
+    """A chunk whose cumulative log-decay far exceeds exp's fp32 range must
+    still give finite grads: the intermediates that would overflow are all
+    masked out, so they are clamped rather than allowed to reach inf."""
+    q, k, v, g, beta = _inputs(T=64, seed=7)
+    g = g * 10.0  # cumulative decay ~ -600 over the chunk
+    q, k, v, g, beta = (t.detach().requires_grad_(True) for t in (q, k, v, g, beta))
+    o, S = kda_chunk(q, k, v, g, beta, chunk_size=64)
+    (o.sum() + S.sum()).backward()
+    for name, t in zip(('q', 'k', 'v', 'g', 'beta'), (q, k, v, g, beta)):
+        assert torch.isfinite(t.grad).all(), f"non-finite grad for {name}"
