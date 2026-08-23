@@ -237,7 +237,7 @@ def test_masked_loss_ignores_unmasked():
     target = torch.randint(0, V, (1, 4))
     mask_one = torch.tensor([[1, 0, 0, 0]], dtype=torch.bool)
     expected = F.cross_entropy(_softcapped(hidden[0, :1], weight), target[0, :1])
-    assert torch.allclose(masked_loss(hidden, weight, target, mask_one, 0),
+    assert torch.allclose(masked_loss(hidden, weight, None, target, mask_one, 0),
                           expected, atol=1e-6)
 
 
@@ -254,7 +254,7 @@ def test_masked_loss_matches_masking_after_the_lm_head():
     per_token = F.cross_entropy(_softcapped(hidden, weight).view(-1, V),
                                 target.reshape(-1), reduction='none')
     ref = (per_token * mask.reshape(-1)).sum() / mask.sum()
-    assert torch.allclose(masked_loss(hidden, weight, target, mask, 0), ref, atol=1e-6)
+    assert torch.allclose(masked_loss(hidden, weight, None, target, mask, 0), ref, atol=1e-6)
 
 
 def test_sft_encode_conversation_masks_assistant():

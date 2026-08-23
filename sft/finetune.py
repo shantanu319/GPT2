@@ -24,7 +24,7 @@ from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
 
 
-def masked_loss(hidden, weight, target, mask, ce_chunk):
+def masked_loss(hidden, weight, bias, target, mask, ce_chunk):
     """Soft-capped CE over the loss-carrying (assistant) tokens only.
 
     Rows are selected before the LM head rather than after: prompt tokens are
@@ -33,7 +33,7 @@ def masked_loss(hidden, weight, target, mask, ce_chunk):
     materializing them in full."""
     keep = mask.reshape(-1)
     rows = hidden.reshape(-1, hidden.size(-1))[keep]
-    return chunked_cross_entropy(rows, weight, target.reshape(-1)[keep],
+    return chunked_cross_entropy(rows, weight, bias, target.reshape(-1)[keep],
                                  LOGIT_SOFTCAP, ce_chunk)
 
 
@@ -78,7 +78,7 @@ def validate(model, val, val_mask, opt, device, max_batches=100, eos_id=None):
                 break
             seg = rest[0] if rest else None
             loss = masked_loss(hidden_states(model, x, seg, device),
-                               model.out.weight, y, m, opt.ce_chunk)
+                               model.out.weight, model.out.bias, y, m, opt.ce_chunk)
             total += loss.item()
             count += 1
     model.train()
@@ -159,7 +159,7 @@ def main():
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
                 loss = masked_loss(hidden_states(model, x, seg, device),
-                                   model.out.weight, y, m, args.ce_chunk)
+                                   model.out.weight, model.out.bias, y, m, args.ce_chunk)
 
             for opt in optimizers:
                 opt.zero_grad()
