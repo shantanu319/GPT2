@@ -21,9 +21,9 @@ import sys
 import torch
 
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint
 from core.tokenizer import BPETokenizer
-from inference.sample import decode_loop, prefill_logits, reprefill_window
+from inference.sample import TorchBackend, decode_loop, reprefill_window
 
 
 def log(msg):
@@ -47,7 +47,7 @@ def _resolve_device(no_cuda):
 
 @torch.no_grad()
 def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
-                  max_tokens, temperature, top_p, max_context, device,
+                  max_tokens, temperature, top_p, max_context, backend,
                   stop_ids=None):
     """Extend context_ids with new_prompt_ids, generate up to max_tokens, append
     generated tokens in place. Returns (newly_generated_ids, new_cache_len).
@@ -63,16 +63,15 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     if cache_len + len(new_prompt_ids) > max_context:
         model.reset_cache()
         window = reprefill_window(context_ids, max_context)
-        last_logits = prefill_logits(model, window, device)
+        last_logits = backend.prefill(model, window)
         cache_len = len(window)
     elif cache_len == 0:
-        last_logits = prefill_logits(model, new_prompt_ids, device)
+        last_logits = backend.prefill(model, new_prompt_ids)
         cache_len = len(new_prompt_ids)
     else:
         # Multi-turn continuation: extend the cache with the whole new prompt in
         # one forward, under a rectangular causal mask over cache + prompt.
-        last_logits = prefill_logits(model, new_prompt_ids, device,
-                                     start_pos=cache_len)
+        last_logits = backend.prefill(model, new_prompt_ids, start_pos=cache_len)
         cache_len += len(new_prompt_ids)
 
     stop_ids = set(stop_ids or ())
@@ -82,7 +81,7 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     start = len(context_ids)
     n, cache_len = decode_loop(model, last_logits, context_ids, cache_len,
                                max_tokens, temperature, top_p, max_context,
-                               device, stop_ids)
+                               backend, stop_ids)
     return context_ids[start:start + n], cache_len
 
 
@@ -103,6 +102,7 @@ def main():
     args = parser.parse_args()
 
     device = _resolve_device(args.no_cuda)
+    backend = TorchBackend(device)
     log(f"device: {device}")
 
     tokenizer = BPETokenizer()
@@ -163,7 +163,7 @@ def main():
                     temperature=msg.get("temperature", args.temperature),
                     top_p=msg.get("top_p", args.top_p),
                     max_context=args.max_context,
-                    device=device,
+                    backend=backend,
                     stop_ids=stop_ids,
                 )
                 if chat_mode and new_ids and new_ids[-1] in stop_ids | {eos_id}:

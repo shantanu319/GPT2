@@ -41,20 +41,6 @@ def _resolve_device(no_cuda):
     return torch.device("cpu")
 
 
-def _sample_next(logits, temperature, top_p):
-    """Sample one token id, returned as a (1, 1) tensor on the logits' device.
-
-    Gumbel-max -- argmax of log p plus Gumbel noise -- draws from the same
-    distribution as torch.multinomial, which on MPS synchronises and stalls the
-    decode pipeline for a full step. argmax is invariant to a constant scale on
-    p, so the nucleus does not need renormalizing."""
-    probs = F.softmax(logits.float() / max(temperature, 1e-6), dim=-1).squeeze(0)
-    if top_p < 1.0:
-        probs = top_p_filter(probs, top_p)
-    u = torch.rand_like(probs).clamp_min_(1e-20)
-    return (probs.log() - (-u.log()).log()).argmax(-1).view(1, 1)
-
-
 def reprefill_window(ids, max_context):
     """Tail of `ids` to rebuild the KV cache from after an overflow.
 
@@ -64,17 +50,46 @@ def reprefill_window(ids, max_context):
     return ids[-(max_context * 3 // 4):]
 
 
-def prefill_logits(model, ids, device, start_pos=0):
-    """Feed `ids` into the KV cache at start_pos in one batched forward.
-    Returns logits for the final token."""
-    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    mask = nopeak_mask(x.size(1), device, start_pos=start_pos)
-    return model(x, mask, start_pos=start_pos)[:, -1, :]
+class TorchBackend:
+    """The tensor-level primitives decode_loop needs, gathered behind one object
+    so the loop itself is runtime-agnostic. inference/mlx_sample.py supplies the
+    MLX counterpart."""
+
+    def __init__(self, device):
+        self.device = device
+
+    def prefill(self, model, ids, start_pos=0):
+        """Feed `ids` through the model in one batched forward, into the KV cache
+        at start_pos (start_pos=None runs uncached). Logits for the final token."""
+        x = torch.tensor(ids, dtype=torch.long, device=self.device).unsqueeze(0)
+        mask = nopeak_mask(x.size(1), self.device, start_pos=start_pos or 0)
+        return model(x, mask, start_pos=start_pos)[:, -1, :]
+
+    def step(self, model, tok, start_pos):
+        """Extend the cache by the single token `tok`; logits for what follows."""
+        return model(tok, None, start_pos=start_pos)[:, -1, :]
+
+    def sample(self, logits, temperature, top_p):
+        """Sample one token id, returned as a (1, 1) tensor on the logits' device.
+
+        Gumbel-max -- argmax of log p plus Gumbel noise -- draws from the same
+        distribution as torch.multinomial, which on MPS synchronises and stalls
+        the decode pipeline for a full step. argmax is invariant to a constant
+        scale on p, so the nucleus does not need renormalizing."""
+        probs = F.softmax(logits.float() / max(temperature, 1e-6), dim=-1).squeeze(0)
+        if top_p < 1.0:
+            probs = top_p_filter(probs, top_p)
+        u = torch.rand_like(probs).clamp_min_(1e-20)
+        return (probs.log() - (-u.log()).log()).argmax(-1).view(1, 1)
+
+    def token_ids(self, pending):
+        """Read a block of sampled tokens back off the device."""
+        return torch.cat(pending, dim=1).view(-1).tolist()
 
 
 @torch.no_grad()
 def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
-                top_p, max_context, device, stop_ids):
+                top_p, max_context, backend, stop_ids):
     """Sample up to max_tokens tokens, appending them to `ids` in place.
     Returns (n_generated, cache_len).
 
@@ -90,7 +105,7 @@ def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
         nonlocal pending, stopped
         if not pending:
             return 0
-        toks = torch.cat(pending, dim=1).view(-1).tolist()
+        toks = backend.token_ids(pending)
         pending = []
         for i, tok in enumerate(toks):
             ids.append(tok)
@@ -109,12 +124,12 @@ def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
                 break
             model.reset_cache()
             window = reprefill_window(ids, max_context)
-            last_logits = prefill_logits(model, window, device)
+            last_logits = backend.prefill(model, window)
             cache_len = len(window)
-        tok = _sample_next(last_logits, temperature, top_p)
+        tok = backend.sample(last_logits, temperature, top_p)
         pending.append(tok)
         n += 1
-        last_logits = model(tok, None, start_pos=cache_len)[:, -1, :]
+        last_logits = backend.step(model, tok, cache_len)
         cache_len += 1
         if len(pending) == STOP_CHECK_EVERY or n == max_tokens:
             dropped = flush()
@@ -126,7 +141,7 @@ def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
 
 @torch.no_grad()
 def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
-             max_context, device, eos_id=None, stop_at_eos=True,
+             max_context, backend, eos_id=None, stop_at_eos=True,
              use_kv_cache=True, stop_ids=None):
     model.eval()
 
@@ -142,22 +157,20 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
         ids = [0]
 
     if not use_kv_cache:
-        tokens = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+        out = list(ids)
         for _ in range(max_tokens):
-            context = tokens[:, -max_context:]
-            mask = nopeak_mask(context.size(1), device)
-            tok = _sample_next(model(context, mask)[:, -1, :], temperature, top_p)
-            tokens = torch.cat([tokens, tok], dim=1)
-            if tok.item() in stop_ids:
+            logits = backend.prefill(model, out[-max_context:], start_pos=None)
+            out += backend.token_ids([backend.sample(logits, temperature, top_p)])
+            if out[-1] in stop_ids:
                 break
-        return tokenizer.decode(tokens[0].tolist())
+        return tokenizer.decode(out)
 
     # KV-cache path: prefill the prompt, then decode one token at a time.
     model.reset_cache()
     all_ids = list(ids)
-    last_logits = prefill_logits(model, all_ids, device)
+    last_logits = backend.prefill(model, all_ids)
     decode_loop(model, last_logits, all_ids, len(all_ids), max_tokens,
-                temperature, top_p, max_context, device, stop_ids)
+                temperature, top_p, max_context, backend, stop_ids)
     return tokenizer.decode(all_ids)
 
 
@@ -222,7 +235,7 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
             max_context=args.max_context,
-            device=device,
+            backend=TorchBackend(device),
             eos_id=eos_id,
             use_kv_cache=not args.no_kv_cache,
             stop_ids=stop_ids,
