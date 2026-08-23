@@ -26,7 +26,7 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import load_bin, load_bin_u8
-from core.model import LOGIT_SOFTCAP, Transformer
+from core.model import LOGIT_SOFTCAP, Transformer, load_checkpoint
 from core.tokenizer import BPETokenizer
 from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
@@ -208,7 +208,7 @@ def main():
         raise ValueError("tokenizer lacks <|endoftext|> — rerun prepare.py")
     args.pad_id = tokenizer.special_tokens[EOS_TOKEN]
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     cfg = ckpt['config']
     if cfg is None:
         raise ValueError("checkpoint lacks config — retrain with current train.py")

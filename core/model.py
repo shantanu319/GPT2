@@ -402,7 +402,7 @@ def get_model(opt, vocab):
 
     if opt.loadname is not None:
         print("loading pretrained weights...")
-        ckpt = torch.load(opt.loadname, map_location=opt.device, weights_only=False)
+        ckpt = load_checkpoint(opt.loadname)
         state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
         model.load_state_dict(state)
     else:
