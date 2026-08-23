@@ -57,6 +57,11 @@ class MLXBackend:
     def seed(self, n):
         mx.random.seed(n)
 
+    def wait(self, x):
+        """Block until `x` is materialized. Nothing is even queued until the
+        eval, so a plain stream synchronize would return immediately."""
+        mx.eval(x)
+
     def param_count(self, model):
         # Keyed by id: the tied head and the embedding table are one array.
         params = {id(a): a for _, a in tree_flatten(model.parameters())}

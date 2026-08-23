@@ -89,6 +89,12 @@ class TorchBackend:
     def seed(self, n):
         torch.manual_seed(n)
 
+    def wait(self, x):
+        """Block until `x` is materialized. A device sync covers it, so the
+        tensor itself is not needed here -- the MLX backend does need it."""
+        if self.device.type != 'cpu':
+            getattr(torch, self.device.type).synchronize()
+
     def param_count(self, model):
         return sum(p.numel() for p in model.parameters())
 
