@@ -23,7 +23,7 @@ import torch
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
 from core.model import model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
-from inference.sample import _sample_next
+from inference.sample import decode_loop, prefill_logits
 
 
 def log(msg):
@@ -43,13 +43,6 @@ def _resolve_device(no_cuda):
         if torch.backends.mps.is_available():
             return torch.device("mps")
     return torch.device("cpu")
-
-
-def _prefill(model, ids, device):
-    """Batched prefill from start_pos=0. Returns logits for the final token."""
-    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    mask = nopeak_mask(x.size(1), device)
-    return model(x, mask, start_pos=0)[:, -1, :]
 
 
 def _decode_one(model, tok_id, start_pos, device):
@@ -76,10 +69,10 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     if cache_len + len(new_prompt_ids) > max_context:
         model.reset_cache()
         window = context_ids[-(max_context - 1):]
-        last_logits = _prefill(model, window, device)
+        last_logits = prefill_logits(model, window, device)
         cache_len = len(window)
     elif cache_len == 0:
-        last_logits = _prefill(model, new_prompt_ids, device)
+        last_logits = prefill_logits(model, new_prompt_ids, device)
         cache_len = len(new_prompt_ids)
     else:
         # Multi-turn continuation: advance the cache one new-prompt token at a time.
@@ -94,25 +87,11 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     if eos_id is not None:
         stop_ids.add(eos_id)
 
-    generated = []
-    for _ in range(max_tokens):
-        next_id = _sample_next(last_logits, temperature, top_p)
-        generated.append(next_id)
-        context_ids.append(next_id)
-        if next_id in stop_ids:
-            break
-
-        if cache_len + 1 > max_context:
-            model.reset_cache()
-            window = context_ids[-(max_context - 1):]
-            last_logits = _prefill(model, window, device)
-            cache_len = len(window)
-            continue
-
-        last_logits = _decode_one(model, next_id, cache_len, device)
-        cache_len += 1
-
-    return generated, cache_len
+    start = len(context_ids)
+    n, cache_len = decode_loop(model, last_logits, context_ids, cache_len,
+                               max_tokens, temperature, top_p, max_context,
+                               device, stop_ids)
+    return context_ids[start:start + n], cache_len
 
 
 def main():
