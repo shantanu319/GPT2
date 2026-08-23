@@ -143,6 +143,18 @@ def test_swa_shorter_than_window_is_global():
     assert torch.allclose(a, b, atol=1e-6)
 
 
+def test_swa_kv_cache_stays_bounded():
+    """A windowed layer's cache must not grow with the number of decode steps."""
+    B, W, V = 1, 8, 48
+    m = _model(W, seed=10)
+    with torch.no_grad():
+        m.reset_cache()
+        for i in range(40):
+            m(torch.randint(0, V, (B, 1)), None, start_pos=i)
+    for layer in m.decoder.layers:
+        assert layer.attn_1.k_cache[0].size(2) == W - 1
+
+
 def test_swa_survives_checkpoint_config():
     from core.model import model_from_checkpoint
     m = _model(16, kda=2, seed=8)

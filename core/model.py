@@ -174,6 +174,32 @@ class MultiHeadAttention(nn.Module):
         self.k_cache = {}
         self.v_cache = {}
 
+    def _cached_kv(self, cache_idx, k, v, start_pos):
+        """Fold this step's keys and values into the cache and return the whole
+        span the queries at start_pos.. may attend.
+
+        A windowed layer can never reach further than `window - 1` positions
+        back, so its cache holds exactly that many rows instead of the whole
+        context: decode is constant-memory however long the generation runs.
+        Global layers keep the full context, written at its absolute position."""
+        T = k.size(2)
+        rows = self.window - 1 if self.window else self.rope_cos.size(0)
+        if cache_idx not in self.k_cache:
+            shape = (k.size(0), self.h_kv, rows, self.d_k)
+            self.k_cache[cache_idx] = torch.zeros(shape, device=k.device, dtype=k.dtype)
+            self.v_cache[cache_idx] = torch.zeros(shape, device=k.device, dtype=k.dtype)
+        kc, vc = self.k_cache[cache_idx], self.v_cache[cache_idx]
+        if not self.window:
+            kc[:, :, start_pos:start_pos+T] = k
+            vc[:, :, start_pos:start_pos+T] = v
+            return kc[:, :, :start_pos+T], vc[:, :, :start_pos+T]
+        n = min(start_pos, rows)
+        if n:
+            k, v = (torch.cat((c[:, :, :n], x), dim=2) for c, x in ((kc, k), (vc, v)))
+        keep = min(rows, n + T)
+        kc[:, :, :keep], vc[:, :, :keep] = k[:, :, -keep:], v[:, :, -keep:]
+        return k, v
+
     def rope_tables(self, pos_ids):
         """cos/sin gathered at per-token positions. Every layer's table holds
         the same values, so the decoder gathers once for the whole stack."""
@@ -215,24 +241,12 @@ class MultiHeadAttention(nn.Module):
             v = (1 - gate) * v + gate * v1
 
         if start_pos is not None:
-            if cache_idx not in self.k_cache:
-                max_len = self.rope_cos.size(0)
-                self.k_cache[cache_idx] = torch.zeros(
-                    bs, self.h_kv, max_len, self.d_k, device=q.device, dtype=q.dtype)
-                self.v_cache[cache_idx] = torch.zeros(
-                    bs, self.h_kv, max_len, self.d_k, device=q.device, dtype=q.dtype)
-            self.k_cache[cache_idx][:, :, start_pos:start_pos+T] = k
-            self.v_cache[cache_idx][:, :, start_pos:start_pos+T] = v
-            k = self.k_cache[cache_idx][:, :, :start_pos+T]
-            v = self.v_cache[cache_idx][:, :, :start_pos+T]
+            k, v = self._cached_kv(cache_idx, k, v, start_pos)
             if self.window:
-                # Nothing older than the oldest query's window can be attended,
-                # so the read narrows to that span -- and a single decode step
-                # reads at most `window` keys, all of them live, hence no mask.
-                lo = max(0, start_pos + 1 - self.window)
-                k, v = k[:, :, lo:], v[:, :, lo:]
+                # A step reads at most `window` keys and every one of them is
+                # inside the window, so decoding a single token needs no mask.
                 mask = None if T == 1 else window_band_mask(
-                    T, k.size(2), start_pos - lo, self.window, q.device)
+                    T, k.size(2), k.size(2) - T, self.window, q.device)
 
         dropout_p = self.dropout.p if self.training else 0.0
         if start_pos is None and self.window and T > self.window:
