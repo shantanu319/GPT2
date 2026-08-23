@@ -41,7 +41,10 @@ def kda_recurrence(q, k, v, g, beta, initial_state=None, seg_ids=None):
     return o, S
 
 
-_SUB_CHUNK = 16  # sub-block size inside a chunk for the decayed-score matrices
+_SUB_CHUNK = 8  # sub-block size inside a chunk for the decayed-score matrices
+# Smaller sub-blocks trade iterations of the per-column loop in _decay_scores
+# for iterations of its block loop, which is matmuls; 8 is the measured floor
+# at chunk_size=64 (4 and 16 both cost more).
 
 
 def _decay_scores(x, y, g, diagonals):

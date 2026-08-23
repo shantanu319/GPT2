@@ -113,16 +113,17 @@ def window_attention(q, k, v, window, masks, dropout_p=0.0, enable_gqa=False):
     nb = T // window
     head_mask, tail_mask = masks
 
-    def blocks(x, width, drop):
-        # Overlapping `width`-key spans, one per query block past the first.
-        x = x[:, :, drop:].unfold(2, width, window).movedim(-1, -2)
+    def cut(x, start, width):
+        # One span per query block past the first: block b covers
+        # [b*W, (b+1)*W) and reads the keys in [(b-1)*W, (b+1)*W).
+        x = x[:, :, start:].unfold(2, width, window).movedim(-1, -2)
         return x.transpose(1, 2).reshape(B * (nb - 1), -1, width, D)
 
     first = F.scaled_dot_product_attention(
         q[:, :, :window], k[:, :, :window], v[:, :, :window], attn_mask=head_mask,
         dropout_p=dropout_p, enable_gqa=enable_gqa)
     rest = F.scaled_dot_product_attention(
-        blocks(q, window, window), blocks(k, 2 * window, 0), blocks(v, 2 * window, 0),
+        cut(q, window, window), cut(k, 0, 2 * window), cut(v, 0, 2 * window),
         attn_mask=tail_mask, dropout_p=dropout_p, enable_gqa=enable_gqa)
     rest = rest.view(B, nb - 1, H, window, D).transpose(1, 2).reshape(B, H, -1, D)
     return torch.cat((first, rest), dim=2)
@@ -195,7 +196,8 @@ class MultiHeadAttention(nn.Module):
             return kc[:, :, :start_pos+T], vc[:, :, :start_pos+T]
         n = min(start_pos, rows)
         if n:
-            k, v = (torch.cat((c[:, :, :n], x), dim=2) for c, x in ((kc, k), (vc, v)))
+            k = torch.cat((kc[:, :, :n], k), dim=2)
+            v = torch.cat((vc[:, :, :n], v), dim=2)
         keep = min(rows, n + T)
         kc[:, :, :keep], vc[:, :, :keep] = k[:, :, -keep:], v[:, :, -keep:]
         return k, v
