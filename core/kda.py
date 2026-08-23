@@ -44,11 +44,14 @@ def kda_recurrence(q, k, v, g, beta, initial_state=None, seg_ids=None):
 _SUB_CHUNK = 16  # sub-block size inside a chunk for the decayed-score matrices
 
 
-def _decay_scores(x, y, g, diagonal):
-    """Lower-triangular decayed inner products M[c, j] = sum_d x[c,d] y[j,d]
-    exp(g[c,d] - g[j,d]), zeroed on and above the `diagonal`-th diagonal.
+def _decay_scores(x, y, g, diagonals):
+    """Lower-triangular decayed inner products M[s, c, j] = sum_d x[s,c,d]
+    y[j,d] exp(g[c,d] - g[j,d]), zeroed on and above the diagonals[s]-th
+    diagonal.
 
-    x, y, g: [..., BT, K], g non-increasing along BT (a cumsum of non-positive
+    x: [S, ..., BT, K] — score matrices sharing y and g are stacked so the
+    column loop below, which is the expensive part, runs once for all of them.
+    y, g: [..., BT, K], g non-increasing along BT (a cumsum of non-positive
     log-decays). Sub-blocks below the diagonal factor the decay through their
     row block's first position, so both exponents stay <= 0 and the block is a
     single matmul. Only the diagonal sub-blocks keep the per-column form, where
@@ -66,9 +69,11 @@ def _decay_scores(x, y, g, diagonal):
         # which would otherwise poison the backward pass with 0 * inf.
         decay = (gs - gs[..., j:j + 1, :]).clamp(max=0).exp()
         diag[..., j] = (xs * decay * ys[..., j:j + 1, :]).sum(-1)
-    tri = torch.triu(torch.ones(BC, BC, dtype=torch.bool, device=x.device),
-                     diagonal=diagonal)
-    diag = diag.masked_fill(tri, 0)
+    tri = torch.stack([torch.triu(torch.ones(BC, BC, dtype=torch.bool,
+                                             device=x.device), diagonal=d)
+                       for d in diagonals])
+    diag = diag.masked_fill(tri.view(len(diagonals), *(1,) * (diag.dim() - 3),
+                                     BC, BC), 0)
 
     out = x.new_zeros(*x.shape[:-2], BT, BT)
     for b in range(NB):
@@ -85,24 +90,22 @@ def _decay_scores(x, y, g, diagonal):
 def _unit_lower_inverse(L):
     """(I - L)^{-1} for a strictly lower-triangular L: [..., BT, BT].
 
-    Blocked forward substitution. The BC-wide diagonal blocks are inverted by
-    the row recursion, but all of them at once, so it costs BC steps instead of
-    BT; each remaining block row is then one matmul against the block rows
-    already solved."""
+    Blocked forward substitution. The BC-wide diagonal blocks are inverted
+    together by repeated squaring — (I+M)(I+M^2)(I+M^4)... telescopes to
+    I + M + ... + M^(BC-1), and M^BC is zero — which is log2(BC) batched
+    matmuls where the row recursion needs BC sequential steps. Each remaining
+    block row is then one matmul against the block rows already solved."""
     BT = L.shape[-1]
     BC = min(_SUB_CHUNK, BT)
     NB = BT // BC
     eye = torch.eye(BC, dtype=L.dtype, device=L.device)
 
-    # Diagonal blocks -> [..., NB, BC, BC], inverted together by the recursion
-    # X[i, :i] += X[i, :] @ X[:, :i] (the strictly-lower Neumann series).
-    blocks = torch.diagonal(L.unflatten(-1, (NB, BC)).unflatten(-3, (NB, BC)),
-                            dim1=-4, dim2=-2).movedim(-1, -3).clone()
-    for i in range(1, BC):
-        blocks[..., i, :i] = (blocks[..., i, :i].clone()
-                              + (blocks[..., i, :, None].clone()
-                                 * blocks[..., :, :i].clone()).sum(-2))
-    blocks = blocks + eye
+    M = torch.diagonal(L.unflatten(-1, (NB, BC)).unflatten(-3, (NB, BC)),
+                       dim1=-4, dim2=-2).movedim(-1, -3)   # [..., NB, BC, BC]
+    blocks = eye + M
+    for _ in range((BC - 1).bit_length() - 1):
+        M = M @ M
+        blocks = blocks + blocks @ M
 
     X = blocks[..., 0, :, :]      # growing top-left square of the inverse
     for b in range(1, NB):
@@ -156,13 +159,17 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
         # Only the chunk's final (suffix) segment contributes to the next state.
         write_gate = (seg == seg_last).float()[:, None]                 # [B,1,NT,BT]
 
-    # UT transform for the delta rule.
-    A = _decay_scores(k, k, g, diagonal=0)
-    A = A * beta.unsqueeze(-1)    # row c scaled by beta of the writing position
+    # UT transform for the delta rule, and the intra-chunk query->key weights.
+    # Both are decayed scores against k under the same g, so they share a pass.
+    # Aqk is independent of the running state, so every chunk's block is built
+    # up front instead of inside the scan below.
+    scores = _decay_scores(torch.stack((k, q)), k, g, (0, 1))
     if seg_ids is not None:
         # Cross-segment pairs drop out of the solve; the inverse stays
         # block-diagonal, i.e. each segment solves independently.
-        A = A.masked_fill(~same_pair, 0)
+        scores = scores.masked_fill(~same_pair, 0)
+    A, Aqk_all = scores
+    A = A * beta.unsqueeze(-1)    # row c scaled by beta of the writing position
     A = _unit_lower_inverse(-A) * beta.unsqueeze(-2)
 
     w = A @ (g.exp() * k)         # decayed keys   [B,H,NT,BT,K]
@@ -172,11 +179,6 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     if initial_state is not None:
         S = S + initial_state.float()
     o = torch.zeros_like(v)       # [B,H,NT,BT,V]
-    # Intra-chunk query->key weights, decayed. Independent of the running state,
-    # so every chunk's block is built up front instead of inside the scan.
-    Aqk_all = _decay_scores(q, k, g, diagonal=1)
-    if seg_ids is not None:
-        Aqk_all = Aqk_all.masked_fill(~same_pair, 0)
     for i in range(NT):
         q_i, k_i, u_i, g_i, w_i = q[:, :, i], k[:, :, i], u[:, :, i], g[:, :, i], w[:, :, i]
         Aqk = Aqk_all[:, :, i]
