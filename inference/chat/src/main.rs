@@ -45,6 +45,9 @@ struct Args {
 
     #[arg(long)]
     no_cuda: bool,
+
+    #[arg(long, default_value = "torch", value_parser = ["torch", "mlx"])]
+    backend: String,
 }
 
 #[derive(Serialize)]
@@ -78,7 +81,8 @@ impl Server {
             .arg("--max-tokens").arg(args.max_tokens.to_string())
             .arg("--temperature").arg(args.temperature.to_string())
             .arg("--top-p").arg(args.top_p.to_string())
-            .arg("--max-context").arg(args.max_context.to_string());
+            .arg("--max-context").arg(args.max_context.to_string())
+            .arg("--backend").arg(&args.backend);
         if args.no_cuda {
             cmd.arg("--no-cuda");
         }

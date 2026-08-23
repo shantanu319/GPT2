@@ -86,6 +86,23 @@ class TorchBackend:
         """Read a block of sampled tokens back off the device."""
         return torch.cat(pending, dim=1).view(-1).tolist()
 
+    def seed(self, n):
+        torch.manual_seed(n)
+
+    def param_count(self, model):
+        return sum(p.numel() for p in model.parameters())
+
+
+def build_backend(ckpt, backend='torch', no_cuda=False):
+    """(model, backend, label) for the requested runtime: 'mlx' rebuilds the
+    checkpoint on Apple's MLX, anything else runs torch on the best device."""
+    if backend == 'mlx':
+        from core.mlx_model import model_from_checkpoint as mlx_from_checkpoint
+        from inference.mlx_sample import MLXBackend
+        return mlx_from_checkpoint(ckpt), MLXBackend(), 'mlx'
+    device = _resolve_device(no_cuda)
+    return model_from_checkpoint(ckpt, device), TorchBackend(device), str(device)
+
 
 @torch.no_grad()
 def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
@@ -186,17 +203,15 @@ def main():
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--backend', choices=('torch', 'mlx'), default='torch',
+                        help='Inference runtime: torch (CUDA/MPS/CPU) or MLX '
+                             '(Apple silicon)')
     parser.add_argument('--no-kv-cache', action='store_true',
                         help='Disable KV cache (re-feed full context each step). '
                              'Temporary: used to verify KV-cache correctness.')
     parser.add_argument('--chat', action='store_true',
                         help='Wrap --prompt in the ChatML template (for SFT checkpoints)')
     args = parser.parse_args()
-
-    if args.seed is not None:
-        torch.manual_seed(args.seed)
-
-    device = _resolve_device(args.no_cuda)
 
     tok_path = os.path.join(args.data_dir, 'tokenizer.json')
     if not os.path.exists(tok_path):
@@ -210,7 +225,9 @@ def main():
             f"checkpoint {args.checkpoint} lacks a 'config' field — "
             f"retrain with the current save_checkpoint to include model architecture"
         )
-    model = model_from_checkpoint(ckpt, device)
+    model, backend, _ = build_backend(ckpt, args.backend, args.no_cuda)
+    if args.seed is not None:
+        backend.seed(args.seed)
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
 
@@ -235,7 +252,7 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
             max_context=args.max_context,
-            backend=TorchBackend(device),
+            backend=backend,
             eos_id=eos_id,
             use_kv_cache=not args.no_kv_cache,
             stop_ids=stop_ids,

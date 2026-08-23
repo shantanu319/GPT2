@@ -21,9 +21,9 @@ import sys
 import torch
 
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from core.model import load_checkpoint, model_from_checkpoint
+from core.model import load_checkpoint
 from core.tokenizer import BPETokenizer
-from inference.sample import TorchBackend, decode_loop, reprefill_window
+from inference.sample import build_backend, decode_loop, reprefill_window
 
 
 def log(msg):
@@ -34,15 +34,6 @@ def log(msg):
 def _send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
-
-
-def _resolve_device(no_cuda):
-    if not no_cuda:
-        if torch.cuda.is_available():
-            return torch.device("cuda:0")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-    return torch.device("cpu")
 
 
 @torch.no_grad()
@@ -94,16 +85,15 @@ def main():
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--backend', choices=('torch', 'mlx'), default='torch',
+                        help='Inference runtime: torch (CUDA/MPS/CPU) or MLX '
+                             '(Apple silicon)')
     parser.add_argument('--raw', action='store_true',
                         help='Disable the chat template (raw LM continuation), '
                              'e.g. for pretrain-only checkpoints')
     parser.add_argument('--system', default=DEFAULT_SYSTEM,
                         help='System prompt used in chat-template mode')
     args = parser.parse_args()
-
-    device = _resolve_device(args.no_cuda)
-    backend = TorchBackend(device)
-    log(f"device: {device}")
 
     tokenizer = BPETokenizer()
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
@@ -113,8 +103,9 @@ def main():
     if 'config' not in ckpt or ckpt['config'] is None:
         _send({"type": "error", "error": "checkpoint missing 'config' field"})
         return
-    model = model_from_checkpoint(ckpt, device)
-    log(f"model loaded: {sum(p.numel() for p in model.parameters()):,} params")
+    model, backend, label = build_backend(ckpt, args.backend, args.no_cuda)
+    log(f"backend: {label}")
+    log(f"model loaded: {backend.param_count(model):,} params")
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
     im_end_id = tokenizer.special_tokens.get(IM_END)

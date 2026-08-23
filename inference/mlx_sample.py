@@ -2,6 +2,7 @@
 decode_loop calls, so the loop, its stop-token accounting, and its KV-window
 policy are shared with the torch backend rather than reimplemented."""
 import mlx.core as mx
+from mlx.utils import tree_flatten
 
 
 def top_p_filter(probs, top_p):
@@ -52,3 +53,11 @@ class MLXBackend:
         """Read a block of sampled tokens back off the device -- the one point in
         the decode loop that waits on the queued work."""
         return mx.concatenate(pending, axis=1).reshape(-1).tolist()
+
+    def seed(self, n):
+        mx.random.seed(n)
+
+    def param_count(self, model):
+        # Keyed by id: the tied head and the embedding table are one array.
+        params = {id(a): a for _, a in tree_flatten(model.parameters())}
+        return sum(a.size for a in params.values())
