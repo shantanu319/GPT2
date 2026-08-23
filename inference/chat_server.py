@@ -21,7 +21,7 @@ import sys
 import torch
 
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from core.model import model_from_checkpoint, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 from inference.sample import decode_loop, prefill_logits
 
@@ -109,7 +109,7 @@ def main():
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
     log(f"tokenizer vocab_size: {tokenizer.vocab_size}")
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     if 'config' not in ckpt or ckpt['config'] is None:
         _send({"type": "error", "error": "checkpoint missing 'config' field"})
         return

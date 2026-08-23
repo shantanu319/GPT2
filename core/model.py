@@ -416,6 +416,15 @@ def inference_dtype(device):
     return torch.bfloat16 if device.type in ('cuda', 'mps') else torch.float32
 
 
+def load_checkpoint(path):
+    """Read a checkpoint without pulling it onto the accelerator.
+
+    map_location='cpu' with mmap keeps unpickling lazy; materializing every
+    tensor on the device as it is unpickled costs far more than mapping the
+    file and moving the assembled model once."""
+    return torch.load(path, map_location='cpu', mmap=True, weights_only=False)
+
+
 def model_from_checkpoint(ckpt, device, dtype=None):
     """Rebuild a Transformer from a checkpoint's saved config, weights loaded
     and ready for inference.
@@ -434,8 +443,15 @@ def model_from_checkpoint(ckpt, device, dtype=None):
         attn_res=cfg.get('attn_res', 0),
         kda=cfg.get('kda', 0),
     )
-    model.load_state_dict(ckpt['model'])
     dtype = inference_dtype(device) if dtype is None else dtype
+    # assign hands the checkpoint's tensors straight to the module rather than
+    # copying into the freshly initialized ones, which are discarded anyway --
+    # but it also replaces the tied head weight, so re-tie it afterwards. The
+    # final to() still carries dtype: the rope tables are non-persistent
+    # buffers, so they are not in the state dict and nothing else converts them.
+    model.load_state_dict({k: v.to(dtype) for k, v in ckpt['model'].items()},
+                          assign=True)
+    model.out.weight = model.decoder.embed.embed.weight
     return model.to(device=device, dtype=dtype).eval()
 
 

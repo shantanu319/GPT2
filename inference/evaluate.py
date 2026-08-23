@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from core.chat_format import DEFAULT_SYSTEM, IM_START, render_turn
-from core.model import model_from_checkpoint, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 
 
@@ -134,7 +134,7 @@ def main():
     tokenizer = BPETokenizer()
     tokenizer.load(args.tokenizer)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     model = model_from_checkpoint(ckpt, device)
 
     print(f"{'task':<14} {'n':>5} {'acc':>7} {'acc_norm':>9}")

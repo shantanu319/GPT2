@@ -10,7 +10,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from core.model import model_from_checkpoint, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 
 
@@ -182,7 +182,7 @@ def main():
     tokenizer = BPETokenizer()
     tokenizer.load(tok_path)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     if 'config' not in ckpt or ckpt['config'] is None:
         raise ValueError(
             f"checkpoint {args.checkpoint} lacks a 'config' field — "
