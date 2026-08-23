@@ -117,17 +117,20 @@ def window_attention(q, k, v, window, masks, dropout_p=0.0, enable_gqa=False):
         q, k, v = (F.pad(x, (0, 0, 0, -T % window)) for x in (q, k, v))
     nb = q.size(2) // window
 
-    def cut(x, start, width):
-        # One span per query block past the first: block b covers
-        # [b*W, (b+1)*W) and reads the keys in [(b-1)*W, (b+1)*W).
-        x = x[:, :, start:].unfold(2, width, window).movedim(-1, -2)
-        return x.transpose(1, 2).reshape(B * (nb - 1), -1, width, D)
+    def cut(x, paired):
+        # W-wide blocks; each query block past the first is paired with the
+        # block before it, which is the window it reaches back into. Built by
+        # concatenation rather than unfold: an unfold view's strides trip
+        # torch.compile's guards at some shapes.
+        b = x.unflatten(2, (nb, window))
+        b = torch.cat((b[:, :, :-1], b[:, :, 1:]), dim=-2) if paired else b[:, :, 1:]
+        return b.transpose(1, 2).reshape(B * (nb - 1), -1, b.size(-2), D)
 
     first = F.scaled_dot_product_attention(
         q[:, :, :window], k[:, :, :window], v[:, :, :window], attn_mask=head_mask,
         dropout_p=dropout_p, enable_gqa=enable_gqa)
     rest = F.scaled_dot_product_attention(
-        cut(q, window, window), cut(k, 0, 2 * window), cut(v, 0, 2 * window),
+        cut(q, False), cut(k, True), cut(v, True),
         attn_mask=tail_mask, dropout_p=dropout_p, enable_gqa=enable_gqa)
     rest = rest.view(B, nb - 1, H, window, D).transpose(1, 2).reshape(B, H, -1, D)
     return torch.cat((first, rest), dim=2)[:, :, :T]
