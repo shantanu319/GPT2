@@ -122,6 +122,25 @@ def _unit_lower_inverse(L):
     return X
 
 
+def chunk_scan(u, w, qg, Aqk, kg, dec, initial_state):
+    """Sequential pass over the chunks of a KDA batch, the one part of the
+    chunked form that cannot be batched away.
+
+    u, Aqk: [B,H,NT,BT,V] / [B,H,NT,BT,BT]; w, qg, kg: [B,H,NT,BT,K];
+    dec: [B,H,NT,K] the chunk's total decay; initial_state: [B,H,K,V] or None.
+    Returns (o [B,H,NT,BT,V], S [B,H,K,V])."""
+    B, H, NT, _, K = w.shape
+    S = u.new_zeros(B, H, K, u.size(-1))
+    if initial_state is not None:
+        S = S + initial_state.float()
+    o = []
+    for i in range(NT):
+        v_i = u[:, :, i] - w[:, :, i] @ S  # drop what the incoming state knows
+        o.append(qg[:, :, i] @ S + Aqk[:, :, i] @ v_i)
+        S = dec[:, :, i].unsqueeze(-1) * S + kg[:, :, i].mT @ v_i
+    return torch.stack(o, dim=2), S
+
+
 def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None):
     """Chunked-parallel KDA in fp32 — the training path: all positions of a
     chunk are processed with batched matmuls, only the inter-chunk scan is
@@ -185,23 +204,15 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     # they scale whole rows, so scaling the operand equals scaling the product
     # -- which keeps the loop body identical with and without seg_ids.
     qg, kg = q * ge, (g[:, :, :, -1:] - g).exp() * k
-    dec = g[:, :, :, -1].exp().unsqueeze(-1)        # [B,H,NT,K,1]
+    dec = g[:, :, :, -1].exp()                      # [B,H,NT,K]
     if seg_ids is not None:
         rg = read_gate.unsqueeze(-1)                # [B,1,NT,BT,1]
         qg, w = qg * rg, w * rg   # fresh segments ignore the incoming state
         kg = kg * write_gate.unsqueeze(-1)
-        dec = dec * carry.unsqueeze(-1)
-    kg = kg.transpose(-1, -2)                       # [B,H,NT,K,BT]
+        dec = dec * carry
 
-    S = q.new_zeros(B, H, K, V)
-    if initial_state is not None:
-        S = S + initial_state.float()
-    o = []
-    for i in range(NT):
-        v_i = u[:, :, i] - w[:, :, i] @ S  # drop what the incoming state knows
-        o.append(qg[:, :, i] @ S + Aqk_all[:, :, i] @ v_i)
-        S = dec[:, :, i] * S + kg[:, :, i] @ v_i
-    o = torch.stack(o, dim=2).permute(0, 2, 3, 1, 4).reshape(B, T, H, V)
+    o, S = chunk_scan(u, w, qg, Aqk_all, kg, dec, initial_state)
+    o = o.permute(0, 2, 3, 1, 4).reshape(B, T, H, V)
     return o, S
 
 
