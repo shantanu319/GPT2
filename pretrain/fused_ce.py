@@ -9,6 +9,12 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
     over `chunk` rows at a time, so transient memory is one (chunk, V) block
     instead of the whole logits + tanh + fp32 softmax stack. Only hidden,
     weight and targets are saved for backward.
+
+    Backward runs outside the caller's autocast region, so the dtype autocast
+    would have used is recorded in forward and applied by hand. Otherwise the
+    recomputed logits come out in fp32 -- a different operating point from the
+    loss the forward measured, and three (N, V) x (V, d) products at fp32
+    matmul rates instead of bf16.
     """
 
     @staticmethod
@@ -25,28 +31,33 @@ class _ChunkedCrossEntropy(torch.autograd.Function):
         ctx.save_for_backward(hidden, weight, targets)
         ctx.softcap = softcap
         ctx.chunk = chunk
+        dev = hidden.device.type
+        ctx.compute_dtype = (torch.get_autocast_dtype(dev)
+                             if torch.is_autocast_enabled(dev) else hidden.dtype)
         return loss_sum / n
 
     @staticmethod
     def backward(ctx, grad_out):
         hidden, weight, targets = ctx.saved_tensors
         softcap, chunk = ctx.softcap, ctx.chunk
+        dtype = ctx.compute_dtype
         n = hidden.size(0)
-        w_f = weight.float()
+        w = weight.to(dtype)
         dhidden = torch.empty_like(hidden)
         dweight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+        scale = grad_out.float() / n
         for lo in range(0, n, chunk):
             hi = min(lo + chunk, n)
-            h_f = hidden[lo:hi].float()
-            logits = h_f @ w_f.T
+            h = hidden[lo:hi].to(dtype)
+            logits = (h @ w.T).float()   # the matmul the forward actually ran
             t = torch.tanh(logits / softcap)
-            z = softcap * t
-            p = torch.softmax(z, dim=-1)
+            p = torch.softmax(softcap * t, dim=-1)
             p[torch.arange(hi - lo, device=p.device), targets[lo:hi]] -= 1
             # d loss/d logits through z = softcap * tanh(logits / softcap)
-            dz = p * (1 - t * t) * (grad_out.float() / n)
-            dhidden[lo:hi] = (dz @ w_f).to(hidden.dtype)
-            dweight += dz.T @ h_f
+            dz = (p * (1 - t * t) * scale).to(dtype)
+            dhidden[lo:hi] = (dz @ w).to(hidden.dtype)
+            # chunk products are low precision, but they accumulate in fp32
+            dweight += (dz.T @ h).float()
         return dhidden, dweight.to(weight.dtype), None, None, None
 
 

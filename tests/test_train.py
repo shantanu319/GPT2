@@ -157,3 +157,44 @@ def test_chunked_cross_entropy_matches_reference():
     loss2.backward()
     assert loss2.item() == pytest.approx(ref_loss.item(), abs=1e-4)
     assert torch.allclose(h2.grad, ref_h.grad, atol=1e-4)
+
+
+def test_chunked_cross_entropy_backward_runs_in_the_autocast_dtype():
+    """Backward runs outside the caller's autocast region, so it has to be told
+    which dtype the forward's logits matmul used. Recomputing them in fp32
+    instead differentiates at a different operating point from the loss, and
+    pays fp32 matmul rates for three (N, V) x (V, d) products."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from pretrain.fused_ce import _chunked_cross_entropy, _reference_cross_entropy
+
+    class _MatmulDtypes(TorchDispatchMode):
+        def __init__(self):
+            self.dtypes = set()
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func.__name__.startswith('mm'):
+                self.dtypes.add(args[0].dtype)
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(0)
+    N, d, V, softcap = 512, 64, 2000, 15.0
+    h0, w0 = torch.randn(N, d) * 0.5, torch.randn(V, d) * 0.02
+    targets = torch.randint(0, V, (N,))
+
+    h = h0.clone().requires_grad_(True)
+    w = w0.clone().requires_grad_(True)
+    with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+        loss = _chunked_cross_entropy(h, w, targets, softcap, 256)
+    seen = _MatmulDtypes()
+    with seen:
+        loss.backward()
+    assert seen.dtypes == {torch.bfloat16}, seen.dtypes
+
+    # ...and it still lands on the unfused fallback it stands in for.
+    ref_h = h0.clone().requires_grad_(True)
+    ref_w = w0.clone().requires_grad_(True)
+    with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+        _reference_cross_entropy(ref_h, ref_w, targets, softcap).backward()
+    assert torch.allclose(h.grad, ref_h.grad, atol=1e-5)
+    assert torch.allclose(w.grad, ref_w.grad, atol=1e-4)
