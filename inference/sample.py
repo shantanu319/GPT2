@@ -10,7 +10,7 @@ import os
 import torch
 import torch.nn.functional as F
 
-from core.model import Transformer, nopeak_mask
+from core.model import model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 
 
@@ -69,8 +69,7 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
         for _ in range(max_tokens):
             context = tokens[:, -max_context:]
             mask = nopeak_mask(context.size(1), device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits = model(context, mask)
+            logits = model(context, mask)
             next_id = _sample_next(logits[:, -1, :], temperature, top_p)
             tokens = torch.cat(
                 [tokens, torch.tensor([[next_id]], dtype=torch.long, device=device)],
@@ -87,9 +86,7 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
     def prefill(window):
         x = torch.tensor(window, dtype=torch.long, device=device).unsqueeze(0)
         mask = nopeak_mask(x.size(1), device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(x, mask, start_pos=0)
-        return logits[:, -1, :]
+        return model(x, mask, start_pos=0)[:, -1, :]
 
     last_logits = prefill(all_ids)
     cache_len = len(all_ids)
@@ -109,9 +106,7 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
             continue
 
         x = torch.tensor([[next_id]], dtype=torch.long, device=device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(x, None, start_pos=cache_len)
-        last_logits = logits[:, -1, :]
+        last_logits = model(x, None, start_pos=cache_len)[:, -1, :]
         cache_len += 1
 
     return tokenizer.decode(all_ids)
@@ -153,21 +148,7 @@ def main():
             f"checkpoint {args.checkpoint} lacks a 'config' field — "
             f"retrain with the current save_checkpoint to include model architecture"
         )
-    cfg = ckpt['config']
-    model = Transformer(
-        vocab=cfg['vocab_size'],
-        d_model=cfg['d_model'],
-        N=cfg['n_layers'],
-        heads=cfg['heads'],
-        dropout=cfg['dropout'],
-        kv_heads=cfg.get('kv_heads'),
-        loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-    ).to(device)
-    model.load_state_dict(ckpt['model'])
+    model = model_from_checkpoint(ckpt, device)
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
 

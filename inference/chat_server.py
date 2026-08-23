@@ -21,7 +21,7 @@ import sys
 import torch
 
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from core.model import Transformer, nopeak_mask
+from core.model import model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 from inference.sample import _sample_next
 
@@ -49,17 +49,13 @@ def _prefill(model, ids, device):
     """Batched prefill from start_pos=0. Returns logits for the final token."""
     x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     mask = nopeak_mask(x.size(1), device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits = model(x, mask, start_pos=0)
-    return logits[:, -1, :]
+    return model(x, mask, start_pos=0)[:, -1, :]
 
 
 def _decode_one(model, tok_id, start_pos, device):
     """Run a single token through the model using the existing cache."""
     x = torch.tensor([[tok_id]], dtype=torch.long, device=device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits = model(x, None, start_pos=start_pos)
-    return logits[:, -1, :]
+    return model(x, None, start_pos=start_pos)[:, -1, :]
 
 
 @torch.no_grad()
@@ -146,21 +142,7 @@ def main():
     if 'config' not in ckpt or ckpt['config'] is None:
         _send({"type": "error", "error": "checkpoint missing 'config' field"})
         return
-    cfg = ckpt['config']
-    model = Transformer(
-        vocab=cfg['vocab_size'],
-        d_model=cfg['d_model'],
-        N=cfg['n_layers'],
-        heads=cfg['heads'],
-        dropout=cfg['dropout'],
-        kv_heads=cfg.get('kv_heads'),
-        loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-    ).to(device)
-    model.load_state_dict(ckpt['model'])
+    model = model_from_checkpoint(ckpt, device)
     log(f"model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')

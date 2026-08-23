@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from core.chat_format import DEFAULT_SYSTEM, IM_START, render_turn
-from core.model import Transformer, nopeak_mask
+from core.model import model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 
 
@@ -71,8 +71,7 @@ def choice_logprob(model, tokenizer, context, choice, device, max_len=1024):
     x = torch.tensor(ids[:-1], dtype=torch.long, device=device).unsqueeze(0)
     y = torch.tensor(ids[1:], dtype=torch.long, device=device)
     mask = nopeak_mask(x.size(1), device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits = model(x, mask)
+    logits = model(x, mask)
     logp = F.log_softmax(logits.float()[0], dim=-1)
     tok_lp = logp[torch.arange(y.size(0)), y][-n_cho:]
     return tok_lp.sum().item(), tok_lp.mean().item()
@@ -115,17 +114,7 @@ def main():
     tokenizer.load(args.tokenizer)
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    cfg = ckpt['config']
-    model = Transformer(
-        vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
-        heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
-        kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-    ).to(device).eval()
-    model.load_state_dict(ckpt['model'])
+    model = model_from_checkpoint(ckpt, device)
 
     print(f"{'task':<14} {'n':>5} {'acc':>7} {'acc_norm':>9}")
     for task in args.tasks.split(','):

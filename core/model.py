@@ -413,6 +413,34 @@ def get_model(opt, vocab):
     return model
 
 
+def inference_dtype(device):
+    """bf16 on accelerators, fp32 on CPU (no fast bf16 path there)."""
+    return torch.bfloat16 if device.type in ('cuda', 'mps') else torch.float32
+
+
+def model_from_checkpoint(ckpt, device, dtype=None):
+    """Rebuild a Transformer from a checkpoint's saved config, weights loaded
+    and ready for inference.
+
+    The weights are converted once here rather than under torch.autocast:
+    autocast's cast cache is only live while grad mode is on, so under
+    no_grad it re-casts every weight on every forward, which dominates
+    single-token decode."""
+    cfg = ckpt['config']
+    model = Transformer(
+        vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
+        heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
+        kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
+        value_residual=cfg.get('value_residual', False),
+        unet_skips=cfg.get('unet_skips', False),
+        attn_res=cfg.get('attn_res', 0),
+        kda=cfg.get('kda', 0),
+    )
+    model.load_state_dict(ckpt['model'])
+    dtype = inference_dtype(device) if dtype is None else dtype
+    return model.to(device=device, dtype=dtype).eval()
+
+
 def nopeak_mask(size, device):
     mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).unsqueeze(0)
     mask = (mask == 0)
