@@ -82,6 +82,40 @@ def _decay_scores(x, y, g, diagonal):
     return out
 
 
+def _unit_lower_inverse(L):
+    """(I - L)^{-1} for a strictly lower-triangular L: [..., BT, BT].
+
+    Blocked forward substitution. The BC-wide diagonal blocks are inverted by
+    the row recursion, but all of them at once, so it costs BC steps instead of
+    BT; each remaining block row is then one matmul against the block rows
+    already solved."""
+    BT = L.shape[-1]
+    BC = min(_SUB_CHUNK, BT)
+    NB = BT // BC
+    eye = torch.eye(BC, dtype=L.dtype, device=L.device)
+
+    # Diagonal blocks -> [..., NB, BC, BC], inverted together by the recursion
+    # X[i, :i] += X[i, :] @ X[:, :i] (the strictly-lower Neumann series).
+    blocks = torch.diagonal(L.unflatten(-1, (NB, BC)).unflatten(-3, (NB, BC)),
+                            dim1=-4, dim2=-2).movedim(-1, -3).clone()
+    for i in range(1, BC):
+        blocks[..., i, :i] = (blocks[..., i, :i].clone()
+                              + (blocks[..., i, :, None].clone()
+                                 * blocks[..., :, :i].clone()).sum(-2))
+    blocks = blocks + eye
+
+    X = blocks[..., 0, :, :]      # growing top-left square of the inverse
+    for b in range(1, NB):
+        lo, hi = b * BC, (b + 1) * BC
+        D = blocks[..., b, :, :]
+        off = D @ (L[..., lo:hi, :lo] @ X)
+        X = torch.cat([
+            torch.cat([X, X.new_zeros(*X.shape[:-1], BC)], dim=-1),
+            torch.cat([off, D], dim=-1),
+        ], dim=-2)
+    return X
+
+
 def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None):
     """Chunked-parallel KDA in fp32 — the training path: all positions of a
     chunk are processed with batched matmuls, only the inter-chunk scan is
@@ -129,11 +163,7 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
         # Cross-segment pairs drop out of the solve; the inverse stays
         # block-diagonal, i.e. each segment solves independently.
         A = A.masked_fill(~same_pair, 0)
-    A = -A
-    for i in range(1, BT):        # forward substitution: (I + strictly-lower)^{-1}
-        A[..., i, :i] = (A[..., i, :i].clone()
-                         + (A[..., i, :, None].clone() * A[..., :, :i].clone()).sum(-2))
-    A = (A + torch.eye(BT, dtype=torch.float, device=q.device)) * beta.unsqueeze(-2)
+    A = _unit_lower_inverse(-A) * beta.unsqueeze(-2)
 
     w = A @ (g.exp() * k)         # decayed keys   [B,H,NT,BT,K]
     u = A @ v                     # pseudo-values  [B,H,NT,BT,V]
