@@ -18,14 +18,12 @@ def _polar_express(G, steps=5, eps=1e-7):
     # Approximates the orthogonal factor U @ V.T of the SVD G = U S V.T.
     # Runs in bf16 (inputs pre-normalized with a 1.02 safety factor so the
     # iteration stays in its convergence basin); operates on the smaller dim
-    # by transposing tall matrices. Accepts 2D (single matrix) or 3D input
-    # (batched — e.g. one (d_head, fan_in) matrix per attention head).
-    assert G.ndim in (2, 3)
+    # by transposing tall matrices. The last two dims are the matrix; any
+    # leading dims batch it — one matrix per attention head, per parameter,
+    # or both.
+    assert G.ndim >= 2
     X = G.to(torch.bfloat16)
-    if G.ndim == 3:
-        X = X / (X.norm(dim=(-1, -2), keepdim=True) * 1.02 + eps)
-    else:
-        X = X / (X.norm() * 1.02 + eps)
+    X = X / (X.norm(dim=(-1, -2), keepdim=True) * 1.02 + eps)
     transposed = False
     if X.size(-2) > X.size(-1):
         X = X.mT
@@ -53,6 +51,11 @@ class Muon(torch.optim.Optimizer):
     matrix. axis=0 slices output rows (q/k/v projections: (h*d_k, fan_in)
     -> h matrices of (d_k, fan_in)); axis=1 slices input columns (the attn
     out projection: (fan_out, h*d_k) -> h matrices of (fan_out, d_k)).
+
+    Parameters that share a shape are orthogonalized as one batch: a
+    transformer has only a handful of distinct matrix shapes, so the whole
+    stack's Newton-Schulz iteration collapses into that many batched matmuls
+    instead of one chain per parameter.
     """
 
     def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5,
@@ -62,29 +65,27 @@ class Muon(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     @staticmethod
-    def _orthogonalize(update, head_split, ns_steps):
+    def _orthogonalize(updates, head_split, ns_steps):
+        """updates: (n, rows, cols), n same-shaped parameter updates."""
+        n, rows, cols = updates.shape
         if head_split is None:
-            ortho = _polar_express(update, steps=ns_steps)
-            scale = max(1.0, update.shape[0] / update.shape[1]) ** 0.5
-            return ortho, scale
+            return _polar_express(updates, steps=ns_steps), max(1.0, rows / cols) ** 0.5
         heads, axis = head_split
         if axis == 0:
-            if update.size(0) % heads:
+            if rows % heads:
                 raise RuntimeError(
-                    f"muon_head_split=({heads}, 0) does not divide {tuple(update.shape)}")
-            ortho = _polar_express(
-                update.view(heads, update.size(0) // heads, update.size(1)),
-                steps=ns_steps).view(update.shape)
-            scale = max(1.0, (update.size(0) // heads) / update.size(1)) ** 0.5
+                    f"muon_head_split=({heads}, 0) does not divide {(rows, cols)}")
+            ortho = _polar_express(updates.view(n, heads, rows // heads, cols),
+                                   steps=ns_steps).view(updates.shape)
+            scale = max(1.0, (rows // heads) / cols) ** 0.5
         else:
-            if update.size(1) % heads:
+            if cols % heads:
                 raise RuntimeError(
-                    f"muon_head_split=({heads}, 1) does not divide {tuple(update.shape)}")
-            ortho = _polar_express(
-                update.view(update.size(0), heads, update.size(1) // heads)
-                      .permute(1, 0, 2),
-                steps=ns_steps).permute(1, 0, 2).reshape(update.shape)
-            scale = max(1.0, update.size(0) / (update.size(1) // heads)) ** 0.5
+                    f"muon_head_split=({heads}, 1) does not divide {(rows, cols)}")
+            ortho = _polar_express(updates.view(n, rows, heads, cols // heads)
+                                          .permute(0, 2, 1, 3),
+                                   steps=ns_steps).permute(0, 2, 1, 3).reshape(updates.shape)
+            scale = max(1.0, rows / (cols // heads)) ** 0.5
         return ortho, scale
 
     @torch.no_grad()
@@ -96,6 +97,7 @@ class Muon(torch.optim.Optimizer):
             nesterov = group['nesterov']
             ns_steps = group['ns_steps']
             wd = group['weight_decay']
+            buckets = {}  # (shape, head_split) -> params and their updates
             for p in group['params']:
                 if p.grad is None:
                     continue
@@ -112,11 +114,20 @@ class Muon(torch.optim.Optimizer):
                 buf.mul_(momentum).add_(g)
                 update = g.add(buf, alpha=momentum) if nesterov else buf
 
-                update, scale = self._orthogonalize(
-                    update, getattr(p, 'muon_head_split', None), ns_steps)
-                if wd:
-                    # Decoupled weight decay, applied before the orthogonal update.
-                    p.mul_(1 - lr * wd)
-                # Equalize update magnitude across different matrix shapes.
-                p.add_(update, alpha=-lr * scale)
+                key = (tuple(p.shape), getattr(p, 'muon_head_split', None))
+                buckets.setdefault(key, ([], []))
+                buckets[key][0].append(p)
+                # bf16 up front: the iteration runs there anyway, so stacking in
+                # bf16 halves the copy without changing a single output bit.
+                buckets[key][1].append(update.to(torch.bfloat16))
+
+            for (_, head_split), (params, updates) in buckets.items():
+                ortho, scale = self._orthogonalize(
+                    torch.stack(updates), head_split, ns_steps)
+                for p, o in zip(params, ortho.unbind(0)):
+                    if wd:
+                        # Decoupled weight decay, before the orthogonal update.
+                        p.mul_(1 - lr * wd)
+                    # Equalize update magnitude across different matrix shapes.
+                    p.add_(o, alpha=-lr * scale)
         return loss

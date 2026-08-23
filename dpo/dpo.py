@@ -26,8 +26,9 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import load_bin, load_bin_u8
-from core.model import Transformer
+from core.model import LOGIT_SOFTCAP, Transformer, load_checkpoint
 from core.tokenizer import BPETokenizer
+from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
 from sft.finetune import make_sft_optimizers
 
@@ -77,18 +78,33 @@ def build_batch(tokens, masks, pairs, pair_ids, max_len, pad_id, device):
             attn)
 
 
-def sequence_logprobs(model, ids_in, targets, loss_mask, attn_mask, autocast_device):
+def sequence_logprobs(model, ids_in, targets, loss_mask, attn_mask, autocast_device,
+                      ce_chunk=16384):
     """Mean log p(target | prompt) over completion tokens, per sequence.
 
     Length-normalized (sum / completion-token count) so longer completions
     don't accumulate more negative log-prob (SimPO, arXiv:2405.14734);
-    padding-invariant, since pads are excluded from both sum and count."""
+    padding-invariant, since pads are excluded from both sum and count.
+
+    Completion rows are selected before the LM head and each sequence's rows
+    are scored by the chunked kernel, whose mean is exactly this
+    length-normalized log-prob. The (2B, T, V) logits and the fp32 log-softmax
+    over them are never built."""
     with torch.autocast(device_type=autocast_device.type, dtype=torch.bfloat16):
-        logits = model(ids_in, attn_mask)
-    logp = torch.log_softmax(logits.float(), dim=-1)
-    tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    counts = loss_mask.sum(dim=-1).clamp(min=1)
-    return (tok_logp * loss_mask).sum(dim=-1) / counts
+        hidden = model.decoder(ids_in, attn_mask)
+        keep = loss_mask.reshape(-1)
+        rows = hidden.reshape(-1, hidden.size(-1))[keep]
+        tgt = targets.reshape(-1)[keep]
+        out, lo = [], 0
+        for count in loss_mask.sum(dim=-1).tolist():
+            # a sequence with no completion tokens scores 0, as the old
+            # sum-over-clamped-count did
+            out.append(-chunked_cross_entropy(rows[lo:lo + count], model.out.weight,
+                                              model.out.bias, tgt[lo:lo + count],
+                                              LOGIT_SOFTCAP, ce_chunk)
+                       if count else rows.new_zeros(()))
+            lo += count
+        return torch.stack(out)
 
 
 def dpo_loss_and_metrics(policy_logps, ref_logps, beta):
@@ -118,21 +134,37 @@ def make_dpo_optimizers(model, muon_lr, adamw_lr):
     return [adamw]
 
 
+def batches(tokens, masks, pairs, args, device, max_batches=None):
+    """Yield (index, batch) for the deterministic pass over `pairs`, skipping
+    degenerate ones. Every epoch sees exactly this sequence."""
+    n = max(1, len(pairs) // args.batchsize)
+    for i in range(n if max_batches is None else min(n, max_batches)):
+        pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
+        batch = build_batch(tokens, masks, pairs, pair_ids, args.max_len,
+                            args.pad_id, device)
+        if batch is not None:
+            yield i, batch
+
+
 @torch.no_grad()
-def validate(policy, ref, tokens, masks, pairs, args, device, max_batches=50):
+def reference_logprobs(ref, tokens, masks, pairs, args, device, max_batches=None):
+    """Reference log-probs for every batch, computed once.
+
+    The reference model is frozen and the pass over the pairs is
+    deterministic, so recomputing this each epoch reproduces the same numbers;
+    sequence_logprobs is padding-invariant, so a batch's values do not depend
+    on how the pairs were grouped either."""
+    return {i: sequence_logprobs(ref, *batch, device)
+            for i, batch in batches(tokens, masks, pairs, args, device, max_batches)}
+
+
+@torch.no_grad()
+def validate(policy, ref_logps, tokens, masks, pairs, args, device, max_batches=50):
     policy.eval()
     total_loss, total_margin, total_acc, count = 0.0, 0.0, 0.0, 0
-    num_batches = max(1, len(pairs) // args.batchsize)
-    pad_id = args.pad_id
-    for i in range(min(num_batches, max_batches)):
-        pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
-        batch = build_batch(tokens, masks, pairs, pair_ids,
-                            args.max_len, pad_id, device)
-        if batch is None:
-            continue
+    for i, batch in batches(tokens, masks, pairs, args, device, max_batches):
         pi = sequence_logprobs(policy, *batch, device)
-        rf = sequence_logprobs(ref, *batch, device)
-        loss, margin, acc = dpo_loss_and_metrics(pi, rf, args.beta)
+        loss, margin, acc = dpo_loss_and_metrics(pi, ref_logps[i], args.beta)
         total_loss += loss.item()
         total_margin += margin
         total_acc += acc
@@ -176,7 +208,7 @@ def main():
         raise ValueError("tokenizer lacks <|endoftext|> — rerun prepare.py")
     args.pad_id = tokenizer.special_tokens[EOS_TOKEN]
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     cfg = ckpt['config']
     if cfg is None:
         raise ValueError("checkpoint lacks config — retrain with current train.py")
@@ -217,24 +249,24 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     policy.train()
+    print("precomputing reference log-probs...")
+    train_ref = reference_logprobs(ref, train_tokens, train_masks, train_pairs,
+                                   args, device)
+    val_ref = reference_logprobs(ref, val_tokens, val_masks, val_pairs, args,
+                                 device, max_batches=50)
+    del ref  # every reference number is in hand; the weights are dead weight now
+    print(f"  {len(train_ref)} train batches, {len(val_ref)} val batches cached")
+
     step = 0
     for epoch in range(args.epochs):
-        for i in range(batches_per_epoch):
-            pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
-            batch = build_batch(train_tokens, train_masks, train_pairs, pair_ids,
-                                args.max_len, args.pad_id, device)
-            if batch is None:
-                continue
-
+        for i, batch in batches(train_tokens, train_masks, train_pairs, args, device):
             factor = lr_factor(step, total_steps, warmup_steps=args.warmup_steps)
             for opt in optimizers:
                 for group in opt.param_groups:
                     group['lr'] = group['peak_lr'] * factor
 
             pi = sequence_logprobs(policy, *batch, device)
-            with torch.no_grad():
-                rf = sequence_logprobs(ref, *batch, device)
-            loss, margin, acc = dpo_loss_and_metrics(pi, rf, args.beta)
+            loss, margin, acc = dpo_loss_and_metrics(pi, train_ref[i], args.beta)
 
             for opt in optimizers:
                 opt.zero_grad()
@@ -252,11 +284,11 @@ def main():
                 save_checkpoint(policy, optimizers, step, path, config=cfg)
                 print(f"saved {path}")
             if args.val_every and step % args.val_every == 0:
-                validate(policy, ref, val_tokens, val_masks, val_pairs, args, device)
+                validate(policy, val_ref, val_tokens, val_masks, val_pairs, args, device)
 
     final = os.path.join(save_dir, 'dpo_final.pt')
     save_checkpoint(policy, optimizers, step, final, config=cfg)
-    validate(policy, ref, val_tokens, val_masks, val_pairs, args, device)
+    validate(policy, val_ref, val_tokens, val_masks, val_pairs, args, device)
     print(f"saved final DPO checkpoint: {final}")
 
 

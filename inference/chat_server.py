@@ -21,9 +21,9 @@ import sys
 import torch
 
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from core.model import Transformer, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
-from inference.sample import _sample_next
+from inference.sample import decode_loop, prefill_logits, reprefill_window
 
 
 def log(msg):
@@ -45,23 +45,6 @@ def _resolve_device(no_cuda):
     return torch.device("cpu")
 
 
-def _prefill(model, ids, device):
-    """Batched prefill from start_pos=0. Returns logits for the final token."""
-    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    mask = nopeak_mask(x.size(1), device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits = model(x, mask, start_pos=0)
-    return logits[:, -1, :]
-
-
-def _decode_one(model, tok_id, start_pos, device):
-    """Run a single token through the model using the existing cache."""
-    x = torch.tensor([[tok_id]], dtype=torch.long, device=device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits = model(x, None, start_pos=start_pos)
-    return logits[:, -1, :]
-
-
 @torch.no_grad()
 def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
                   max_tokens, temperature, top_p, max_context, device,
@@ -79,44 +62,28 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     # If adding this prompt overflows the window, drop cache and re-prefill the tail.
     if cache_len + len(new_prompt_ids) > max_context:
         model.reset_cache()
-        window = context_ids[-(max_context - 1):]
-        last_logits = _prefill(model, window, device)
+        window = reprefill_window(context_ids, max_context)
+        last_logits = prefill_logits(model, window, device)
         cache_len = len(window)
     elif cache_len == 0:
-        last_logits = _prefill(model, new_prompt_ids, device)
+        last_logits = prefill_logits(model, new_prompt_ids, device)
         cache_len = len(new_prompt_ids)
     else:
-        # Multi-turn continuation: advance the cache one new-prompt token at a time.
-        # Simpler than building a rectangular causal mask for batched prefill; cost
-        # is len(new_prompt_ids) single-token forwards, bounded by prompt length.
-        last_logits = None
-        for tok in new_prompt_ids:
-            last_logits = _decode_one(model, tok, cache_len, device)
-            cache_len += 1
+        # Multi-turn continuation: extend the cache with the whole new prompt in
+        # one forward, under a rectangular causal mask over cache + prompt.
+        last_logits = prefill_logits(model, new_prompt_ids, device,
+                                     start_pos=cache_len)
+        cache_len += len(new_prompt_ids)
 
     stop_ids = set(stop_ids or ())
     if eos_id is not None:
         stop_ids.add(eos_id)
 
-    generated = []
-    for _ in range(max_tokens):
-        next_id = _sample_next(last_logits, temperature, top_p)
-        generated.append(next_id)
-        context_ids.append(next_id)
-        if next_id in stop_ids:
-            break
-
-        if cache_len + 1 > max_context:
-            model.reset_cache()
-            window = context_ids[-(max_context - 1):]
-            last_logits = _prefill(model, window, device)
-            cache_len = len(window)
-            continue
-
-        last_logits = _decode_one(model, next_id, cache_len, device)
-        cache_len += 1
-
-    return generated, cache_len
+    start = len(context_ids)
+    n, cache_len = decode_loop(model, last_logits, context_ids, cache_len,
+                               max_tokens, temperature, top_p, max_context,
+                               device, stop_ids)
+    return context_ids[start:start + n], cache_len
 
 
 def main():
@@ -142,25 +109,11 @@ def main():
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
     log(f"tokenizer vocab_size: {tokenizer.vocab_size}")
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     if 'config' not in ckpt or ckpt['config'] is None:
         _send({"type": "error", "error": "checkpoint missing 'config' field"})
         return
-    cfg = ckpt['config']
-    model = Transformer(
-        vocab=cfg['vocab_size'],
-        d_model=cfg['d_model'],
-        N=cfg['n_layers'],
-        heads=cfg['heads'],
-        dropout=cfg['dropout'],
-        kv_heads=cfg.get('kv_heads'),
-        loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-    ).to(device)
-    model.load_state_dict(ckpt['model'])
+    model = model_from_checkpoint(ckpt, device)
     log(f"model loaded: {sum(p.numel() for p in model.parameters()):,} params")
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')

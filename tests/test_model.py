@@ -68,3 +68,30 @@ def test_can_overfit_single_batch():
 
     # Loss should meaningfully decrease from initial value
     assert losses[-1] < losses[0] * 0.5, f"loss did not drop: {losses[0]:.3f} -> {losses[-1]:.3f}"
+
+
+def test_model_from_checkpoint_keeps_one_dtype_and_a_tied_head(tmp_path):
+    """assign=True replaces the parameter objects, which unties the head from
+    the embedding; and the rope tables are non-persistent buffers, so nothing
+    in the state dict converts them. Both have to be handled after the load."""
+    from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
+
+    torch.manual_seed(0)
+    cfg = {'vocab_size': 32, 'd_model': 16, 'n_layers': 2, 'heads': 2,
+           'dropout': 0.0, 'kv_heads': 1}
+    model = Transformer(vocab=cfg['vocab_size'], d_model=cfg['d_model'],
+                        N=cfg['n_layers'], heads=cfg['heads'], dropout=0.0,
+                        kv_heads=cfg['kv_heads']).eval()
+    path = tmp_path / 'ckpt.pt'
+    torch.save({'model': model.state_dict(), 'config': cfg}, path)
+
+    loaded = model_from_checkpoint(load_checkpoint(str(path)), torch.device('cpu'),
+                                   dtype=torch.bfloat16)
+    assert loaded.out.weight is loaded.decoder.embed.embed.weight
+    dtypes = {p.dtype for p in loaded.parameters()} | {b.dtype for b in loaded.buffers()}
+    assert dtypes == {torch.bfloat16}, dtypes
+
+    x = torch.randint(0, cfg['vocab_size'], (1, 4))
+    mask = nopeak_mask(4, torch.device('cpu'))
+    with torch.no_grad():
+        assert torch.equal(loaded(x, mask), model.to(torch.bfloat16)(x, mask))

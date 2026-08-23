@@ -157,8 +157,8 @@ def _batch_loss(model, inX, out, opt, seg=None):
     if opt.device.type == 'cuda' and getattr(opt, 'ce_chunk', 0) > 0:
         hidden = model.decoder(inX, None, seg_ids=seg)
         return chunked_cross_entropy(hidden.view(-1, hidden.size(-1)),
-                                     model.out.weight, out.reshape(-1),
-                                     LOGIT_SOFTCAP, opt.ce_chunk)
+                                     model.out.weight, model.out.bias,
+                                     out.reshape(-1), LOGIT_SOFTCAP, opt.ce_chunk)
     if seg is not None:
         pred = model(inX, None, seg_ids=seg)
     else:

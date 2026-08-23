@@ -56,15 +56,13 @@ def apply_partial_rope(x, cos, sin, rot_dim):
     return torch.cat((apply_rope(x_rot, cos, sin), x_pass), dim=-1)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
+class RMSNorm(nn.RMSNorm):
+    """torch's fused RMSNorm at this model's eps. The fused kernel also
+    reduces in fp32, so it is both faster and more accurate under bf16 than
+    computing the mean square in the input dtype."""
 
-    def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight * x * rms
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__(d_model, eps=eps)
 
 
 def attention(q, k, v, mask=None, dropout_p=0.0, is_causal=False):
@@ -120,8 +118,13 @@ class MultiHeadAttention(nn.Module):
         self.k_cache = {}
         self.v_cache = {}
 
+    def rope_tables(self, pos_ids):
+        """cos/sin gathered at per-token positions. Every layer's table holds
+        the same values, so the decoder gathers once for the whole stack."""
+        return self.rope_cos[pos_ids], self.rope_sin[pos_ids]
+
     def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0, v1=None,
-                pos_ids=None):
+                rope=None):
 
         bs = q.size(0)
 
@@ -139,10 +142,8 @@ class MultiHeadAttention(nn.Module):
         k = self.k_norm(k)
 
         T = q.size(2)
-        if pos_ids is not None:
-            # Per-token positions (reset at document boundaries); training only.
-            cos = self.rope_cos[pos_ids]
-            sin = self.rope_sin[pos_ids]
+        if rope is not None:
+            cos, sin = rope   # per-token positions, prepared by the decoder
         else:
             pos = start_pos if start_pos is not None else 0
             cos = self.rope_cos[pos:pos+T]
@@ -233,7 +234,7 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
         self.ff = SwiGLU(d_model, dropout=dropout)
 
     def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None, seg_ids=None,
-                pos_ids=None):
+                rope=None):
         x2 = self.norm_1(x)
         if self.is_kda:
             # KDA ignores the attention mask (the recurrence is inherently
@@ -243,7 +244,7 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
                                  seg_ids=seg_ids), None
         else:
             att, v = self.attn_1(x2, x2, x2, mask, start_pos=start_pos,
-                                 cache_idx=cache_idx, v1=v1, pos_ids=pos_ids)
+                                 cache_idx=cache_idx, v1=v1, rope=rope)
         x = x + self.dropout_1(att)
         x2 = self.norm_3(x)
         x = x + self.dropout_3(self.ff(x2))
@@ -309,13 +310,18 @@ class Decoder(nn.Module):
         return torch.einsum('btj,jbtd->btd', w, cands)
 
     def forward(self, trg, mask, start_pos=None, seg_ids=None):
-        pos_ids = None
+        rope = None
         if seg_ids is not None:
             # Document-aware training: no attention across boundaries, RoPE
             # positions restart at each new segment (KDA gets seg_ids directly).
+            # The gathered tables are the same for every layer, so they are
+            # built once here instead of per layer -- at (B, T, rot_dim/2) each
+            # they are the single largest thing the rotation holds on to.
             assert start_pos is None, "seg_ids is only supported in training windows"
             mask = segment_mask(seg_ids)
             pos_ids = segment_pos_ids(seg_ids)
+            mha = next((l.attn_1 for l in self.layers if not l.is_kda), None)
+            rope = mha.rope_tables(pos_ids) if mha is not None else None
         x0 = x = self.embed(trg)
         half = (self.N + 1) // 2
         # Block outputs feed AttnRes boundaries; accumulates across the whole
@@ -337,11 +343,11 @@ class Decoder(nn.Module):
                 v1_in = v1 if (self.value_residual and not self.layers[i].is_kda) else None
                 if self.training and self.grad_ckpt:
                     x, v = checkpoint(self.layers[i], x_in, mask, start_pos, loop,
-                                      v1_in, seg_ids, pos_ids, use_reentrant=False)
+                                      v1_in, seg_ids, rope, use_reentrant=False)
                 else:
                     x, v = self.layers[i](x_in, mask, start_pos=start_pos,
                                           cache_idx=loop, v1=v1_in, seg_ids=seg_ids,
-                                          pos_ids=pos_ids)
+                                          rope=rope)
                 if v1 is None and v is not None:
                     v1 = v
                 outs.append(x)
@@ -396,7 +402,7 @@ def get_model(opt, vocab):
 
     if opt.loadname is not None:
         print("loading pretrained weights...")
-        ckpt = torch.load(opt.loadname, map_location=opt.device, weights_only=False)
+        ckpt = load_checkpoint(opt.loadname)
         state = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
         model.load_state_dict(state)
     else:
@@ -413,10 +419,57 @@ def get_model(opt, vocab):
     return model
 
 
-def nopeak_mask(size, device):
-    mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).unsqueeze(0)
-    mask = (mask == 0)
-    return mask
+def inference_dtype(device):
+    """bf16 on accelerators, fp32 on CPU (no fast bf16 path there)."""
+    return torch.bfloat16 if device.type in ('cuda', 'mps') else torch.float32
+
+
+def load_checkpoint(path):
+    """Read a checkpoint without pulling it onto the accelerator.
+
+    map_location='cpu' with mmap keeps unpickling lazy; materializing every
+    tensor on the device as it is unpickled costs far more than mapping the
+    file and moving the assembled model once."""
+    return torch.load(path, map_location='cpu', mmap=True, weights_only=False)
+
+
+def model_from_checkpoint(ckpt, device, dtype=None):
+    """Rebuild a Transformer from a checkpoint's saved config, weights loaded
+    and ready for inference.
+
+    The weights are converted once here rather than under torch.autocast:
+    autocast's cast cache is only live while grad mode is on, so under
+    no_grad it re-casts every weight on every forward, which dominates
+    single-token decode."""
+    cfg = ckpt['config']
+    model = Transformer(
+        vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
+        heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
+        kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
+        value_residual=cfg.get('value_residual', False),
+        unet_skips=cfg.get('unet_skips', False),
+        attn_res=cfg.get('attn_res', 0),
+        kda=cfg.get('kda', 0),
+    )
+    dtype = inference_dtype(device) if dtype is None else dtype
+    # assign hands the checkpoint's tensors straight to the module rather than
+    # copying into the freshly initialized ones, which are discarded anyway --
+    # but it also replaces the tied head weight, so re-tie it afterwards. The
+    # final to() still carries dtype: the rope tables are non-persistent
+    # buffers, so they are not in the state dict and nothing else converts them.
+    model.load_state_dict({k: v.to(dtype) for k, v in ckpt['model'].items()},
+                          assign=True)
+    model.out.weight = model.decoder.embed.embed.weight
+    return model.to(device=device, dtype=dtype).eval()
+
+
+def nopeak_mask(size, device, start_pos=0):
+    """(1, size, start_pos + size) bool mask (True = attend): query i may see
+    every key up to start_pos + i. start_pos > 0 covers a chunk fed into an
+    existing KV cache; start_pos = 0 is the square causal mask."""
+    keys = torch.arange(start_pos + size, device=device)
+    queries = torch.arange(size, device=device) + start_pos
+    return (keys[None, :] <= queries[:, None]).unsqueeze(0)
 
 
 def segment_mask(seg_ids):

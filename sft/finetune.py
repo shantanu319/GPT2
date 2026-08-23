@@ -18,24 +18,33 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import data_feeder_masked, load_bin, load_bin_u8
-from core.model import Transformer, nopeak_mask
+from core.model import LOGIT_SOFTCAP, Transformer, load_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
+from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
 
 
-def masked_loss(pred, target, mask, vocab_size):
-    loss = F.cross_entropy(pred.view(-1, vocab_size), target.reshape(-1),
-                           reduction='none')
-    mask = mask.reshape(-1).float()
-    return (loss * mask).sum() / mask.sum().clamp(min=1)
+def masked_loss(hidden, weight, bias, target, mask, ce_chunk):
+    """Soft-capped CE over the loss-carrying (assistant) tokens only.
+
+    Rows are selected before the LM head rather than after: prompt tokens are
+    around 60% of a packed SFT batch and carry no loss, so they never reach the
+    (N, V) logits, and what is left goes through the chunked kernel instead of
+    materializing them in full."""
+    keep = mask.reshape(-1)
+    rows = hidden.reshape(-1, hidden.size(-1))[keep]
+    return chunked_cross_entropy(rows, weight, bias, target.reshape(-1)[keep],
+                                 LOGIT_SOFTCAP, ce_chunk)
 
 
-def forward_with_seg(model, x, seg, device):
-    """Intra-conversation attention when seg is present (packed conversations
-    must not merge into one mega-conversation); plain causal otherwise."""
+def hidden_states(model, x, seg, device):
+    """Trunk output, with intra-conversation attention when seg is present
+    (packed conversations must not merge into one mega-conversation) and plain
+    causal otherwise. The LM head is applied by masked_loss, on the
+    loss-carrying rows only."""
     if seg is not None:
-        return model(x, None, seg_ids=seg)
-    return model(x, nopeak_mask(x.size(1), device))
+        return model.decoder(x, None, seg_ids=seg)
+    return model.decoder(x, nopeak_mask(x.size(1), device))
 
 
 def make_sft_optimizers(model, muon_lr, adamw_lr):
@@ -58,8 +67,7 @@ def make_sft_optimizers(model, muon_lr, adamw_lr):
 
 
 @torch.no_grad()
-def validate(model, val, val_mask, opt, device, vocab_size, max_batches=100,
-             eos_id=None):
+def validate(model, val, val_mask, opt, device, max_batches=100, eos_id=None):
     model.eval()
     total, count = 0.0, 0
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
@@ -69,7 +77,8 @@ def validate(model, val, val_mask, opt, device, vocab_size, max_batches=100,
             if i >= max_batches:
                 break
             seg = rest[0] if rest else None
-            loss = masked_loss(forward_with_seg(model, x, seg, device), y, m, vocab_size)
+            loss = masked_loss(hidden_states(model, x, seg, device),
+                               model.out.weight, model.out.bias, y, m, opt.ce_chunk)
             total += loss.item()
             count += 1
     model.train()
@@ -93,6 +102,9 @@ def main():
     parser.add_argument('--printevery', type=int, default=50)
     parser.add_argument('--dir-name', default='sft')
     parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--ce-chunk', type=int, default=16384,
+                        help='Rows per chunk in the fused cross-entropy '
+                             '(0 = plain unfused path)')
     parser.add_argument('--no-doc-mask', action='store_true',
                         help='Disable intra-conversation attention (allow attention '
                              'across packed conversations separated by <|endoftext|>)')
@@ -104,7 +116,7 @@ def main():
     tokenizer = BPETokenizer()
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     cfg = ckpt['config']
     if cfg is None:
         raise ValueError("checkpoint lacks config — retrain with current train.py")
@@ -118,7 +130,6 @@ def main():
         kda=cfg.get('kda', 0),
     ).to(device)
     model.load_state_dict(ckpt['model'])
-    vocab_size = cfg['vocab_size']
     print(f"loaded {sum(p.numel() for p in model.parameters()):,} params "
           f"from {args.checkpoint}")
 
@@ -147,8 +158,8 @@ def main():
                     group['lr'] = group['peak_lr'] * factor
 
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                loss = masked_loss(forward_with_seg(model, x, seg, device), y, m,
-                                   vocab_size)
+                loss = masked_loss(hidden_states(model, x, seg, device),
+                                   model.out.weight, model.out.bias, y, m, args.ce_chunk)
 
             for opt in optimizers:
                 opt.zero_grad()
@@ -166,11 +177,11 @@ def main():
                 save_checkpoint(model, optimizers, step, path, config=cfg)
                 print(f"saved {path}")
             if args.val_every and step % args.val_every == 0:
-                validate(model, val, val_mask, args, device, vocab_size, eos_id=eos_id)
+                validate(model, val, val_mask, args, device, eos_id=eos_id)
 
     final = os.path.join(save_dir, 'sft_final.pt')
     save_checkpoint(model, optimizers, step, final, config=cfg)
-    validate(model, val, val_mask, args, device, vocab_size, eos_id=eos_id)
+    validate(model, val, val_mask, args, device, eos_id=eos_id)
     print(f"saved final SFT checkpoint: {final}")
 
 

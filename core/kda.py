@@ -41,6 +41,81 @@ def kda_recurrence(q, k, v, g, beta, initial_state=None, seg_ids=None):
     return o, S
 
 
+_SUB_CHUNK = 16  # sub-block size inside a chunk for the decayed-score matrices
+
+
+def _decay_scores(x, y, g, diagonal):
+    """Lower-triangular decayed inner products M[c, j] = sum_d x[c,d] y[j,d]
+    exp(g[c,d] - g[j,d]), zeroed on and above the `diagonal`-th diagonal.
+
+    x, y, g: [..., BT, K], g non-increasing along BT (a cumsum of non-positive
+    log-decays). Sub-blocks below the diagonal factor the decay through their
+    row block's first position, so both exponents stay <= 0 and the block is a
+    single matmul. Only the diagonal sub-blocks keep the per-column form, where
+    a positive exponent can appear but always lands in a masked-out entry."""
+    BT, K = x.shape[-2], x.shape[-1]
+    BC = min(_SUB_CHUNK, BT)
+    assert BT % BC == 0, f"chunk_size={BT} must be a multiple of {BC}"
+    NB = BT // BC
+    xs, ys, gs = (t.unflatten(-2, (NB, BC)) for t in (x, y, g))
+
+    diag = x.new_zeros(*x.shape[:-2], NB, BC, BC)
+    for j in range(BC):
+        # clamp: entries with a positive exponent are all above the diagonal and
+        # get masked out below — clamping keeps them from overflowing to inf,
+        # which would otherwise poison the backward pass with 0 * inf.
+        decay = (gs - gs[..., j:j + 1, :]).clamp(max=0).exp()
+        diag[..., j] = (xs * decay * ys[..., j:j + 1, :]).sum(-1)
+    tri = torch.triu(torch.ones(BC, BC, dtype=torch.bool, device=x.device),
+                     diagonal=diagonal)
+    diag = diag.masked_fill(tri, 0)
+
+    out = x.new_zeros(*x.shape[:-2], BT, BT)
+    for b in range(NB):
+        lo, hi = b * BC, (b + 1) * BC
+        out[..., lo:hi, lo:hi] = diag[..., b, :, :]
+        if b:
+            ref = g[..., lo:lo + 1, :]  # route both decays through the block start
+            left = x[..., lo:hi, :] * (g[..., lo:hi, :] - ref).exp()
+            right = y[..., :lo, :] * (ref - g[..., :lo, :]).exp()
+            out[..., lo:hi, :lo] = left @ right.mT
+    return out
+
+
+def _unit_lower_inverse(L):
+    """(I - L)^{-1} for a strictly lower-triangular L: [..., BT, BT].
+
+    Blocked forward substitution. The BC-wide diagonal blocks are inverted by
+    the row recursion, but all of them at once, so it costs BC steps instead of
+    BT; each remaining block row is then one matmul against the block rows
+    already solved."""
+    BT = L.shape[-1]
+    BC = min(_SUB_CHUNK, BT)
+    NB = BT // BC
+    eye = torch.eye(BC, dtype=L.dtype, device=L.device)
+
+    # Diagonal blocks -> [..., NB, BC, BC], inverted together by the recursion
+    # X[i, :i] += X[i, :] @ X[:, :i] (the strictly-lower Neumann series).
+    blocks = torch.diagonal(L.unflatten(-1, (NB, BC)).unflatten(-3, (NB, BC)),
+                            dim1=-4, dim2=-2).movedim(-1, -3).clone()
+    for i in range(1, BC):
+        blocks[..., i, :i] = (blocks[..., i, :i].clone()
+                              + (blocks[..., i, :, None].clone()
+                                 * blocks[..., :, :i].clone()).sum(-2))
+    blocks = blocks + eye
+
+    X = blocks[..., 0, :, :]      # growing top-left square of the inverse
+    for b in range(1, NB):
+        lo, hi = b * BC, (b + 1) * BC
+        D = blocks[..., b, :, :]
+        off = D @ (L[..., lo:hi, :lo] @ X)
+        X = torch.cat([
+            torch.cat([X, X.new_zeros(*X.shape[:-1], BC)], dim=-1),
+            torch.cat([off, D], dim=-1),
+        ], dim=-2)
+    return X
+
+
 def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None):
     """Chunked-parallel KDA in fp32 — the training path: all positions of a
     chunk are processed with batched matmuls, only the inter-chunk scan is
@@ -81,25 +156,14 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
         # Only the chunk's final (suffix) segment contributes to the next state.
         write_gate = (seg == seg_last).float()[:, None]                 # [B,1,NT,BT]
 
-    # UT transform for the delta rule. exp(g_c - g_i) is formed per column so no
-    # entry ever exponentiates a positive number (a cumsum of non-positive
-    # log-decays is non-increasing, so only masked-out entries could overflow).
-    mask_incl = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
-    A = q.new_zeros(B, H, NT, BT, BT)
-    for i in range(BT):
-        k_i = k[..., i, :]        # [B,H,NT,K]
-        g_i = g[..., i:i+1, :]    # [B,H,NT,1,K]
-        A[..., i] = torch.einsum('...cd,...d->...c', k * (g - g_i).exp(), k_i)
+    # UT transform for the delta rule.
+    A = _decay_scores(k, k, g, diagonal=0)
     A = A * beta.unsqueeze(-1)    # row c scaled by beta of the writing position
     if seg_ids is not None:
         # Cross-segment pairs drop out of the solve; the inverse stays
         # block-diagonal, i.e. each segment solves independently.
-        mask_incl = mask_incl | ~same_pair
-    A = -A.masked_fill(mask_incl, 0)
-    for i in range(1, BT):        # forward substitution: (I + strictly-lower)^{-1}
-        A[..., i, :i] = (A[..., i, :i].clone()
-                         + (A[..., i, :, None].clone() * A[..., :, :i].clone()).sum(-2))
-    A = (A + torch.eye(BT, dtype=torch.float, device=q.device)) * beta.unsqueeze(-2)
+        A = A.masked_fill(~same_pair, 0)
+    A = _unit_lower_inverse(-A) * beta.unsqueeze(-2)
 
     w = A @ (g.exp() * k)         # decayed keys   [B,H,NT,BT,K]
     u = A @ v                     # pseudo-values  [B,H,NT,BT,V]
@@ -108,18 +172,16 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     if initial_state is not None:
         S = S + initial_state.float()
     o = torch.zeros_like(v)       # [B,H,NT,BT,V]
-    mask_strict = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    # Intra-chunk query->key weights, decayed. Independent of the running state,
+    # so every chunk's block is built up front instead of inside the scan.
+    Aqk_all = _decay_scores(q, k, g, diagonal=1)
+    if seg_ids is not None:
+        Aqk_all = Aqk_all.masked_fill(~same_pair, 0)
     for i in range(NT):
         q_i, k_i, u_i, g_i, w_i = q[:, :, i], k[:, :, i], u[:, :, i], g[:, :, i], w[:, :, i]
-        Aqk = q.new_zeros(B, H, BT, BT)  # intra-chunk query->key weights, decayed
-        for j in range(BT):
-            k_j = k_i[:, :, j]           # [B,H,K]
-            g_j = g_i[:, :, j:j+1]       # [B,H,1,K]
-            Aqk[..., j] = torch.einsum('...cd,...d->...c', q_i * (g_i - g_j).exp(), k_j)
-        Aqk = Aqk.masked_fill(mask_strict, 0)
+        Aqk = Aqk_all[:, :, i]
         if seg_ids is not None:
             rg = read_gate[:, :, i].unsqueeze(-1)   # [B,H,BT,1]
-            Aqk = Aqk.masked_fill(~same_pair[:, :, i], 0)
             v_i = u_i - rg * (w_i @ S)  # fresh segments ignore the incoming state
             o[:, :, i] = rg * ((q_i * g_i.exp()) @ S) + Aqk @ v_i
             S = carry[:, :, i].unsqueeze(-1) * S * g_i[:, :, -1].exp().unsqueeze(-1)
@@ -134,18 +196,22 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     return o, S
 
 
-class _RMSNorm(nn.Module):
-    """Mirror of core.model.RMSNorm (duplicated to keep this module import-
-    cycle-free); eps follows fla's FusedRMSNormGated."""
-
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight * x * rms
+def kda_scan(q, k, v, g, beta, initial_state=None, chunk_size=64):
+    """kda_chunk over the leading whole chunks, kda_recurrence for the ragged
+    tail. Same result as running the recurrence over the whole span, but the
+    sequential part is the tail rather than every position -- which is what a
+    cached prefill of T tokens would otherwise cost."""
+    T = q.shape[1]
+    full = T - T % chunk_size
+    if not full:
+        return kda_recurrence(q, k, v, g, beta, initial_state=initial_state)
+    head = (x[:, :full] for x in (q, k, v, g, beta))
+    o, S = kda_chunk(*head, initial_state=initial_state, chunk_size=chunk_size)
+    if full < T:
+        tail = (x[:, full:] for x in (q, k, v, g, beta))
+        o_tail, S = kda_recurrence(*tail, initial_state=S)
+        o = torch.cat((o, o_tail), dim=1)
+    return o, S
 
 
 class KimiDeltaAttention(nn.Module):
@@ -187,7 +253,7 @@ class KimiDeltaAttention(nn.Module):
             nn.Linear(d_model, self.d_k, bias=False),
             nn.Linear(self.d_k, d_model, bias=True),
         )
-        self.o_norm = _RMSNorm(self.d_k)
+        self.o_norm = nn.RMSNorm(self.d_k, eps=1e-5)  # eps follows fla's FusedRMSNormGated
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.s_cache = {}  # recurrence states keyed by recurrence-pass index
@@ -213,8 +279,8 @@ class KimiDeltaAttention(nn.Module):
             else:
                 o, _ = kda_recurrence(q, k, v, g, beta, seg_ids=seg_ids)
         else:
-            S = self.s_cache.get(cache_idx)
-            o, S = kda_recurrence(q, k, v, g, beta, initial_state=S)
+            o, S = kda_scan(q, k, v, g, beta, initial_state=self.s_cache.get(cache_idx),
+                            chunk_size=self.chunk_size)
             self.s_cache[cache_idx] = S
 
         o = o.to(x.dtype)

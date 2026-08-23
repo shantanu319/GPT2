@@ -141,19 +141,88 @@ def test_chunked_cross_entropy_matches_reference():
 
     # Chunked autograd path (ragged last chunk: 130 = 2*64 + 2)
     h = ref_h.detach().clone().requires_grad_(True)
-    loss = _chunked_cross_entropy(h, weight, targets, softcap, 64)
+    loss = _chunked_cross_entropy(h, weight, None, targets, softcap, 64)
     loss.backward()
     assert loss.item() == pytest.approx(ref_loss.item(), abs=1e-4)
     assert torch.allclose(h.grad, ref_h.grad, atol=1e-4)
     # weight grad: recompute against autograd through the same reference
     w = weight.clone().requires_grad_(True)
-    loss_w = _chunked_cross_entropy(ref_h.detach(), w, targets, softcap, 64)
+    loss_w = _chunked_cross_entropy(ref_h.detach(), w, None, targets, softcap, 64)
     loss_w.backward()
     assert torch.allclose(w.grad, ref_dw, atol=1e-4)
 
     # Public API falls back to the plain path on CPU but must agree on value
     h2 = ref_h.detach().clone().requires_grad_(True)
-    loss2 = chunked_cross_entropy(h2, weight, targets, softcap, 64)
+    loss2 = chunked_cross_entropy(h2, weight, None, targets, softcap, 64)
     loss2.backward()
     assert loss2.item() == pytest.approx(ref_loss.item(), abs=1e-4)
     assert torch.allclose(h2.grad, ref_h.grad, atol=1e-4)
+
+
+def test_chunked_cross_entropy_backward_runs_in_the_autocast_dtype():
+    """Backward runs outside the caller's autocast region, so it has to be told
+    which dtype the forward's logits matmul used. Recomputing them in fp32
+    instead differentiates at a different operating point from the loss, and
+    pays fp32 matmul rates for three (N, V) x (V, d) products."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    from pretrain.fused_ce import _chunked_cross_entropy, _reference_cross_entropy
+
+    class _MatmulDtypes(TorchDispatchMode):
+        def __init__(self):
+            self.dtypes = set()
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func.__name__.startswith('mm'):
+                self.dtypes.add(args[0].dtype)
+            return func(*args, **(kwargs or {}))
+
+    torch.manual_seed(0)
+    N, d, V, softcap = 512, 64, 2000, 15.0
+    h0, w0 = torch.randn(N, d) * 0.5, torch.randn(V, d) * 0.02
+    targets = torch.randint(0, V, (N,))
+
+    h = h0.clone().requires_grad_(True)
+    w = w0.clone().requires_grad_(True)
+    with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+        loss = _chunked_cross_entropy(h, w, None, targets, softcap, 256)
+    seen = _MatmulDtypes()
+    with seen:
+        loss.backward()
+    assert seen.dtypes == {torch.bfloat16}, seen.dtypes
+
+    # ...and it still lands on the unfused fallback it stands in for.
+    ref_h = h0.clone().requires_grad_(True)
+    ref_w = w0.clone().requires_grad_(True)
+    with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
+        _reference_cross_entropy(ref_h, ref_w, None, targets, softcap).backward()
+    assert torch.allclose(h.grad, ref_h.grad, atol=1e-5)
+    assert torch.allclose(w.grad, ref_w.grad, atol=1e-4)
+
+
+def test_chunked_cross_entropy_applies_the_lm_head_bias():
+    """model.out is an nn.Linear with a bias, so the chunked path has to be
+    handed it. Without it the fused training loss drifts from the logits the
+    model actually produces at inference, and the bias never sees a gradient."""
+    import torch.nn.functional as F
+
+    from core.model import LOGIT_SOFTCAP, Transformer, nopeak_mask
+    from pretrain.fused_ce import _chunked_cross_entropy
+
+    torch.manual_seed(0)
+    V, d = 64, 16
+    model = Transformer(vocab=V, d_model=d, N=1, heads=2, dropout=0.0, kv_heads=1).eval()
+    torch.nn.init.normal_(model.out.bias, std=0.5)
+    x = torch.randint(0, V, (2, 8))
+    y = torch.randint(0, V, (2, 8))
+    mask = nopeak_mask(8, torch.device('cpu'))
+
+    ref = F.cross_entropy(model(x, mask).view(-1, V), y.reshape(-1))
+    hidden = model.decoder(x, mask).reshape(-1, d)
+    fused = _chunked_cross_entropy(hidden, model.out.weight, model.out.bias,
+                                   y.reshape(-1), LOGIT_SOFTCAP, 4)
+    assert torch.allclose(ref, fused, atol=1e-5), (ref.item(), fused.item())
+
+    fused.backward()
+    assert model.out.bias.grad is not None
+    assert model.out.bias.grad.abs().sum() > 0

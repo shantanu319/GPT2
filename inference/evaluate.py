@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from core.chat_format import DEFAULT_SYSTEM, IM_START, render_turn
-from core.model import Transformer, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 
 
@@ -63,19 +63,40 @@ TASKS = {
 
 
 @torch.no_grad()
-def choice_logprob(model, tokenizer, context, choice, device, max_len=1024):
+def choice_logprobs(model, tokenizer, context, choices, device, max_len=1024):
+    """Score every choice of one question in a single batched forward.
+
+    The choices share a context, so it is tokenized once and the batch is
+    right-padded, with the padding masked out of attention the same way
+    dpo.build_batch does it. Returns (sum, mean) of the continuation's token
+    log-probabilities per choice."""
     ctx_ids = tokenizer.encode(context)
-    cho_ids = tokenizer.encode_ordinary(choice)
-    ids = (ctx_ids + cho_ids)[-max_len:]
-    n_cho = min(len(cho_ids), len(ids) - 1)
-    x = torch.tensor(ids[:-1], dtype=torch.long, device=device).unsqueeze(0)
-    y = torch.tensor(ids[1:], dtype=torch.long, device=device)
-    mask = nopeak_mask(x.size(1), device)
-    with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-        logits = model(x, mask)
-    logp = F.log_softmax(logits.float()[0], dim=-1)
-    tok_lp = logp[torch.arange(y.size(0)), y][-n_cho:]
-    return tok_lp.sum().item(), tok_lp.mean().item()
+    seqs, n_cho = [], []
+    for choice in choices:
+        cho_ids = tokenizer.encode_ordinary(choice)
+        ids = (ctx_ids + cho_ids)[-max_len:]
+        seqs.append(ids)
+        n_cho.append(min(len(cho_ids), len(ids) - 1))
+
+    B, T = len(seqs), max(len(s) for s in seqs) - 1
+    x = torch.zeros(B, T, dtype=torch.long, device=device)
+    y = torch.zeros(B, T, dtype=torch.long, device=device)
+    keep = torch.zeros(B, T, dtype=torch.bool, device=device)
+    for i, ids in enumerate(seqs):
+        n = len(ids) - 1
+        x[i, :n] = torch.tensor(ids[:-1], dtype=torch.long, device=device)
+        y[i, :n] = torch.tensor(ids[1:], dtype=torch.long, device=device)
+        keep[i, :n] = True
+
+    logits = model(x, nopeak_mask(T, device) & keep[:, None, :])
+    logp = F.log_softmax(logits.float(), dim=-1)
+    tok_lp = logp.gather(-1, y.unsqueeze(-1)).squeeze(-1)
+    out = []
+    for i, ids in enumerate(seqs):
+        n = len(ids) - 1
+        lp = tok_lp[i, n - n_cho[i]:n]
+        out.append((lp.sum().item(), lp.mean().item()))
+    return out
 
 
 def run_task(model, tokenizer, task, device, limit=None, chat=False):
@@ -88,8 +109,7 @@ def run_task(model, tokenizer, task, device, limit=None, chat=False):
             ctx = (render_turn('system', DEFAULT_SYSTEM)
                    + render_turn('user', ex['context'])
                    + f"{IM_START}assistant\n")
-        scores = [choice_logprob(model, tokenizer, ctx, c, device)
-                  for c in ex['choices']]
+        scores = choice_logprobs(model, tokenizer, ctx, ex['choices'], device)
         acc += max(range(len(scores)), key=lambda i: scores[i][0]) == ex['gold']
         acc_norm += max(range(len(scores)), key=lambda i: scores[i][1]) == ex['gold']
         n += 1
@@ -114,18 +134,8 @@ def main():
     tokenizer = BPETokenizer()
     tokenizer.load(args.tokenizer)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    cfg = ckpt['config']
-    model = Transformer(
-        vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
-        heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
-        kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-    ).to(device).eval()
-    model.load_state_dict(ckpt['model'])
+    ckpt = load_checkpoint(args.checkpoint)
+    model = model_from_checkpoint(ckpt, device)
 
     print(f"{'task':<14} {'n':>5} {'acc':>7} {'acc_norm':>9}")
     for task in args.tasks.split(','):

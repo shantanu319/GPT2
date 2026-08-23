@@ -10,8 +10,11 @@ import os
 import torch
 import torch.nn.functional as F
 
-from core.model import Transformer, nopeak_mask
+from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
+
+
+STOP_CHECK_EVERY = 8  # decode steps between reading sampled tokens back
 
 
 def top_p_filter(probs, top_p):
@@ -39,12 +42,86 @@ def _resolve_device(no_cuda):
 
 
 def _sample_next(logits, temperature, top_p):
-    logits = logits.float() / max(temperature, 1e-6)
-    probs = F.softmax(logits, dim=-1).squeeze(0)
+    """Sample one token id, returned as a (1, 1) tensor on the logits' device.
+
+    Gumbel-max -- argmax of log p plus Gumbel noise -- draws from the same
+    distribution as torch.multinomial, which on MPS synchronises and stalls the
+    decode pipeline for a full step. argmax is invariant to a constant scale on
+    p, so the nucleus does not need renormalizing."""
+    probs = F.softmax(logits.float() / max(temperature, 1e-6), dim=-1).squeeze(0)
     if top_p < 1.0:
         probs = top_p_filter(probs, top_p)
-        probs = probs / probs.sum()
-    return torch.multinomial(probs, num_samples=1).item()
+    u = torch.rand_like(probs).clamp_min_(1e-20)
+    return (probs.log() - (-u.log()).log()).argmax(-1).view(1, 1)
+
+
+def reprefill_window(ids, max_context):
+    """Tail of `ids` to rebuild the KV cache from after an overflow.
+
+    Rebuilding right up to max_context leaves no room: the very next token
+    overflows again, and a re-prefill costs as much as tens of decode steps.
+    Leaving a quarter of the window free amortizes it over that many tokens."""
+    return ids[-(max_context * 3 // 4):]
+
+
+def prefill_logits(model, ids, device, start_pos=0):
+    """Feed `ids` into the KV cache at start_pos in one batched forward.
+    Returns logits for the final token."""
+    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    mask = nopeak_mask(x.size(1), device, start_pos=start_pos)
+    return model(x, mask, start_pos=start_pos)[:, -1, :]
+
+
+@torch.no_grad()
+def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
+                top_p, max_context, device, stop_ids):
+    """Sample up to max_tokens tokens, appending them to `ids` in place.
+    Returns (n_generated, cache_len).
+
+    Sampled tokens stay on the device and are read back a block at a time:
+    testing each one against stop_ids on the CPU costs a pipeline stall per
+    step, which is worth more than the few tokens generated past a stop and
+    thrown away. `ids` must end with every token the KV cache holds."""
+    pending, stopped = [], False
+
+    def flush():
+        """Read the pending tokens into `ids` up to the first stop id. Sets
+        `stopped`, and returns how many tokens past it are discarded."""
+        nonlocal pending, stopped
+        if not pending:
+            return 0
+        toks = torch.cat(pending, dim=1).view(-1).tolist()
+        pending = []
+        for i, tok in enumerate(toks):
+            ids.append(tok)
+            if tok in stop_ids:
+                stopped = True
+                return len(toks) - 1 - i
+        return 0
+
+    n = 0
+    while n < max_tokens:
+        if cache_len + 1 >= max_context:
+            # Rebuilding the cache needs every sampled token back on the CPU.
+            dropped = flush()
+            n, cache_len = n - dropped, cache_len - dropped
+            if stopped:
+                break
+            model.reset_cache()
+            window = reprefill_window(ids, max_context)
+            last_logits = prefill_logits(model, window, device)
+            cache_len = len(window)
+        tok = _sample_next(last_logits, temperature, top_p)
+        pending.append(tok)
+        n += 1
+        last_logits = model(tok, None, start_pos=cache_len)[:, -1, :]
+        cache_len += 1
+        if len(pending) == STOP_CHECK_EVERY or n == max_tokens:
+            dropped = flush()
+            n, cache_len = n - dropped, cache_len - dropped
+            if stopped:
+                break
+    return n, cache_len
 
 
 @torch.no_grad()
@@ -69,51 +146,18 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_p,
         for _ in range(max_tokens):
             context = tokens[:, -max_context:]
             mask = nopeak_mask(context.size(1), device)
-            with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-                logits = model(context, mask)
-            next_id = _sample_next(logits[:, -1, :], temperature, top_p)
-            tokens = torch.cat(
-                [tokens, torch.tensor([[next_id]], dtype=torch.long, device=device)],
-                dim=1,
-            )
-            if next_id in stop_ids:
+            tok = _sample_next(model(context, mask)[:, -1, :], temperature, top_p)
+            tokens = torch.cat([tokens, tok], dim=1)
+            if tok.item() in stop_ids:
                 break
         return tokenizer.decode(tokens[0].tolist())
 
     # KV-cache path: prefill the prompt, then decode one token at a time.
     model.reset_cache()
     all_ids = list(ids)
-
-    def prefill(window):
-        x = torch.tensor(window, dtype=torch.long, device=device).unsqueeze(0)
-        mask = nopeak_mask(x.size(1), device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(x, mask, start_pos=0)
-        return logits[:, -1, :]
-
-    last_logits = prefill(all_ids)
-    cache_len = len(all_ids)
-
-    for _ in range(max_tokens):
-        next_id = _sample_next(last_logits, temperature, top_p)
-        all_ids.append(next_id)
-        if next_id in stop_ids:
-            break
-
-        if cache_len + 1 >= max_context:
-            # Overflow: drop cache and re-prefill the last (max_context - 1) tokens.
-            model.reset_cache()
-            window = all_ids[-(max_context - 1):]
-            last_logits = prefill(window)
-            cache_len = len(window)
-            continue
-
-        x = torch.tensor([[next_id]], dtype=torch.long, device=device)
-        with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
-            logits = model(x, None, start_pos=cache_len)
-        last_logits = logits[:, -1, :]
-        cache_len += 1
-
+    last_logits = prefill_logits(model, all_ids, device)
+    decode_loop(model, last_logits, all_ids, len(all_ids), max_tokens,
+                temperature, top_p, max_context, device, stop_ids)
     return tokenizer.decode(all_ids)
 
 
@@ -147,27 +191,13 @@ def main():
     tokenizer = BPETokenizer()
     tokenizer.load(tok_path)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    ckpt = load_checkpoint(args.checkpoint)
     if 'config' not in ckpt or ckpt['config'] is None:
         raise ValueError(
             f"checkpoint {args.checkpoint} lacks a 'config' field — "
             f"retrain with the current save_checkpoint to include model architecture"
         )
-    cfg = ckpt['config']
-    model = Transformer(
-        vocab=cfg['vocab_size'],
-        d_model=cfg['d_model'],
-        N=cfg['n_layers'],
-        heads=cfg['heads'],
-        dropout=cfg['dropout'],
-        kv_heads=cfg.get('kv_heads'),
-        loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-    ).to(device)
-    model.load_state_dict(ckpt['model'])
+    model = model_from_checkpoint(ckpt, device)
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
 
