@@ -118,8 +118,13 @@ class MultiHeadAttention(nn.Module):
         self.k_cache = {}
         self.v_cache = {}
 
+    def rope_tables(self, pos_ids):
+        """cos/sin gathered at per-token positions. Every layer's table holds
+        the same values, so the decoder gathers once for the whole stack."""
+        return self.rope_cos[pos_ids], self.rope_sin[pos_ids]
+
     def forward(self, q, k, v, mask=None, start_pos=None, cache_idx=0, v1=None,
-                pos_ids=None):
+                rope=None):
 
         bs = q.size(0)
 
@@ -137,10 +142,8 @@ class MultiHeadAttention(nn.Module):
         k = self.k_norm(k)
 
         T = q.size(2)
-        if pos_ids is not None:
-            # Per-token positions (reset at document boundaries); training only.
-            cos = self.rope_cos[pos_ids]
-            sin = self.rope_sin[pos_ids]
+        if rope is not None:
+            cos, sin = rope   # per-token positions, prepared by the decoder
         else:
             pos = start_pos if start_pos is not None else 0
             cos = self.rope_cos[pos:pos+T]
@@ -231,7 +234,7 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
         self.ff = SwiGLU(d_model, dropout=dropout)
 
     def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None, seg_ids=None,
-                pos_ids=None):
+                rope=None):
         x2 = self.norm_1(x)
         if self.is_kda:
             # KDA ignores the attention mask (the recurrence is inherently
@@ -241,7 +244,7 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
                                  seg_ids=seg_ids), None
         else:
             att, v = self.attn_1(x2, x2, x2, mask, start_pos=start_pos,
-                                 cache_idx=cache_idx, v1=v1, pos_ids=pos_ids)
+                                 cache_idx=cache_idx, v1=v1, rope=rope)
         x = x + self.dropout_1(att)
         x2 = self.norm_3(x)
         x = x + self.dropout_3(self.ff(x2))
@@ -307,13 +310,18 @@ class Decoder(nn.Module):
         return torch.einsum('btj,jbtd->btd', w, cands)
 
     def forward(self, trg, mask, start_pos=None, seg_ids=None):
-        pos_ids = None
+        rope = None
         if seg_ids is not None:
             # Document-aware training: no attention across boundaries, RoPE
             # positions restart at each new segment (KDA gets seg_ids directly).
+            # The gathered tables are the same for every layer, so they are
+            # built once here instead of per layer -- at (B, T, rot_dim/2) each
+            # they are the single largest thing the rotation holds on to.
             assert start_pos is None, "seg_ids is only supported in training windows"
             mask = segment_mask(seg_ids)
             pos_ids = segment_pos_ids(seg_ids)
+            mha = next((l.attn_1 for l in self.layers if not l.is_kda), None)
+            rope = mha.rope_tables(pos_ids) if mha is not None else None
         x0 = x = self.embed(trg)
         half = (self.N + 1) // 2
         # Block outputs feed AttnRes boundaries; accumulates across the whole
@@ -335,11 +343,11 @@ class Decoder(nn.Module):
                 v1_in = v1 if (self.value_residual and not self.layers[i].is_kda) else None
                 if self.training and self.grad_ckpt:
                     x, v = checkpoint(self.layers[i], x_in, mask, start_pos, loop,
-                                      v1_in, seg_ids, pos_ids, use_reentrant=False)
+                                      v1_in, seg_ids, rope, use_reentrant=False)
                 else:
                     x, v = self.layers[i](x_in, mask, start_pos=start_pos,
                                           cache_idx=loop, v1=v1_in, seg_ids=seg_ids,
-                                          pos_ids=pos_ids)
+                                          rope=rope)
                 if v1 is None and v is not None:
                     v1 = v
                 outs.append(x)
