@@ -59,6 +59,19 @@ SEQLEN=512 BATCHSIZE=16 \
 EPOCHS=1 WARMUP_STEPS=300 \
 ./scripts/run.sh
 
+Benchmarking the attention stack (`bench/`, needs `pip install mlx` on Apple Silicon):
+
+    python3 -m bench.compare_mlx           # both benchmarks
+    python3 -m bench.compare_mlx --attn    # just global vs sliding-window attention
+
+compare_mlx.py times the two kernels that dominate the stack — the KDA chunked path and windowed
+attention — against MLX ports of the same math in bench/mlx_ops.py, which it checks against
+core/kda.py and core/model.py before timing anything so a drifted port fails loudly instead of
+reporting a fast wrong number. MLX is a measuring stick here, not a backend: it fuses the launch-
+bound KDA scan (~2-3x on this hardware) and its SDPA runs sequence lengths where PyTorch's MPS
+kernel runs out of memory, which makes it the practical way to check long-context behaviour
+locally before renting a GPU.
+
 Running on a vast.ai GPU:
 
 vast_train.py runs the same prepare -> train -> sft_prepare -> sft -> dpo_prepare -> dpo chain on a rented vast.ai instance (plain ssh + rsync — no serverless glue). One-time setup:
