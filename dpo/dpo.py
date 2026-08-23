@@ -26,8 +26,9 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import load_bin, load_bin_u8
-from core.model import Transformer
+from core.model import LOGIT_SOFTCAP, Transformer
 from core.tokenizer import BPETokenizer
+from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
 from sft.finetune import make_sft_optimizers
 
@@ -77,18 +78,33 @@ def build_batch(tokens, masks, pairs, pair_ids, max_len, pad_id, device):
             attn)
 
 
-def sequence_logprobs(model, ids_in, targets, loss_mask, attn_mask, autocast_device):
+def sequence_logprobs(model, ids_in, targets, loss_mask, attn_mask, autocast_device,
+                      ce_chunk=16384):
     """Mean log p(target | prompt) over completion tokens, per sequence.
 
     Length-normalized (sum / completion-token count) so longer completions
     don't accumulate more negative log-prob (SimPO, arXiv:2405.14734);
-    padding-invariant, since pads are excluded from both sum and count."""
+    padding-invariant, since pads are excluded from both sum and count.
+
+    Completion rows are selected before the LM head and each sequence's rows
+    are scored by the chunked kernel, whose mean is exactly this
+    length-normalized log-prob. The (2B, T, V) logits and the fp32 log-softmax
+    over them are never built."""
     with torch.autocast(device_type=autocast_device.type, dtype=torch.bfloat16):
-        logits = model(ids_in, attn_mask)
-    logp = torch.log_softmax(logits.float(), dim=-1)
-    tok_logp = logp.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-    counts = loss_mask.sum(dim=-1).clamp(min=1)
-    return (tok_logp * loss_mask).sum(dim=-1) / counts
+        hidden = model.decoder(ids_in, attn_mask)
+        keep = loss_mask.reshape(-1)
+        rows = hidden.reshape(-1, hidden.size(-1))[keep]
+        tgt = targets.reshape(-1)[keep]
+        out, lo = [], 0
+        for count in loss_mask.sum(dim=-1).tolist():
+            # a sequence with no completion tokens scores 0, as the old
+            # sum-over-clamped-count did
+            out.append(-chunked_cross_entropy(rows[lo:lo + count], model.out.weight,
+                                              model.out.bias, tgt[lo:lo + count],
+                                              LOGIT_SOFTCAP, ce_chunk)
+                       if count else rows.new_zeros(()))
+            lo += count
+        return torch.stack(out)
 
 
 def dpo_loss_and_metrics(policy_logps, ref_logps, beta):
