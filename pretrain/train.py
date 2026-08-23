@@ -462,6 +462,7 @@ def main():
         'unet_skips': bool(getattr(opt, 'unet_skips', 0)),
         'attn_res': getattr(opt, 'attn_res', 0) or 0,
         'kda': getattr(opt, 'kda', 0) or 0,
+        'swa': getattr(opt, 'swa', 0) or 0,
         'grad_ckpt': bool(getattr(opt, 'grad_ckpt', 0)),
     }
 
