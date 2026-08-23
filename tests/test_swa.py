@@ -49,6 +49,32 @@ def test_window_two_blocks_matches_dense_band():
     assert torch.allclose(out, _dense_window(q, k, v, W), atol=1e-5)
 
 
+def test_window_attention_handles_a_ragged_last_block():
+    """T need not be a multiple of W -- the feeders serve seqlen - 1 tokens."""
+    q, k, v = _qkv(T=55, seed=11)
+    W = 16
+    out = window_attention(q, k, v, W, window_block_mask(W, q.device), enable_gqa=True)
+    assert torch.allclose(out, _dense_window(q, k, v, W), atol=1e-5)
+
+
+def test_window_attention_ragged_with_segments():
+    q, k, v = _qkv(T=55, seed=12)
+    B, W = q.size(0), 16
+    seg = (torch.arange(55) // 21).expand(B, 55).contiguous()
+    out = window_attention(q, k, v, W, window_block_mask(W, q.device, seg),
+                           enable_gqa=True)
+    assert torch.allclose(out, _dense_window(q, k, v, W, seg), atol=1e-5)
+
+
+def test_model_swa_ragged_seqlen_backward():
+    B, T, W, V = 2, 55, 16, 48
+    m = _model(W, kda=2, seed=13).train()
+    seg = (torch.arange(T) // 21).expand(B, T).contiguous()
+    m(torch.randint(0, V, (B, T)), None, seg_ids=seg).float().mean().backward()
+    grads = [p.grad for p in m.parameters() if p.requires_grad]
+    assert all(g is not None and torch.isfinite(g).all() for g in grads)
+
+
 def _model(swa, vocab=48, d_model=32, N=4, heads=4, kv_heads=2, kda=0, seed=0):
     torch.manual_seed(seed)
     return Transformer(vocab, d_model, N, heads, 0.0, kv_heads=kv_heads,

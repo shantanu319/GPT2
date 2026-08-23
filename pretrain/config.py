@@ -55,7 +55,7 @@ def parse_args():
                         help='Sliding-window attention (model.py): full-attention '
                              'layers attend only the last N tokens, so with -kda '
                              'the whole stack is linear in sequence length '
-                             '(0 = global attention; seqlen must be a multiple of N)')
+                             '(0 = global attention)')
     parser.add_argument('-shuffle', type=int, default=1,
                         help='Serve train windows in a seeded-permuted order per pass')
     parser.add_argument('-doc_mask', type=int, default=1,

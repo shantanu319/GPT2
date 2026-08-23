@@ -95,6 +95,7 @@ def window_block_mask(window, device, seg_ids=None):
     tail = ((j > i[:, None]) & (j <= i[:, None] + window))[None, None]
     if seg_ids is None:
         return tail[..., window:], tail
+    seg_ids = F.pad(seg_ids, (0, -seg_ids.size(1) % window), value=-1)
     q_seg = seg_ids.unflatten(1, (-1, window))            # (B, nb, W)
     k_seg = seg_ids.unfold(1, 2 * window, window)         # (B, nb-1, 2W)
     head = tail[..., window:] & (q_seg[:, :1, :, None] == q_seg[:, :1, None, :])
@@ -104,14 +105,17 @@ def window_block_mask(window, device, seg_ids=None):
 
 def window_attention(q, k, v, window, masks, dropout_p=0.0, enable_gqa=False):
     """Sliding-window attention: every query attends the `window` keys ending
-    at itself, at O(T*W) cost instead of O(T^2). Needs T a multiple of, and
-    larger than, `window`.
+    at itself, at O(T*W) cost instead of O(T^2). Needs T > window.
 
     Queries are cut into W-wide blocks and each block reads one 2W-key span, so
-    the whole thing is two batched SDPA calls over short sequences."""
+    the whole thing is two batched SDPA calls over short sequences. A ragged
+    last block is padded out and sliced off again -- the padding sits in the
+    future of every real query, so nothing attends it."""
     B, H, T, D = q.shape
-    nb = T // window
     head_mask, tail_mask = masks
+    if T % window:
+        q, k, v = (F.pad(x, (0, 0, 0, -T % window)) for x in (q, k, v))
+    nb = q.size(2) // window
 
     def cut(x, start, width):
         # One span per query block past the first: block b covers
@@ -126,7 +130,7 @@ def window_attention(q, k, v, window, masks, dropout_p=0.0, enable_gqa=False):
         cut(q, window, window), cut(k, 0, 2 * window), cut(v, 0, 2 * window),
         attn_mask=tail_mask, dropout_p=dropout_p, enable_gqa=enable_gqa)
     rest = rest.view(B, nb - 1, H, window, D).transpose(1, 2).reshape(B, H, -1, D)
-    return torch.cat((first, rest), dim=2)
+    return torch.cat((first, rest), dim=2)[:, :, :T]
 
 
 class MultiHeadAttention(nn.Module):
@@ -414,7 +418,6 @@ class Decoder(nn.Module):
             mha = next((l.attn_1 for l in self.layers if not l.is_kda), None)
             rope = mha.rope_tables(pos_ids) if mha is not None else None
         if windowed:
-            assert T % self.swa == 0, f"seqlen {T} must be a multiple of swa={self.swa}"
             mask = window_block_mask(self.swa, trg.device, seg_ids)
         x0 = x = self.embed(trg)
         half = (self.N + 1) // 2
