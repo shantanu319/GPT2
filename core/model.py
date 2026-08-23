@@ -439,10 +439,13 @@ def model_from_checkpoint(ckpt, device, dtype=None):
     return model.to(device=device, dtype=dtype).eval()
 
 
-def nopeak_mask(size, device):
-    mask = torch.triu(torch.ones(size, size, device=device), diagonal=1).unsqueeze(0)
-    mask = (mask == 0)
-    return mask
+def nopeak_mask(size, device, start_pos=0):
+    """(1, size, start_pos + size) bool mask (True = attend): query i may see
+    every key up to start_pos + i. start_pos > 0 covers a chunk fed into an
+    existing KV cache; start_pos = 0 is the square causal mask."""
+    keys = torch.arange(start_pos + size, device=device)
+    queries = torch.arange(size, device=device) + start_pos
+    return (keys[None, :] <= queries[:, None]).unsqueeze(0)
 
 
 def segment_mask(seg_ids):

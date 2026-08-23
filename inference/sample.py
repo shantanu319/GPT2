@@ -55,11 +55,12 @@ def _sample_next(logits, temperature, top_p):
     return (probs.log() - (-u.log()).log()).argmax(-1).view(1, 1)
 
 
-def prefill_logits(model, ids, device):
-    """Batched prefill from start_pos=0. Returns logits for the final token."""
+def prefill_logits(model, ids, device, start_pos=0):
+    """Feed `ids` into the KV cache at start_pos in one batched forward.
+    Returns logits for the final token."""
     x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
-    mask = nopeak_mask(x.size(1), device)
-    return model(x, mask, start_pos=0)[:, -1, :]
+    mask = nopeak_mask(x.size(1), device, start_pos=start_pos)
+    return model(x, mask, start_pos=start_pos)[:, -1, :]
 
 
 @torch.no_grad()

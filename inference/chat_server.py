@@ -45,12 +45,6 @@ def _resolve_device(no_cuda):
     return torch.device("cpu")
 
 
-def _decode_one(model, tok_id, start_pos, device):
-    """Run a single token through the model using the existing cache."""
-    x = torch.tensor([[tok_id]], dtype=torch.long, device=device)
-    return model(x, None, start_pos=start_pos)[:, -1, :]
-
-
 @torch.no_grad()
 def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
                   max_tokens, temperature, top_p, max_context, device,
@@ -75,13 +69,11 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
         last_logits = prefill_logits(model, new_prompt_ids, device)
         cache_len = len(new_prompt_ids)
     else:
-        # Multi-turn continuation: advance the cache one new-prompt token at a time.
-        # Simpler than building a rectangular causal mask for batched prefill; cost
-        # is len(new_prompt_ids) single-token forwards, bounded by prompt length.
-        last_logits = None
-        for tok in new_prompt_ids:
-            last_logits = _decode_one(model, tok, cache_len, device)
-            cache_len += 1
+        # Multi-turn continuation: extend the cache with the whole new prompt in
+        # one forward, under a rectangular causal mask over cache + prompt.
+        last_logits = prefill_logits(model, new_prompt_ids, device,
+                                     start_pos=cache_len)
+        cache_len += len(new_prompt_ids)
 
     stop_ids = set(stop_ids or ())
     if eos_id is not None:
