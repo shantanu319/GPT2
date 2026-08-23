@@ -55,8 +55,8 @@ def main():
 
     tokenizer = BPETokenizer()
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
-    seed = tokenizer.encode(args.prompt)
-    ids = (seed * (args.prompt_tokens // len(seed) + 1))[:args.prompt_tokens]
+    encoded = tokenizer.encode(args.prompt)
+    ids = (encoded * (args.prompt_tokens // len(encoded) + 1))[:args.prompt_tokens]
 
     ckpt = load_checkpoint(args.checkpoint)
     cfg = ckpt['config']

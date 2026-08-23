@@ -30,9 +30,9 @@ class Embedder(nn.Module):
 
 
 class MultiHeadAttention(nn.Module):
-    """GQA + QK-norm + partial RoPE, with a preallocated KV cache keyed by
-    recurrence pass (depth-looped layers are distinct positions in the
-    unrolled stack, so they need separate caches)."""
+    """GQA + QK-norm + partial RoPE, with a KV cache keyed by recurrence pass
+    (depth-looped layers are distinct positions in the unrolled stack, so they
+    need separate caches)."""
 
     def __init__(self, heads, d_model, kv_heads=None, rope_frac=0.5):
         super().__init__()
