@@ -223,18 +223,38 @@ def test_data_feeder_masked_alignment():
     assert m[0].long().tolist() == [(i % 2) for i in range(1, 10)]
 
 
+def _softcapped(hidden, weight):
+    from core.model import LOGIT_SOFTCAP
+    return LOGIT_SOFTCAP * torch.tanh((hidden @ weight.T) / LOGIT_SOFTCAP)
+
+
 def test_masked_loss_ignores_unmasked():
     from sft.finetune import masked_loss
-    V = 10
-    pred = torch.randn(1, 4, V)
+    V, d = 10, 6
+    torch.manual_seed(0)
+    hidden = torch.randn(1, 4, d)
+    weight = torch.randn(V, d)
     target = torch.randint(0, V, (1, 4))
-    mask_keep = torch.tensor([[1, 1, 1, 1]], dtype=torch.bool)
     mask_one = torch.tensor([[1, 0, 0, 0]], dtype=torch.bool)
-    full = masked_loss(pred, target, mask_keep, V)
-    single = masked_loss(pred, target, mask_one, V)
-    expected = F.cross_entropy(pred[0, :1], target[0, :1])
-    assert torch.allclose(single, expected, atol=1e-6)
-    assert full != pytest.approx(single.item()) or True
+    expected = F.cross_entropy(_softcapped(hidden[0, :1], weight), target[0, :1])
+    assert torch.allclose(masked_loss(hidden, weight, target, mask_one, 0),
+                          expected, atol=1e-6)
+
+
+def test_masked_loss_matches_masking_after_the_lm_head():
+    """Selecting rows before the LM head must give the same number as scoring
+    every token and averaging over the masked ones."""
+    from sft.finetune import masked_loss
+    V, d = 32, 8
+    torch.manual_seed(1)
+    hidden = torch.randn(2, 9, d)
+    weight = torch.randn(V, d)
+    target = torch.randint(0, V, (2, 9))
+    mask = torch.rand(2, 9) < 0.4
+    per_token = F.cross_entropy(_softcapped(hidden, weight).view(-1, V),
+                                target.reshape(-1), reduction='none')
+    ref = (per_token * mask.reshape(-1)).sum() / mask.sum()
+    assert torch.allclose(masked_loss(hidden, weight, target, mask, 0), ref, atol=1e-6)
 
 
 def test_sft_encode_conversation_masks_assistant():
