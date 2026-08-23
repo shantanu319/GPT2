@@ -23,7 +23,8 @@ import torch
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
 from core.model import load_checkpoint
 from core.tokenizer import BPETokenizer
-from inference.sample import build_backend, decode_loop, reprefill_window
+from inference.sample import (BACKENDS, build_backend, checkpoint_params,
+                              decode_loop, reprefill_window)
 
 
 def log(msg):
@@ -85,9 +86,9 @@ def main():
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--no-cuda', action='store_true')
-    parser.add_argument('--backend', choices=('torch', 'mlx'), default='torch',
-                        help='Inference runtime: torch (CUDA/MPS/CPU) or MLX '
-                             '(Apple silicon)')
+    parser.add_argument('--backend', choices=BACKENDS, default='torch',
+                        help='Inference runtime: torch (CUDA/MPS/CPU), or MLX on '
+                             'Apple silicon, optionally 4- or 8-bit quantized')
     parser.add_argument('--raw', action='store_true',
                         help='Disable the chat template (raw LM continuation), '
                              'e.g. for pretrain-only checkpoints')
@@ -105,7 +106,7 @@ def main():
         return
     model, backend, label = build_backend(ckpt, args.backend, args.no_cuda)
     log(f"backend: {label}")
-    log(f"model loaded: {backend.param_count(model):,} params")
+    log(f"model loaded: {checkpoint_params(ckpt):,} params")
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
     im_end_id = tokenizer.special_tokens.get(IM_END)

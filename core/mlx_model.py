@@ -13,6 +13,7 @@ from core.model import LOGIT_SOFTCAP, _round_to_multiple
 
 MAX_SEQ_LEN = 4096  # KV-cache capacity, matching the torch RoPE table
 ROPE_BASE = 10000.0
+QUANT_GROUP = 64    # weights per shared scale when --backend mlx:4 / mlx:8
 
 
 def _rms_norm(d_model):
@@ -220,12 +221,22 @@ class Transformer(nn.Module):
             layer.attn_1.reset_cache()
 
 
-def model_from_checkpoint(ckpt, dtype=mx.bfloat16):
+def _quantizable(_path, module):
+    """Linear/Embedding whose rows hold a whole number of quantization groups.
+    KDA's low-rank projections are narrower than one group and stay in dtype."""
+    weight = getattr(module, 'weight', None)
+    return (hasattr(module, 'to_quantized') and weight is not None
+            and weight.shape[-1] % QUANT_GROUP == 0)
+
+
+def model_from_checkpoint(ckpt, dtype=mx.bfloat16, quantize=0):
     """Rebuild an MLX Transformer from a torch checkpoint's saved config.
 
     The state dict is handed over under its own keys — the module tree is
     identical — and the tied head is re-pointed at the embedding table
-    afterwards so the duplicate copy load_weights made is dropped."""
+    afterwards so the duplicate copy load_weights made is dropped.
+
+    quantize (4 or 8) trades accuracy for a smaller, faster weight read."""
     cfg = ckpt['config']
     model = Transformer(
         vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
@@ -238,5 +249,8 @@ def model_from_checkpoint(ckpt, dtype=mx.bfloat16):
     model.load_weights([(k, mx.array(v.numpy()).astype(dtype))
                         for k, v in ckpt['model'].items()])
     model.out.weight = model.decoder.embed.embed.weight
+    if quantize:
+        nn.quantize(model, group_size=QUANT_GROUP, bits=quantize,
+                    class_predicate=_quantizable)
     mx.eval(model.parameters())
     return model

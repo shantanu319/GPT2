@@ -2,7 +2,6 @@
 decode_loop calls, so the loop, its stop-token accounting, and its KV-window
 policy are shared with the torch backend rather than reimplemented."""
 import mlx.core as mx
-from mlx.utils import tree_flatten
 
 
 def top_p_filter(probs, top_p):
@@ -62,7 +61,3 @@ class MLXBackend:
         eval, so a plain stream synchronize would return immediately."""
         mx.eval(x)
 
-    def param_count(self, model):
-        # Keyed by id: the tied head and the embedding table are one array.
-        params = {id(a): a for _, a in tree_flatten(model.parameters())}
-        return sum(a.size for a in params.values())

@@ -95,19 +95,28 @@ class TorchBackend:
         if self.device.type != 'cpu':
             getattr(torch, self.device.type).synchronize()
 
-    def param_count(self, model):
-        return sum(p.numel() for p in model.parameters())
+
+BACKENDS = ('torch', 'mlx', 'mlx:4', 'mlx:8')
 
 
 def build_backend(ckpt, backend='torch', no_cuda=False):
     """(model, backend, label) for the requested runtime: 'mlx' rebuilds the
-    checkpoint on Apple's MLX, anything else runs torch on the best device."""
-    if backend == 'mlx':
+    checkpoint on Apple's MLX, with 'mlx:4' / 'mlx:8' quantizing the weights to
+    that many bits on the way in; anything else runs torch on the best device."""
+    name, _, bits = backend.partition(':')
+    if name == 'mlx':
         from core.mlx_model import model_from_checkpoint as mlx_from_checkpoint
         from inference.mlx_sample import MLXBackend
-        return mlx_from_checkpoint(ckpt), MLXBackend(), 'mlx'
+        return mlx_from_checkpoint(ckpt, quantize=int(bits or 0)), MLXBackend(), backend
     device = _resolve_device(no_cuda)
     return model_from_checkpoint(ckpt, device), TorchBackend(device), str(device)
+
+
+def checkpoint_params(ckpt):
+    """Parameter count, deduped by storage: the tied head and the embedding
+    table are saved under two keys over one tensor."""
+    unique = {t.data_ptr(): t for t in ckpt['model'].values()}
+    return sum(t.numel() for t in unique.values())
 
 
 @torch.no_grad()
@@ -209,9 +218,9 @@ def main():
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--no-cuda', action='store_true')
-    parser.add_argument('--backend', choices=('torch', 'mlx'), default='torch',
-                        help='Inference runtime: torch (CUDA/MPS/CPU) or MLX '
-                             '(Apple silicon)')
+    parser.add_argument('--backend', choices=BACKENDS, default='torch',
+                        help='Inference runtime: torch (CUDA/MPS/CPU), or MLX on '
+                             'Apple silicon, optionally 4- or 8-bit quantized')
     parser.add_argument('--no-kv-cache', action='store_true',
                         help='Disable KV cache (re-feed full context each step). '
                              'Temporary: used to verify KV-cache correctness.')

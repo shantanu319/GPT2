@@ -46,7 +46,7 @@ struct Args {
     #[arg(long)]
     no_cuda: bool,
 
-    #[arg(long, default_value = "torch", value_parser = ["torch", "mlx"])]
+    #[arg(long, default_value = "torch", value_parser = ["torch", "mlx", "mlx:4", "mlx:8"])]
     backend: String,
 }
 
