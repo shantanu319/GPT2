@@ -196,20 +196,6 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     return o, S
 
 
-class _RMSNorm(nn.Module):
-    """Mirror of core.model.RMSNorm (duplicated to keep this module import-
-    cycle-free); eps follows fla's FusedRMSNormGated."""
-
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
-
-    def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight * x * rms
-
-
 class KimiDeltaAttention(nn.Module):
     """KDA layer. Same role as MultiHeadAttention but with a constant-size
     recurrent state instead of a growing KV cache, and no positional encoding
@@ -249,7 +235,7 @@ class KimiDeltaAttention(nn.Module):
             nn.Linear(d_model, self.d_k, bias=False),
             nn.Linear(self.d_k, d_model, bias=True),
         )
-        self.o_norm = _RMSNorm(self.d_k)
+        self.o_norm = nn.RMSNorm(self.d_k, eps=1e-5)  # eps follows fla's FusedRMSNormGated
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
 
         self.s_cache = {}  # recurrence states keyed by recurrence-pass index

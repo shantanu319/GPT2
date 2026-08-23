@@ -56,15 +56,13 @@ def apply_partial_rope(x, cos, sin, rot_dim):
     return torch.cat((apply_rope(x_rot, cos, sin), x_pass), dim=-1)
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-6):
-        super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(d_model))
+class RMSNorm(nn.RMSNorm):
+    """torch's fused RMSNorm at this model's eps. The fused kernel also
+    reduces in fp32, so it is both faster and more accurate under bf16 than
+    computing the mean square in the input dtype."""
 
-    def forward(self, x):
-        rms = torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-        return self.weight * x * rms
+    def __init__(self, d_model, eps=1e-6):
+        super().__init__(d_model, eps=eps)
 
 
 def attention(q, k, v, mask=None, dropout_p=0.0, is_causal=False):
