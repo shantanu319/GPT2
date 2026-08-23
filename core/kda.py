@@ -196,6 +196,24 @@ def kda_chunk(q, k, v, g, beta, initial_state=None, chunk_size=64, seg_ids=None)
     return o, S
 
 
+def kda_scan(q, k, v, g, beta, initial_state=None, chunk_size=64):
+    """kda_chunk over the leading whole chunks, kda_recurrence for the ragged
+    tail. Same result as running the recurrence over the whole span, but the
+    sequential part is the tail rather than every position -- which is what a
+    cached prefill of T tokens would otherwise cost."""
+    T = q.shape[1]
+    full = T - T % chunk_size
+    if not full:
+        return kda_recurrence(q, k, v, g, beta, initial_state=initial_state)
+    head = (x[:, :full] for x in (q, k, v, g, beta))
+    o, S = kda_chunk(*head, initial_state=initial_state, chunk_size=chunk_size)
+    if full < T:
+        tail = (x[:, full:] for x in (q, k, v, g, beta))
+        o_tail, S = kda_recurrence(*tail, initial_state=S)
+        o = torch.cat((o, o_tail), dim=1)
+    return o, S
+
+
 class KimiDeltaAttention(nn.Module):
     """KDA layer. Same role as MultiHeadAttention but with a constant-size
     recurrent state instead of a growing KV cache, and no positional encoding
@@ -261,8 +279,8 @@ class KimiDeltaAttention(nn.Module):
             else:
                 o, _ = kda_recurrence(q, k, v, g, beta, seg_ids=seg_ids)
         else:
-            S = self.s_cache.get(cache_idx)
-            o, S = kda_recurrence(q, k, v, g, beta, initial_state=S)
+            o, S = kda_scan(q, k, v, g, beta, initial_state=self.s_cache.get(cache_idx),
+                            chunk_size=self.chunk_size)
             self.s_cache[cache_idx] = S
 
         o = o.to(x.dtype)

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn.functional as F
 
-from core.kda import KimiDeltaAttention, kda_chunk, kda_recurrence
+from core.kda import KimiDeltaAttention, kda_chunk, kda_recurrence, kda_scan
 from core.model import Transformer, get_model, nopeak_mask
 
 
@@ -321,3 +321,31 @@ def test_chunk_grads_finite_under_steep_decay():
     (o.sum() + S.sum()).backward()
     for name, t in zip(('q', 'k', 'v', 'g', 'beta'), (q, k, v, g, beta)):
         assert torch.isfinite(t.grad).all(), f"non-finite grad for {name}"
+
+
+def test_scan_matches_recurrence_including_a_ragged_tail():
+    """The cached path chunks the leading whole chunks and walks only the
+    ragged tail, so it has to equal the plain recurrence for any T -- carried
+    state included."""
+    S0 = torch.randn(2, 3, 16, 16, generator=torch.Generator().manual_seed(5)) * 0.1
+    for T in (64, 100, 192):
+        q, k, v, g, beta = _inputs(T=T, seed=T)
+        o_ref, S_ref = kda_recurrence(q, k, v, g, beta, initial_state=S0)
+        o, S = kda_scan(q, k, v, g, beta, initial_state=S0, chunk_size=64)
+        assert torch.allclose(o, o_ref, atol=1e-4, rtol=1e-4), T
+        assert torch.allclose(S, S_ref, atol=1e-4, rtol=1e-4), T
+
+
+def test_kda_cached_prefill_matches_token_by_token_decode():
+    """Prefilling a span in one call and feeding it a token at a time have to
+    leave the layer in the same place and emit the same outputs."""
+    torch.manual_seed(0)
+    layer = KimiDeltaAttention(d_model=32, heads=4).eval()
+    x = torch.randn(1, 100, 32)
+    with torch.no_grad():
+        layer.reset_cache()
+        whole = layer(x, start_pos=0)
+        layer.reset_cache()
+        stepped = torch.cat([layer(x[:, i:i + 1], start_pos=i) for i in range(x.size(1))],
+                            dim=1)
+    assert torch.allclose(whole, stepped, atol=1e-4)
