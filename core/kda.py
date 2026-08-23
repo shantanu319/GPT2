@@ -11,6 +11,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+try:
+    from core import kda_triton
+except ImportError:   # no triton outside CUDA builds
+    kda_triton = None
+
 
 def kda_recurrence(q, k, v, g, beta, initial_state=None, seg_ids=None):
     """Sequential KDA scan in fp32 — the reference path, also used for cached
@@ -129,6 +134,8 @@ def chunk_scan(u, w, qg, Aqk, kg, dec, initial_state):
     u, Aqk: [B,H,NT,BT,V] / [B,H,NT,BT,BT]; w, qg, kg: [B,H,NT,BT,K];
     dec: [B,H,NT,K] the chunk's total decay; initial_state: [B,H,K,V] or None.
     Returns (o [B,H,NT,BT,V], S [B,H,K,V])."""
+    if kda_triton is not None and kda_triton.supported(u, w):
+        return kda_triton.chunk_scan(u, w, qg, Aqk, kg, dec, initial_state)
     B, H, NT, _, K = w.shape
     S = u.new_zeros(B, H, K, u.size(-1))
     if initial_state is not None:
