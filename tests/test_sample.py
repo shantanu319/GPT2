@@ -46,6 +46,7 @@ class _ScriptedModel:
         self.vocab = vocab
         self.calls = 0
         self.resets = 0
+        self.prefills = 0   # calls fed more than one token, i.e. cache rebuilds
 
     def reset_cache(self):
         self.resets += 1
@@ -53,6 +54,8 @@ class _ScriptedModel:
     def __call__(self, x, mask=None, start_pos=None):
         nxt = self.script[self.calls % len(self.script)]
         self.calls += 1
+        if x.size(1) > 1:
+            self.prefills += 1
         logits = torch.full((1, x.size(1), self.vocab), -30.0)
         logits[:, -1, nxt] = 30.0
         return logits
@@ -103,3 +106,23 @@ def test_sample_next_stays_in_the_nucleus():
         tok = _sample_next(logits, temperature=1.0, top_p=0.9)
         assert tok.shape == (1, 1)
         assert tok.item() in (0, 1)
+
+
+def test_decode_loop_leaves_room_after_a_context_overflow():
+    """Rebuilding the cache right up to max_context leaves none: the next token
+    overflows again, and a re-prefill costs as much as tens of decode steps. A
+    long run past the window should rebuild a handful of times, not per token."""
+    from inference.sample import decode_loop, prefill_logits
+
+    dev = torch.device('cpu')
+    max_context, n_tokens = 32, 40
+    model = _ScriptedModel(list(range(1, 40)))
+    ids = list(range(1, max_context - 6))
+    logits = prefill_logits(model, ids, dev)
+    model.prefills = 0
+
+    n, cache_len = decode_loop(model, logits, ids, len(ids), n_tokens, 0.01, 1.0,
+                               max_context, dev, set())
+    assert n == n_tokens
+    assert cache_len <= max_context
+    assert model.prefills <= n_tokens // 4, model.prefills

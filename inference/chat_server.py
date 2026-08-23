@@ -23,7 +23,7 @@ import torch
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
 from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
-from inference.sample import decode_loop, prefill_logits
+from inference.sample import decode_loop, prefill_logits, reprefill_window
 
 
 def log(msg):
@@ -62,7 +62,7 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     # If adding this prompt overflows the window, drop cache and re-prefill the tail.
     if cache_len + len(new_prompt_ids) > max_context:
         model.reset_cache()
-        window = context_ids[-(max_context - 1):]
+        window = reprefill_window(context_ids, max_context)
         last_logits = prefill_logits(model, window, device)
         cache_len = len(window)
     elif cache_len == 0:

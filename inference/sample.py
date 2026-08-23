@@ -55,6 +55,15 @@ def _sample_next(logits, temperature, top_p):
     return (probs.log() - (-u.log()).log()).argmax(-1).view(1, 1)
 
 
+def reprefill_window(ids, max_context):
+    """Tail of `ids` to rebuild the KV cache from after an overflow.
+
+    Rebuilding right up to max_context leaves no room: the very next token
+    overflows again, and a re-prefill costs as much as tens of decode steps.
+    Leaving a quarter of the window free amortizes it over that many tokens."""
+    return ids[-(max_context * 3 // 4):]
+
+
 def prefill_logits(model, ids, device, start_pos=0):
     """Feed `ids` into the KV cache at start_pos in one batched forward.
     Returns logits for the final token."""
@@ -99,7 +108,7 @@ def decode_loop(model, last_logits, ids, cache_len, max_tokens, temperature,
             if stopped:
                 break
             model.reset_cache()
-            window = ids[-(max_context - 1):]
+            window = reprefill_window(ids, max_context)
             last_logits = prefill_logits(model, window, device)
             cache_len = len(window)
         tok = _sample_next(last_logits, temperature, top_p)
