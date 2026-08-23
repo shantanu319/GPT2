@@ -134,21 +134,37 @@ def make_dpo_optimizers(model, muon_lr, adamw_lr):
     return [adamw]
 
 
+def batches(tokens, masks, pairs, args, device, max_batches=None):
+    """Yield (index, batch) for the deterministic pass over `pairs`, skipping
+    degenerate ones. Every epoch sees exactly this sequence."""
+    n = max(1, len(pairs) // args.batchsize)
+    for i in range(n if max_batches is None else min(n, max_batches)):
+        pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
+        batch = build_batch(tokens, masks, pairs, pair_ids, args.max_len,
+                            args.pad_id, device)
+        if batch is not None:
+            yield i, batch
+
+
 @torch.no_grad()
-def validate(policy, ref, tokens, masks, pairs, args, device, max_batches=50):
+def reference_logprobs(ref, tokens, masks, pairs, args, device, max_batches=None):
+    """Reference log-probs for every batch, computed once.
+
+    The reference model is frozen and the pass over the pairs is
+    deterministic, so recomputing this each epoch reproduces the same numbers;
+    sequence_logprobs is padding-invariant, so a batch's values do not depend
+    on how the pairs were grouped either."""
+    return {i: sequence_logprobs(ref, *batch, device)
+            for i, batch in batches(tokens, masks, pairs, args, device, max_batches)}
+
+
+@torch.no_grad()
+def validate(policy, ref_logps, tokens, masks, pairs, args, device, max_batches=50):
     policy.eval()
     total_loss, total_margin, total_acc, count = 0.0, 0.0, 0.0, 0
-    num_batches = max(1, len(pairs) // args.batchsize)
-    pad_id = args.pad_id
-    for i in range(min(num_batches, max_batches)):
-        pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
-        batch = build_batch(tokens, masks, pairs, pair_ids,
-                            args.max_len, pad_id, device)
-        if batch is None:
-            continue
+    for i, batch in batches(tokens, masks, pairs, args, device, max_batches):
         pi = sequence_logprobs(policy, *batch, device)
-        rf = sequence_logprobs(ref, *batch, device)
-        loss, margin, acc = dpo_loss_and_metrics(pi, rf, args.beta)
+        loss, margin, acc = dpo_loss_and_metrics(pi, ref_logps[i], args.beta)
         total_loss += loss.item()
         total_margin += margin
         total_acc += acc
@@ -233,24 +249,24 @@ def main():
     os.makedirs(save_dir, exist_ok=True)
 
     policy.train()
+    print("precomputing reference log-probs...")
+    train_ref = reference_logprobs(ref, train_tokens, train_masks, train_pairs,
+                                   args, device)
+    val_ref = reference_logprobs(ref, val_tokens, val_masks, val_pairs, args,
+                                 device, max_batches=50)
+    del ref  # every reference number is in hand; the weights are dead weight now
+    print(f"  {len(train_ref)} train batches, {len(val_ref)} val batches cached")
+
     step = 0
     for epoch in range(args.epochs):
-        for i in range(batches_per_epoch):
-            pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
-            batch = build_batch(train_tokens, train_masks, train_pairs, pair_ids,
-                                args.max_len, args.pad_id, device)
-            if batch is None:
-                continue
-
+        for i, batch in batches(train_tokens, train_masks, train_pairs, args, device):
             factor = lr_factor(step, total_steps, warmup_steps=args.warmup_steps)
             for opt in optimizers:
                 for group in opt.param_groups:
                     group['lr'] = group['peak_lr'] * factor
 
             pi = sequence_logprobs(policy, *batch, device)
-            with torch.no_grad():
-                rf = sequence_logprobs(ref, *batch, device)
-            loss, margin, acc = dpo_loss_and_metrics(pi, rf, args.beta)
+            loss, margin, acc = dpo_loss_and_metrics(pi, train_ref[i], args.beta)
 
             for opt in optimizers:
                 opt.zero_grad()
@@ -268,11 +284,11 @@ def main():
                 save_checkpoint(policy, optimizers, step, path, config=cfg)
                 print(f"saved {path}")
             if args.val_every and step % args.val_every == 0:
-                validate(policy, ref, val_tokens, val_masks, val_pairs, args, device)
+                validate(policy, val_ref, val_tokens, val_masks, val_pairs, args, device)
 
     final = os.path.join(save_dir, 'dpo_final.pt')
     save_checkpoint(policy, optimizers, step, final, config=cfg)
-    validate(policy, ref, val_tokens, val_masks, val_pairs, args, device)
+    validate(policy, val_ref, val_tokens, val_masks, val_pairs, args, device)
     print(f"saved final DPO checkpoint: {final}")
 
 
