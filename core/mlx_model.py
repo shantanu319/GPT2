@@ -11,7 +11,7 @@ import mlx.nn as nn
 from core.mlx_kda import KimiDeltaAttention
 from core.model import LOGIT_SOFTCAP, _round_to_multiple
 
-MAX_SEQ_LEN = 4096  # KV-cache capacity, matching the torch RoPE table
+CACHE_STEP = 256    # KV cache grows in blocks of this many positions
 ROPE_BASE = 10000.0
 QUANT_GROUP = 64    # weights per shared scale when --backend mlx:4 / mlx:8
 
@@ -59,11 +59,19 @@ class MultiHeadAttention(nn.Module):
         self._v_cache = {}
 
     def _cache(self, idx, start_pos, k, v):
-        if idx not in self._k_cache:
-            shape = (k.shape[0], self.h_kv, MAX_SEQ_LEN, self.d_k)
-            self._k_cache[idx] = mx.zeros(shape, dtype=k.dtype)
-            self._v_cache[idx] = mx.zeros(shape, dtype=k.dtype)
+        """Append k/v at start_pos and return the cache up to that point.
+
+        Grown a block at a time rather than preallocated to the context limit:
+        a slice assignment costs the whole buffer, not the slice, so an
+        oversized cache is paid for again on every decode step."""
         end = start_pos + k.shape[2]
+        held = self._k_cache[idx].shape[2] if idx in self._k_cache else 0
+        if held < end:
+            shape = (k.shape[0], self.h_kv,
+                     _round_to_multiple(end, CACHE_STEP) - held, self.d_k)
+            for cache in (self._k_cache, self._v_cache):
+                pad = mx.zeros(shape, dtype=k.dtype)
+                cache[idx] = mx.concatenate([cache[idx], pad], axis=2) if held else pad
         self._k_cache[idx][:, :, start_pos:end] = k
         self._v_cache[idx][:, :, start_pos:end] = v
         return self._k_cache[idx][:, :, :end], self._v_cache[idx][:, :, :end]
