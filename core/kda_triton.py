@@ -23,11 +23,13 @@ STAGES = 1        # the loop is serially dependent, so there is nothing to pipel
 # and at that width the live tiles spill, so it wants them spread four times
 # wider: measured on an A100, ieee at 4 warps is slower than the Python loop
 # it replaces and at 16 warps is 3.4x faster.
-_WARPS = {'tf32': (4, 8), 'ieee': (16, 32)}
+_WARPS = {'tf32': (4, 8, 4), 'ieee': (16, 32, 16)}
 
 
 def _plan(operands):
     """(tl.dot precision, warp counts) for this set of operands.
+
+    Warps are (forward, reverse scan, per-chunk gradients).
 
     Autocast leaves the scan a mix: the matmul-derived operands arrive bf16
     while the elementwise ones stay fp32. One low-precision operand caps the
@@ -74,13 +76,15 @@ def _scan_fwd(U, W, QG, A, KG, DEC, S0, O, SS, SN, NT,
 
 
 @triton.jit
-def _scan_bwd(U, W, QG, A, KG, DEC, SS, DO, DSN,
-              DU, DW, DQG, DA, DKG, DDEC, DS0, NT,
+def _scan_bwd(W, QG, A, KG, DEC, SS, DO, DSN, DU, DW, DSK, DS0, NT,
               BT: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
               HAS_DSN: tl.constexpr, PREC: tl.constexpr):
-    """Reverse scan. Mirrors _scan_fwd term by term; v is recomputed from the
-    saved entry state rather than kept, which is the cheaper half of the
-    trade against another [B,H,NT,BT,V] tensor."""
+    """Reverse scan: everything the carried gradient is on the path of.
+
+    Only du, dw and the carry itself need to be here. The rest of the chunk's
+    gradients depend on nothing that crosses a chunk boundary, so they are
+    left to _scan_bwd_local, which has NT times the programs to spread them
+    over -- this one is stuck at one program per (batch, head)."""
     bh = tl.program_id(0).to(tl.int64)
     rt, rk, rv = tl.arange(0, BT), tl.arange(0, K), tl.arange(0, V)
     state = rk[:, None] * V + rv[None, :]
@@ -91,41 +95,52 @@ def _scan_bwd(U, W, QG, A, KG, DEC, SS, DO, DSN,
         dS = tl.zeros((K, V), dtype=tl.float32)
 
     for j in range(NT):
-        i = NT - 1 - j
-        row = (bh * NT + i) * BT
-        sq = (bh * NT + i) * K
-        S = tl.load(SS + sq * V + state)
-        w = tl.load(W + (row + rt[:, None]) * K + rk[None, :]).to(tl.float32)
-        u = tl.load(U + (row + rt[:, None]) * V + rv[None, :]).to(tl.float32)
-        v = u - tl.dot(w, S, input_precision=PREC)
+        p = bh * NT + NT - 1 - j
+        row_k = (p * BT + rt[:, None]) * K + rk[None, :]
+        row_v = (p * BT + rt[:, None]) * V + rv[None, :]
+        tl.store(DSK + p * K * V + state, dS)
 
-        # what flows back through S_{i+1} = dec * S_i + kg^T v
-        kg = tl.load(KG + (row + rt[:, None]) * K + rk[None, :]).to(tl.float32)
-        dec = tl.load(DEC + sq + rk).to(tl.float32)
-        dv = tl.dot(kg, dS, input_precision=PREC)
-        tl.store(DKG + (row + rt[:, None]) * K + rk[None, :],
-                 tl.dot(v, tl.trans(dS), input_precision=PREC))
-        tl.store(DDEC + sq + rk, tl.sum(dS * S, 1))
-        carried = dec[:, None] * dS
+        do = tl.load(DO + row_v).to(tl.float32)
+        kg = tl.load(KG + row_k).to(tl.float32)
+        a = tl.load(A + (p * BT + rt[:, None]) * BT + rt[None, :]).to(tl.float32)
+        dv = (tl.dot(kg, dS, input_precision=PREC)
+              + tl.dot(tl.trans(a), do, input_precision=PREC))
+        tl.store(DU + row_v, dv)
 
-        # ... and through o_i = qg S_i + A v
-        do = tl.load(DO + (row + rt[:, None]) * V + rv[None, :]).to(tl.float32)
-        qg = tl.load(QG + (row + rt[:, None]) * K + rk[None, :]).to(tl.float32)
-        a = tl.load(A + (row + rt[:, None]) * BT + rt[None, :]).to(tl.float32)
-        tl.store(DQG + (row + rt[:, None]) * K + rk[None, :],
-                 tl.dot(do, tl.trans(S), input_precision=PREC))
-        tl.store(DA + (row + rt[:, None]) * BT + rt[None, :],
-                 tl.dot(do, tl.trans(v), input_precision=PREC))
-        dv += tl.dot(tl.trans(a), do, input_precision=PREC)
-
-        # ... and finally through v_i = u - w S_i, which needs the whole dv
-        tl.store(DU + (row + rt[:, None]) * V + rv[None, :], dv)
-        tl.store(DW + (row + rt[:, None]) * K + rk[None, :],
-                 -tl.dot(dv, tl.trans(S), input_precision=PREC))
-        dS = (carried + tl.dot(tl.trans(qg), do, input_precision=PREC)
+        S = tl.load(SS + p * K * V + state)
+        tl.store(DW + row_k, -tl.dot(dv, tl.trans(S), input_precision=PREC))
+        w = tl.load(W + row_k).to(tl.float32)
+        qg = tl.load(QG + row_k).to(tl.float32)
+        dec = tl.load(DEC + p * K + rk).to(tl.float32)
+        dS = (dec[:, None] * dS + tl.dot(tl.trans(qg), do, input_precision=PREC)
               - tl.dot(tl.trans(w), dv, input_precision=PREC))
 
     tl.store(DS0 + bh * K * V + state, dS)
+
+
+@triton.jit
+def _scan_bwd_local(U, W, SS, DO, DSK, DQG, DA, DKG, DDEC,
+                    BT: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+                    PREC: tl.constexpr):
+    """The rest of the chunk's gradients, one program per chunk. v is rebuilt
+    from the saved entry state rather than carried over from the forward."""
+    p = tl.program_id(0).to(tl.int64)
+    rt, rk, rv = tl.arange(0, BT), tl.arange(0, K), tl.arange(0, V)
+    state = rk[:, None] * V + rv[None, :]
+    row_k = (p * BT + rt[:, None]) * K + rk[None, :]
+    row_v = (p * BT + rt[:, None]) * V + rv[None, :]
+
+    S = tl.load(SS + p * K * V + state)
+    dS = tl.load(DSK + p * K * V + state)
+    w = tl.load(W + row_k).to(tl.float32)
+    v = tl.load(U + row_v).to(tl.float32) - tl.dot(w, S, input_precision=PREC)
+    do = tl.load(DO + row_v).to(tl.float32)
+
+    tl.store(DDEC + p * K + rk, tl.sum(dS * S, 1))
+    tl.store(DKG + row_k, tl.dot(v, tl.trans(dS), input_precision=PREC))
+    tl.store(DQG + row_k, tl.dot(do, tl.trans(S), input_precision=PREC))
+    tl.store(DA + (p * BT + rt[:, None]) * BT + rt[None, :],
+             tl.dot(do, tl.trans(v), input_precision=PREC))
 
 
 class _ChunkScan(torch.autograd.Function):
@@ -137,7 +152,7 @@ class _ChunkScan(torch.autograd.Function):
         o = torch.empty_like(u)
         SN = u.new_empty(B, H, K, V, dtype=torch.float32)
         save = any(ctx.needs_input_grad)
-        prec, (warps, _) = _plan((u, w, qg, a, kg, dec))
+        prec, (warps, _, _) = _plan((u, w, qg, a, kg, dec))
         SS = u.new_empty(B, H, NT, K, V, dtype=torch.float32) if save else o
         if S0 is not None:
             S0 = S0.contiguous()
@@ -158,12 +173,17 @@ class _ChunkScan(torch.autograd.Function):
         du, dw, dqg, da, dkg, ddec = (torch.empty_like(x)
                                       for x in (u, w, qg, a, kg, dec))
         dS0 = u.new_empty(B, H, K, V, dtype=torch.float32)
-        prec, (_, warps) = _plan((u, w, qg, a, kg, dec))
-        _scan_bwd[(B * H,)](u, w, qg, a, kg, dec, SS, do.contiguous(),
+        dSK = torch.empty_like(SS)   # the carried gradient entering each chunk
+        do = do.contiguous()
+        prec, (_, scan_warps, local_warps) = _plan((u, w, qg, a, kg, dec))
+        _scan_bwd[(B * H,)](w, qg, a, kg, dec, SS, do,
                             dSN.contiguous() if dSN is not None else u,
-                            du, dw, dqg, da, dkg, ddec, dS0, NT,
-                            BT=BT, K=K, V=V, HAS_DSN=dSN is not None,
-                            PREC=prec, num_warps=warps, num_stages=STAGES)
+                            du, dw, dSK, dS0, NT, BT=BT, K=K, V=V,
+                            HAS_DSN=dSN is not None, PREC=prec,
+                            num_warps=scan_warps, num_stages=STAGES)
+        _scan_bwd_local[(B * H * NT,)](u, w, SS, do, dSK, dqg, da, dkg, ddec,
+                                       BT=BT, K=K, V=V, PREC=prec,
+                                       num_warps=local_warps, num_stages=STAGES)
         return du, dw, dqg, da, dkg, ddec, dS0 if ctx.wants_s0 else None
 
 
