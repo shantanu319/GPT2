@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import uuid
 
 from vultr.api import (
     client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_live_plan,
@@ -67,6 +68,17 @@ def _confirm_instance_deleted(api, instance_id, attempts=12):
     raise RuntimeError(f"instance {instance_id} still exists after delete")
 
 
+def _find_instance_by_label(api, label, attempts=3):
+    for attempt in range(attempts):
+        instances = api.request("GET", "/instances?per_page=500").get("instances", [])
+        match = next((item for item in instances if item.get("label") == label), None)
+        if match:
+            return match
+        if attempt < attempts - 1:
+            time.sleep(2 ** attempt)
+    return None
+
+
 def provision(args, bootstrap_instance=True):
     api = client_from_env()
     if getattr(args, "compute", False):
@@ -84,29 +96,34 @@ def provision(args, bootstrap_instance=True):
     key_id = None
     key_created = False
     claimed = False
+    provisional = None
     state = None
     try:
         public_key = os.path.expanduser(args.ssh_public_key)
         key_id, key_created = ensure_ssh_key(api, public_key)
         claim_state()
         claimed = True
+        request_label = f"{args.label}-{uuid.uuid4().hex[:8]}"
+        provisional = {
+            "status": "provisioning", "label": request_label,
+            "ssh_private_key": args.ssh_private_key, "plan": plan["id"], "region": region,
+            "hourly_cost": plan["hourly_cost"], "gpu": plan.get("gpu_type", "CPU"),
+            "ssh_key_id": key_id, "ssh_key_created": key_created,
+        }
+        save_state(provisional)
         print(f"creating {plan['id']} in {region} (${plan['hourly_cost']:.3f}/hr)...")
         result = api.request("POST", "/instances", {
             "region": region,
             "plan": plan["id"],
             "os_id": args.os_id,
-            "label": args.label,
+            "label": request_label,
             "hostname": args.label,
             "sshkey_id": [key_id],
             "activation_email": False,
         })
         instance_id = result["instance"]["id"]
-        state = {
-            "id": instance_id, "ssh_host": "", "ssh_private_key": args.ssh_private_key,
-            "plan": plan["id"], "region": region,
-            "hourly_cost": plan["hourly_cost"], "gpu": plan.get("gpu_type", "CPU"),
-            "ssh_key_id": key_id, "ssh_key_created": key_created,
-        }
+        state = {**provisional, "id": instance_id, "ssh_host": ""}
+        state.pop("status")
         save_state(state)
         state.update(wait_ready(api, instance_id, args.ssh_private_key))
         save_state(state)
@@ -117,6 +134,11 @@ def provision(args, bootstrap_instance=True):
     except BaseException:
         try:
             if state:
+                destroy_state(api, state)
+            elif claimed and (recovered := _find_instance_by_label(api, provisional["label"])):
+                state = {**provisional, "id": recovered["id"], "ssh_host": ""}
+                state.pop("status")
+                save_state(state)
                 destroy_state(api, state)
             else:
                 try:
