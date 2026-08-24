@@ -8,6 +8,15 @@ cargo run --manifest-path inference/chat/Cargo.toml --release -- \
 exist yet — SFT was cut at the deadline, sft_step10000.pt is the latest.
 For the raw pretrain model instead: --checkpoint vast_out/saved/vast_run/ckpt_final.pt)
 
+On Apple silicon, --backend mlx runs the same checkpoint on MLX instead of
+torch/MPS, which decodes faster (needs `pip install mlx`; the torch backend
+is unaffected if it is missing):
+
+cargo run --manifest-path inference/chat/Cargo.toml --release -- \
+  --checkpoint vast_out/saved/vast_run_sft/sft_step10000.pt \
+  --data-dir data_cache/cosmopedia \
+  --backend mlx
+
 For a local pretrain checkpoint (run in raw mode, no chat template):
 
 cargo run --manifest-path inference/chat/Cargo.toml --release -- \
