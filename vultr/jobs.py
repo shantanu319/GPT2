@@ -21,7 +21,8 @@ def ssh(args):
     if not args.command:
         print(shlex.join(ssh_prefix(state)))
         return
-    result = run_remote(state, shlex.join(args.command), check=False)
+    command = args.command[0] if len(args.command) == 1 else shlex.join(args.command)
+    result = run_remote(state, command, check=False)
     raise SystemExit(result.returncode)
 
 
