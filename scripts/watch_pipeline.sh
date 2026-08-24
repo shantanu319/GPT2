@@ -53,7 +53,10 @@ while true; do
     fi
     if [ "$DESTROY_ON_TIMEOUT" = "1" ]; then
       note "destroying instance (DESTROY_ON_TIMEOUT=1)"
-      "${CLI[@]}" destroy 2>&1 | tail -2 | tee -a "$LOG"
+      if ! "${CLI[@]}" destroy 2>&1 | tail -2 | tee -a "$LOG"; then
+        note "ERROR: destroy failed — instance may still be billing; destroy it manually"
+        exit 1
+      fi
     else
       note "instance still running (meter on) — stop it with: ${CLI[*]} destroy"
     fi
