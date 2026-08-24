@@ -94,6 +94,10 @@ def main():
     ap.add_argument('--chunk', type=int, default=64)
     ap.add_argument('--dtype', default='bf16', choices=['bf16', 'fp32'])
     ap.add_argument('--sweep', action='store_true')
+    ap.add_argument('--model', action='store_true',
+                    help='whole training steps instead of the layer in isolation')
+    ap.add_argument('--kda', type=int, default=4)
+    ap.add_argument('--swa', type=int, default=128)
     a = ap.parse_args()
 
     if kda.kda_triton is None or not torch.cuda.is_available():
@@ -103,23 +107,37 @@ def main():
     print(f"{torch.cuda.get_device_name(0)} | torch {torch.__version__} | "
           f"B={B} H={H} K={K} chunk={a.chunk} {a.dtype}\n")
 
+    if a.model:
+        # One config per process, on purpose: dynamo's cache fills up when a
+        # single run builds many models, and the rows past the limit silently
+        # fall back to eager. A/B by running twice under KDA_FUSED=1 and =0.
+        from bench.cuda_attention import step_time
+        from core.model import Transformer
+        T = a.seqlens[0]
+        m = Transformer(4096, 512, 12, 8, 0.0, kv_heads=2, value_residual=True,
+                        unet_skips=True, kda=a.kda, swa=a.swa)
+        dt = step_time(m, T, B, 'cuda', True)
+        print(f"kda {a.kda} swa {a.swa} T={T} fused={int(kda.kda_triton.ENABLED)}"
+              f"  {dt * 1e3:>7.1f} ms  {B * T / dt:>7.0f} tok/s", flush=True)
+        return
+
     parity(scan_inputs(B, H, 1024, K, a.chunk, torch.float32))
 
     if a.sweep:
-        print(f"{'T':>6} {'warps':>10} {'prec':>6} {'ms':>9}")
+        print(f"{'T':>6} {'warps':>12} {'prec':>6} {'ms':>9}")
         for T in a.seqlens:
             args = scan_inputs(B, H, T, K, a.chunk, dt) + (None,)
             kda.kda_triton.ENABLED = False
             base = timed(fwd_bwd(kda.chunk_scan, args, True)) * 1e3
             kda.kda_triton.ENABLED = True
-            print(f"{T:>6} {'loop':>10} {'-':>6} {base:>9.3f}", flush=True)
-            for prec in ('ieee', 'tf32'):
-                for fw, bw in ((2, 4), (4, 4), (4, 8), (8, 8), (8, 16),
-                               (16, 16), (16, 32)):
-                    kda.kda_triton.WARPS = (fw, bw)
-                    kda.kda_triton.PRECISION = prec
+            print(f"{T:>6} {'loop':>12} {'-':>6} {base:>9.3f}", flush=True)
+            for prec in ('tf32', 'ieee'):
+                for warps in ((2, 4, 4), (4, 4, 4), (4, 8, 4), (4, 8, 8),
+                              (8, 8, 4), (4, 16, 4), (8, 16, 8), (16, 32, 16)):
+                    kda.kda_triton.WARPS, kda.kda_triton.PRECISION = warps, prec
                     dtms = timed(fwd_bwd(kda.chunk_scan, args, True)) * 1e3
-                    print(f"{T:>6} {f'{fw}/{bw}':>10} {prec:>6} {dtms:>9.3f}", flush=True)
+                    print(f"{T:>6} {'/'.join(map(str, warps)):>12} {prec:>6} "
+                          f"{dtms:>9.3f}", flush=True)
             kda.kda_triton.WARPS = kda.kda_triton.PRECISION = None
         return
 

@@ -63,6 +63,9 @@ Benchmarking the attention stack (`bench/`, needs `pip install mlx` on Apple Sil
 
     python3 -m bench.compare_mlx           # both benchmarks
     python3 -m bench.compare_mlx --attn    # just global vs sliding-window attention
+    python3 -m bench.kda_kernel            # CUDA: fused KDA scan vs the Python loop
+    python3 -m bench.kda_kernel --model    # ... measured as whole training steps
+    python3 -m bench.cuda_attention        # CUDA: the whole stack, eager vs compiled
 
 compare_mlx.py times the two kernels that dominate the stack — the KDA chunked path and windowed
 attention — against MLX ports of the same math in bench/mlx_ops.py, which it checks against
@@ -71,6 +74,12 @@ reporting a fast wrong number. MLX is a measuring stick here, not a backend: it 
 bound KDA scan (~2-3x on this hardware) and its SDPA runs sequence lengths where PyTorch's MPS
 kernel runs out of memory, which makes it the practical way to check long-context behaviour
 locally before renting a GPU.
+
+kda_kernel.py is the CUDA counterpart and A/Bs core/kda_triton.py against the Python loop it
+replaces, both in isolation and as whole kda_chunk calls — the second number is the one that
+matters, since it bounds what any amount of tuning inside the kernel can buy. Run it under
+autocast (it does this itself): without autocast kda_chunk's .float() puts the scan on the fp32
+path, which is not how training runs and answers a different question.
 
 Running on a vast.ai GPU:
 
