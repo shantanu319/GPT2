@@ -37,6 +37,17 @@ def save_state(state):
         json.dump(state, handle, indent=2)
 
 
+def claim_state():
+    try:
+        descriptor = os.open(STATE_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        state = load_state(required=False) or {}
+        current = state.get("id", state.get("status", "unknown"))
+        raise RuntimeError(f"{STATE_FILE} already tracks {current}; resolve it first") from error
+    with os.fdopen(descriptor, "w") as handle:
+        json.dump({"status": "provisioning"}, handle)
+
+
 def clear_state():
     if os.path.exists(STATE_FILE):
         os.remove(STATE_FILE)

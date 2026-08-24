@@ -35,6 +35,7 @@ def arrange(monkeypatch, api, wait_result=None):
     monkeypatch.setattr(lifecycle, "client_from_env", lambda: api)
     monkeypatch.setattr(lifecycle, "list_gpu_plans", lambda client: [PLAN])
     monkeypatch.setattr(lifecycle, "ensure_ssh_key", lambda *unused: ("key-1", True))
+    monkeypatch.setattr(lifecycle, "claim_state", lambda: None)
     monkeypatch.setattr(lifecycle, "wait_ready", lambda *unused: wait_result or {
         "id": "instance-1", "ssh_host": "192.0.2.1", "ssh_private_key": "key-path",
     })

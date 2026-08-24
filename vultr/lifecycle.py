@@ -5,7 +5,9 @@ import time
 from vultr.api import (
     client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_plan,
 )
-from vultr.remote import clear_state, ensure_ssh_key, load_state, run_remote, save_state, wait_ready
+from vultr.remote import (
+    claim_state, clear_state, ensure_ssh_key, load_state, run_remote, save_state, wait_ready,
+)
 
 
 GPU_OS_ID = 2284
@@ -72,10 +74,13 @@ def provision(args, bootstrap_instance=True):
         plan, region = select_plan(
             list_gpu_plans(api), min_vram=args.min_vram, plan_id=args.plan, region=args.region
         )
-    public_key = os.path.expanduser(args.ssh_public_key)
-    key_id, key_created = ensure_ssh_key(api, public_key)
+    key_id = None
+    key_created = False
     state = None
     try:
+        public_key = os.path.expanduser(args.ssh_public_key)
+        key_id, key_created = ensure_ssh_key(api, public_key)
+        claim_state()
         print(f"creating {plan['id']} in {region} (${plan['hourly_cost']:.3f}/hr)...")
         result = api.request("POST", "/instances", {
             "region": region,
@@ -104,8 +109,12 @@ def provision(args, bootstrap_instance=True):
         try:
             if state:
                 destroy_state(api, state)
-            elif key_created:
-                _delete_resource(api, f"/ssh-keys/{key_id}")
+            else:
+                try:
+                    if key_created:
+                        _delete_resource(api, f"/ssh-keys/{key_id}")
+                finally:
+                    clear_state()
         except Exception as cleanup_error:
             resource = state["id"] if state else key_id
             print(f"WARNING: cleanup incomplete for {resource}: {cleanup_error}", file=sys.stderr)

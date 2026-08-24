@@ -4,6 +4,7 @@ import pytest
 
 from vultr.pipeline import build_pipeline
 from vultr import jobs, smoke as smoke_module
+from vultr import remote
 from vultr.remote import ssh_prefix
 
 
@@ -56,6 +57,15 @@ def test_ssh_is_noninteractive_and_preserves_watcher_command(monkeypatch):
     assert exit_info.value.code == 0
     assert captured == ["test -f /root/checkpoint"]
     assert "BatchMode=yes" in ssh_prefix(state)
+
+
+def test_state_claim_refuses_to_overwrite_an_active_instance(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(remote, "STATE_FILE", str(state_file))
+    remote.claim_state()
+    assert remote.load_state() == {"status": "provisioning"}
+    with pytest.raises(RuntimeError, match="already tracks provisioning"):
+        remote.claim_state()
 
 
 def test_smoke_destroys_instance_when_bootstrap_fails(monkeypatch, tmp_path):
