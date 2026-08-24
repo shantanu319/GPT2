@@ -211,7 +211,10 @@ def destroy(args):
     if not instance_id:
         tracked = _resolve_tracked(api, tracked)
     if instance_id and tracked and "id" not in tracked:
-        state = {**tracked, "id": instance_id}
+        info = api.request("GET", f"/instances/{instance_id}")["instance"]
+        if info.get("label") != tracked.get("label"):
+            raise RuntimeError(f"instance {instance_id} does not match tracked label")
+        state = _resolved_state(tracked, info)
     elif instance_id and (not tracked or tracked.get("id") != instance_id):
         state = {"id": instance_id}
     else:

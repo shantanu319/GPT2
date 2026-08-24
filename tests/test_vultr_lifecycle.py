@@ -173,7 +173,18 @@ def test_destroy_by_id_preserves_a_different_tracked_instance(monkeypatch):
 
 
 def test_destroy_by_id_cleans_up_provisional_metadata(monkeypatch):
-    api = API()
+    class RecoveryAPI(API):
+        deleted = False
+
+        def request(self, method, path, payload=None, auth=True):
+            if (method, path) == ("GET", "/instances/recovery") and not self.deleted:
+                self.calls.append((method, path, payload))
+                return {"instance": {"id": "recovery", "label": "unique-label"}}
+            if (method, path) == ("DELETE", "/instances/recovery"):
+                self.deleted = True
+            return super().request(method, path, payload, auth)
+
+    api = RecoveryAPI()
     tracked = {
         "status": "provisioning", "label": "unique-label",
         "ssh_key_id": "key-1", "ssh_key_created": True,
@@ -186,3 +197,23 @@ def test_destroy_by_id_cleans_up_provisional_metadata(monkeypatch):
     assert ("DELETE", "/instances/recovery", None) in api.calls
     assert ("DELETE", "/ssh-keys/key-1", None) in api.calls
     assert cleared
+
+
+@pytest.mark.parametrize("instance_id", ["missing", "wrong-label"])
+def test_destroy_by_id_rejects_unverified_provisional_match(monkeypatch, instance_id):
+    class UnverifiedAPI(API):
+        def request(self, method, path, payload=None, auth=True):
+            if method == "GET" and path == "/instances/wrong-label":
+                return {"instance": {"id": "wrong-label", "label": "somebody-else"}}
+            return super().request(method, path, payload, auth)
+
+    api = UnverifiedAPI()
+    tracked = {"status": "provisioning", "label": "unique-label", "ssh_key_created": True}
+    cleared = []
+    monkeypatch.setattr(lifecycle, "client_from_env", lambda: api)
+    monkeypatch.setattr(lifecycle, "load_state", lambda required=False: tracked)
+    monkeypatch.setattr(lifecycle, "clear_state", lambda: cleared.append(True))
+    with pytest.raises(RuntimeError):
+        lifecycle.destroy(SimpleNamespace(id=instance_id))
+    assert not any(call[0] == "DELETE" for call in api.calls)
+    assert not cleared
