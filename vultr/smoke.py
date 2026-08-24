@@ -5,14 +5,18 @@ from vultr.lifecycle import destroy_state, provision
 from vultr.remote import REMOTE_ROOT, rsync, run_remote
 
 
-def _bootstrap(state):
+def _bootstrap(state, compute=False):
+    swap = ("fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && "
+            "swapon /swapfile && ") if compute else ""
+    torch_index = "--index-url https://download.pytorch.org/whl/cpu " if compute else ""
     run_remote(
         state,
         "cloud-init status --wait && export DEBIAN_FRONTEND=noninteractive && "
         "apt-get update -qq && apt-get install -y -qq python3-venv rsync && "
+        f"{swap}"
         "python3 -m venv /opt/myowntransformer && "
         "/opt/myowntransformer/bin/pip install -q --upgrade pip && "
-        "/opt/myowntransformer/bin/pip install -q torch==2.11.0 matplotlib",
+        f"/opt/myowntransformer/bin/pip install -q {torch_index}torch==2.11.0 matplotlib",
     )
 
 
@@ -42,16 +46,23 @@ def smoke(args):
     started = time.time()
     api = state = None
     try:
-        api, state = provision(args, bootstrap_instance=False)
+        try:
+            api, state = provision(args, bootstrap_instance=False)
+        except RuntimeError as error:
+            if "support request for access to this product" not in str(error):
+                raise
+            print("[smoke] Cloud GPU access is not enabled; falling back to shared CPU compute")
+            args.compute = True
+            args.plan = None
+            api, state = provision(args, bootstrap_instance=False)
         print("[smoke] installing the minimal runtime...")
-        _bootstrap(state)
-        print("[smoke] validating the GPU...")
-        run_remote(
-            state,
-            "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader && "
-            "/opt/myowntransformer/bin/python -c \"import torch; "
-            "assert torch.cuda.is_available(); print('torch', torch.__version__, 'CUDA ready')\"",
-        )
+        _bootstrap(state, compute=args.compute)
+        device_check = ("import torch; print('torch', torch.__version__, 'CPU ready')" if args.compute else
+                        "import torch; assert torch.cuda.is_available(); "
+                        "print('torch', torch.__version__, 'CUDA ready')")
+        print(f"[smoke] validating {'CPU' if args.compute else 'GPU'} compute...")
+        gpu_check = "" if args.compute else "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader && "
+        run_remote(state, f"{gpu_check}/opt/myowntransformer/bin/python -c \"{device_check}\"")
         print("[smoke] pushing the repository and generating synthetic data...")
         run_remote(state, f"mkdir -p {REMOTE_ROOT}")
         rsync(state, "./", f"root@{state['ssh_host']}:{REMOTE_ROOT}/")

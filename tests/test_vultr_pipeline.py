@@ -20,7 +20,7 @@ def pipeline_args(**overrides):
 
 def smoke_args(tmp_path, keep=False):
     return SimpleNamespace(
-        keep=keep, out=str(tmp_path), min_vram=99, label="old",
+        keep=keep, out=str(tmp_path), min_vram=99, label="old", compute=False,
         plan=None, region=None, os_id=2284,
         ssh_public_key="public", ssh_private_key="private",
     )
@@ -47,7 +47,7 @@ def test_smoke_destroys_instance_when_bootstrap_fails(monkeypatch, tmp_path):
     destroyed = []
     monkeypatch.setattr(smoke_module, "provision", lambda *args, **kwargs: ("api", state))
     monkeypatch.setattr(
-        smoke_module, "_bootstrap", lambda unused: (_ for _ in ()).throw(RuntimeError("boom"))
+        smoke_module, "_bootstrap", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
     )
     monkeypatch.setattr(smoke_module, "destroy_state", lambda api, current: destroyed.append(current))
 
@@ -61,7 +61,7 @@ def test_smoke_keep_flag_skips_cleanup(monkeypatch, tmp_path):
     state = {"id": "instance-1", "hourly_cost": 0.059}
     monkeypatch.setattr(smoke_module, "provision", lambda *args, **kwargs: ("api", state))
     monkeypatch.setattr(
-        smoke_module, "_bootstrap", lambda unused: (_ for _ in ()).throw(RuntimeError("boom"))
+        smoke_module, "_bootstrap", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("boom"))
     )
     monkeypatch.setattr(
         smoke_module, "destroy_state",

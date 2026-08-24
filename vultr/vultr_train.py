@@ -72,6 +72,7 @@ def main():
 
     command = commands.add_parser("smoke", help="run tiny training on the cheapest GPU, then destroy it")
     add_instance_args(command, min_vram=2)
+    command.add_argument("--compute", action="store_true", help="use the cheapest viable shared CPU plan")
     command.add_argument("--keep", action="store_true")
     command.add_argument("--out", default=PULL_DIR)
     command.set_defaults(func=smoke)
