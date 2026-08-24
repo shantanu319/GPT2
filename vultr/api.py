@@ -44,10 +44,14 @@ def client_from_env(required=True):
     return VultrAPI(token)
 
 
-def list_gpu_plans(client=None):
+def list_plans(plan_type, client=None):
     client = client or client_from_env(required=False)
-    result = client.request("GET", "/plans?type=vcg&per_page=500", auth=False)
+    result = client.request("GET", f"/plans?type={plan_type}&per_page=500", auth=False)
     return result["plans"]
+
+
+def list_gpu_plans(client=None):
+    return list_plans("vcg", client)
 
 
 def select_plan(plans, min_vram=20, plan_id=None, region=None):
@@ -64,5 +68,18 @@ def select_plan(plans, min_vram=20, plan_id=None, region=None):
         target = plan_id or f">={min_vram} GB VRAM"
         where = f" in {region}" if region else ""
         raise RuntimeError(f"no on-demand Vultr GPU plan for {target}{where}")
+    plan = min(candidates, key=lambda item: (item["hourly_cost"], item["id"]))
+    return plan, region or plan["locations"][0]
+
+
+def select_compute_plan(plans, min_ram=1024, region=None):
+    candidates = [
+        plan for plan in plans
+        if plan.get("deploy_ondemand") and plan.get("ram", 0) >= min_ram
+        and plan.get("locations") and (not region or region in plan["locations"])
+    ]
+    if not candidates:
+        where = f" in {region}" if region else ""
+        raise RuntimeError(f"no on-demand Vultr compute plan with >={min_ram} MB RAM{where}")
     plan = min(candidates, key=lambda item: (item["hourly_cost"], item["id"]))
     return plan, region or plan["locations"][0]

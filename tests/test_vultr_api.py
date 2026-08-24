@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from vultr.api import VultrAPI, select_plan
+from vultr.api import VultrAPI, select_compute_plan, select_plan
 
 
 class Response:
@@ -45,6 +45,17 @@ def test_select_plan_honors_exact_plan_and_region():
 def test_select_plan_rejects_unavailable_capacity():
     with pytest.raises(RuntimeError, match="no on-demand"):
         select_plan(plans(), plan_id="sold-out")
+
+
+def test_select_compute_plan_skips_too_small_instances():
+    compute = [
+        {"id": "tiny", "hourly_cost": 0.005, "ram": 512,
+         "deploy_ondemand": True, "locations": ["ewr"]},
+        {"id": "viable", "hourly_cost": 0.007, "ram": 1024,
+         "deploy_ondemand": True, "locations": ["ewr"]},
+    ]
+    plan, region = select_compute_plan(compute)
+    assert (plan["id"], region) == ("viable", "ewr")
 
 
 def test_request_sends_bearer_token_and_json(monkeypatch):
