@@ -146,17 +146,21 @@ create/list/delete permissions. Vultr also requires the machine's public IP to b
 allowed under the account's API settings. The default SSH key pair is
 `~/.ssh/id_ed25519{,.pub}`; override both paths with CLI flags if necessary.
 
-Run the smoke test first. It discovers the cheapest available GPU plan, creates
-synthetic 1K-token shards, verifies CUDA, trains a 32-wide one-layer model in eager
-mode, pulls `ckpt_final.pt` into `vultr_out/smoke/`, and destroys the instance in a
-`finally` block:
+Run the smoke test first. It discovers the cheapest live GPU plan, creates synthetic
+1K-token shards, trains a 32-wide one-layer model in eager mode, pulls
+`ckpt_final.pt` into `vultr_out/smoke/`, and confirms destruction in a `finally`
+block. If Cloud GPU access is not enabled on the account, it automatically falls
+back to the cheapest viable shared-CPU plan; `--compute` selects that path directly.
+The CPU path validates provisioning, SSH, training, pull, and teardown, but not CUDA:
 
     python3 vultr/vultr_train.py plans
     python3 vultr/vultr_train.py smoke
 
 As of August 2026 the cheapest plan is `vcg-a16-2c-8g-2vram`: a fractional
 2 GB NVIDIA A16 at $0.059/hour. Vultr has a one-hour minimum charge, so even a
-short smoke costs $0.059. Stopped instances still bill; only `destroy` stops billing.
+short GPU smoke costs $0.059. The CPU fallback uses `vc2-1c-1gb` at $0.007/hour;
+the verified smoke completed in 4.4 minutes and pulled a 16-step checkpoint. Stopped
+instances still bill; only `destroy` stops billing.
 
 For a real run, the CLI selects the cheapest currently available plan with at least
 20 GB VRAM (override with `--plan`, `--region`, or `--min-vram`):
@@ -168,10 +172,13 @@ For a real run, the CLI selects the cheapest currently available plan with at le
     python3 vultr/vultr_train.py status
     python3 vultr/vultr_train.py pull       # checkpoints and logs -> vultr_out/
     python3 vultr/vultr_train.py destroy    # also removes a pipeline-owned SSH key
+    python3 vultr/vultr_train.py destroy --id INSTANCE_ID  # recovery without local state
 
-The current instance lives in ignored `.vultr_instance.json`. The pipeline defaults
-to the same 101M shape and ~8B-token data cap as the Vast `pipeline` command. The
-watcher uses `watch_vultr_pipeline.log`, pulls on completion/timeout, and accepts the
+The current instance lives in ignored `.vultr_instance.json`. The pipeline uses the
+same 101M shape as Vast but a safer 1M-document default cap; the 8M-document H200
+budget is a poor default for an A16. Benchmark throughput before raising
+`--max-train-docs` or the watcher's seven-hour deadline. The watcher uses
+`watch_vultr_pipeline.log`, pulls before optional timeout teardown, and accepts the
 same `MAX_HOURS` and `DESTROY_ON_TIMEOUT` controls. See Vultr's
 [GPU provisioning guide](https://docs.vultr.com/products/compute/instances/cloud-gpu/provisioning)
 and [billing rules](https://docs.vultr.com/support/platform/billing/how-am-i-billed-for-my-servers).

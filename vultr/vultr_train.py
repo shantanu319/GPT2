@@ -47,7 +47,7 @@ def main():
     command.add_argument("--dir-name", default="vultr_run")
     command.add_argument("--sft-dir-name", default="vultr_run_sft")
     command.add_argument("--dpo-dir-name", default="vultr_run_dpo")
-    command.add_argument("--max-train-docs", type=int, default=8_000_000)
+    command.add_argument("--max-train-docs", type=int, default=1_000_000)
     command.add_argument("--d-model", type=int, default=512)
     command.add_argument("--n-layers", type=int, default=30)
     command.add_argument("--heads", type=int, default=8)
@@ -74,7 +74,9 @@ def main():
     command.add_argument("--id", help="instance ID for recovery without a state file")
     command.set_defaults(func=destroy)
 
-    command = commands.add_parser("smoke", help="run tiny training on the cheapest GPU, then destroy it")
+    command = commands.add_parser(
+        "smoke", help="run tiny training on the cheapest GPU/compute, then destroy it"
+    )
     add_instance_args(command, min_vram=2)
     command.add_argument("--compute", action="store_true", help="use the cheapest viable shared CPU plan")
     command.add_argument("--keep", action="store_true")
