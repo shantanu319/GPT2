@@ -47,7 +47,10 @@ while true; do
     note "TIMEOUT: ${MAX_HOURS}h reached without dpo_final.pt — pulling latest checkpoints instead"
     "${CLI[@]}" ssh "ls -t $REMOTE/saved/*/*.pt 2>/dev/null | head -5; tail -3 $REMOTE/pipeline.log 2>/dev/null" \
       2>/dev/null | tee -a "$LOG"
-    "${CLI[@]}" pull 2>&1 | tail -3 | tee -a "$LOG"
+    if ! "${CLI[@]}" pull 2>&1 | tail -3 | tee -a "$LOG"; then
+      note "ERROR: artifact pull failed — leaving the instance running"
+      exit 1
+    fi
     if [ "$DESTROY_ON_TIMEOUT" = "1" ]; then
       note "destroying instance (DESTROY_ON_TIMEOUT=1)"
       "${CLI[@]}" destroy 2>&1 | tail -2 | tee -a "$LOG"
@@ -65,5 +68,8 @@ while true; do
   sleep 300
 done
 
-"${CLI[@]}" pull 2>&1 | tail -3 | tee -a "$LOG"
+if ! "${CLI[@]}" pull 2>&1 | tail -3 | tee -a "$LOG"; then
+  note "ERROR: artifact pull failed — leaving the instance running"
+  exit 1
+fi
 note "DONE — weights in ./$OUT/saved/$DPO_DIR_NAME"
