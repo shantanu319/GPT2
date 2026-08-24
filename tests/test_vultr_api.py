@@ -83,6 +83,13 @@ def test_request_surfaces_api_error_without_token(monkeypatch):
         VultrAPI("secret").request("GET", "/instances")
 
 
+def test_request_normalizes_transport_errors_for_cleanup_retries(monkeypatch):
+    error = urllib.error.URLError("temporary failure")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError, match="transport error.*temporary failure"):
+        VultrAPI("secret").request("DELETE", "/instances/test")
+
+
 def test_authenticated_request_requires_key():
     with pytest.raises(RuntimeError, match="VULTR_API_KEY"):
         VultrAPI().request("GET", "/instances")

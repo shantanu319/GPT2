@@ -31,6 +31,8 @@ class VultrAPI:
         except urllib.error.HTTPError as error:
             detail = error.read().decode(errors="replace")
             raise RuntimeError(f"Vultr API {method} {path}: HTTP {error.code}: {detail}") from error
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as error:
+            raise RuntimeError(f"Vultr API {method} {path}: transport error: {error}") from error
         return json.loads(body) if body else {}
 
 
