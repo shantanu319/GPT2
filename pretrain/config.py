@@ -51,6 +51,11 @@ def parse_args():
                         help='Kimi Delta Attention (kda.py): use KDA linear attention in '
                              'all but every Nth layer, which keeps full SDPA attention '
                              '(0 = disabled, 1 = every layer KDA, 4 = Kimi-style 3:1 hybrid)')
+    parser.add_argument('-swa', type=int, default=0,
+                        help='Sliding-window attention (model.py): full-attention '
+                             'layers attend only the last N tokens, so with -kda '
+                             'the whole stack is linear in sequence length '
+                             '(0 = global attention)')
     parser.add_argument('-shuffle', type=int, default=1,
                         help='Serve train windows in a seeded-permuted order per pass')
     parser.add_argument('-doc_mask', type=int, default=1,

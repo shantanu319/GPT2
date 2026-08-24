@@ -75,6 +75,69 @@ def attention(q, k, v, mask=None, dropout_p=0.0, is_causal=False):
                                           is_causal=is_causal, enable_gqa=True)
 
 
+def window_band_mask(T, S, offset, window, device):
+    """(1, T, S) bool: query i, sitting at position offset+i among the S cached
+    keys, attends the `window` keys ending at itself."""
+    d = (torch.arange(T, device=device)[:, None] + offset
+         - torch.arange(S, device=device)[None, :])
+    return ((d >= 0) & (d < window)).unsqueeze(0)
+
+
+def window_block_mask(window, device, seg_ids=None):
+    """(head, tail) bool masks for blocked sliding-window attention.
+
+    `tail` scores query blocks 1..nb-1 against the 2W keys starting one window
+    before each block, so the W keys ending at any query are always in range;
+    `head` is the first block, which has no earlier window and is plain causal
+    -- exactly `tail`'s own-block half. Leading dims are 1 without seg_ids."""
+    i = torch.arange(window, device=device)
+    j = torch.arange(2 * window, device=device)
+    # key j of a block sits `window` positions before query 0, so its offset
+    # from query i is i - j + window; keep that offset in [0, window).
+    tail = ((j > i[:, None]) & (j <= i[:, None] + window))[None, None]
+    if seg_ids is None:
+        return tail[..., window:], tail
+    seg_ids = F.pad(seg_ids, (0, -seg_ids.size(1) % window), value=-1)
+    q_seg = seg_ids.unflatten(1, (-1, window))            # (B, nb, W)
+    k_seg = seg_ids.unfold(1, 2 * window, window)         # (B, nb-1, 2W)
+    head = tail[..., window:] & (q_seg[:, :1, :, None] == q_seg[:, :1, None, :])
+    tail = tail & (q_seg[:, 1:, :, None] == k_seg[:, :, None, :])
+    return head, tail.flatten(0, 1).unsqueeze(1)
+
+
+def window_attention(q, k, v, window, masks, dropout_p=0.0, enable_gqa=False):
+    """Sliding-window attention: every query attends the `window` keys ending
+    at itself, at O(T*W) cost instead of O(T^2). Needs T > window.
+
+    Queries are cut into W-wide blocks and each block reads one 2W-key span, so
+    the whole thing is two batched SDPA calls over short sequences. A ragged
+    last block is padded out and sliced off again -- the padding sits in the
+    future of every real query, so nothing attends it."""
+    B, H, T, D = q.shape
+    head_mask, tail_mask = masks
+    if T % window:
+        q, k, v = (F.pad(x, (0, 0, 0, -T % window)) for x in (q, k, v))
+    nb = q.size(2) // window
+
+    def cut(x, paired):
+        # W-wide blocks; each query block past the first is paired with the
+        # block before it, which is the window it reaches back into. Built by
+        # concatenation rather than unfold: an unfold view's strides trip
+        # torch.compile's guards at some shapes.
+        b = x.unflatten(2, (nb, window))
+        b = torch.cat((b[:, :, :-1], b[:, :, 1:]), dim=-2) if paired else b[:, :, 1:]
+        return b.transpose(1, 2).reshape(B * (nb - 1), -1, b.size(-2), D)
+
+    first = F.scaled_dot_product_attention(
+        q[:, :, :window], k[:, :, :window], v[:, :, :window], attn_mask=head_mask,
+        dropout_p=dropout_p, enable_gqa=enable_gqa)
+    rest = F.scaled_dot_product_attention(
+        cut(q, False), cut(k, True), cut(v, True),
+        attn_mask=tail_mask, dropout_p=dropout_p, enable_gqa=enable_gqa)
+    rest = rest.view(B, nb - 1, H, window, D).transpose(1, 2).reshape(B, H, -1, D)
+    return torch.cat((first, rest), dim=2)[:, :, :T]
+
+
 class MultiHeadAttention(nn.Module):
     """Multi-head attention with GQA, QK-norm, and partial RoPE.
 
@@ -84,9 +147,10 @@ class MultiHeadAttention(nn.Module):
     """
 
     def __init__(self, heads, d_model, kv_heads=None, max_seq_len=4096,
-                 dropout=0.1, rope_frac=0.5):
+                 dropout=0.1, rope_frac=0.5, window=0):
         super().__init__()
 
+        self.window = window
         self.d_model = d_model
         self.d_k = d_model // heads
         self.h = heads
@@ -118,6 +182,33 @@ class MultiHeadAttention(nn.Module):
     def reset_cache(self):
         self.k_cache = {}
         self.v_cache = {}
+
+    def _cached_kv(self, cache_idx, k, v, start_pos):
+        """Fold this step's keys and values into the cache and return the whole
+        span the queries at start_pos.. may attend.
+
+        A windowed layer can never reach further than `window - 1` positions
+        back, so its cache holds exactly that many rows instead of the whole
+        context: decode is constant-memory however long the generation runs.
+        Global layers keep the full context, written at its absolute position."""
+        T = k.size(2)
+        rows = self.window - 1 if self.window else self.rope_cos.size(0)
+        if cache_idx not in self.k_cache:
+            shape = (k.size(0), self.h_kv, rows, self.d_k)
+            self.k_cache[cache_idx] = torch.zeros(shape, device=k.device, dtype=k.dtype)
+            self.v_cache[cache_idx] = torch.zeros(shape, device=k.device, dtype=k.dtype)
+        kc, vc = self.k_cache[cache_idx], self.v_cache[cache_idx]
+        if not self.window:
+            kc[:, :, start_pos:start_pos+T] = k
+            vc[:, :, start_pos:start_pos+T] = v
+            return kc[:, :, :start_pos+T], vc[:, :, :start_pos+T]
+        n = min(start_pos, rows)
+        if n:
+            k = torch.cat((kc[:, :, :n], k), dim=2)
+            v = torch.cat((vc[:, :, :n], v), dim=2)
+        keep = min(rows, n + T)
+        kc[:, :, :keep], vc[:, :, :keep] = k[:, :, -keep:], v[:, :, -keep:]
+        return k, v
 
     def rope_tables(self, pos_ids):
         """cos/sin gathered at per-token positions. Every layer's table holds
@@ -160,22 +251,22 @@ class MultiHeadAttention(nn.Module):
             v = (1 - gate) * v + gate * v1
 
         if start_pos is not None:
-            if cache_idx not in self.k_cache:
-                max_len = self.rope_cos.size(0)
-                self.k_cache[cache_idx] = torch.zeros(
-                    bs, self.h_kv, max_len, self.d_k, device=q.device, dtype=q.dtype)
-                self.v_cache[cache_idx] = torch.zeros(
-                    bs, self.h_kv, max_len, self.d_k, device=q.device, dtype=q.dtype)
-            self.k_cache[cache_idx][:, :, start_pos:start_pos+T] = k
-            self.v_cache[cache_idx][:, :, start_pos:start_pos+T] = v
-            k = self.k_cache[cache_idx][:, :, :start_pos+T]
-            v = self.v_cache[cache_idx][:, :, :start_pos+T]
+            k, v = self._cached_kv(cache_idx, k, v, start_pos)
+            if self.window:
+                # A step reads at most `window` keys and every one of them is
+                # inside the window, so decoding a single token needs no mask.
+                mask = None if T == 1 else window_band_mask(
+                    T, k.size(2), k.size(2) - T, self.window, q.device)
 
         dropout_p = self.dropout.p if self.training else 0.0
-        # mask None + no cache means causal training; mask None + cache means
-        # single-chunk decode attending over the whole cache (not causal).
-        scores = attention(q, k, v, mask, dropout_p,
-                           is_causal=mask is None and start_pos is None)
+        if start_pos is None and self.window and T > self.window:
+            scores = window_attention(q, k, v, self.window, mask, dropout_p,
+                                      enable_gqa=True)
+        else:
+            # mask None + no cache means causal training; mask None + cache means
+            # single-chunk decode attending over the whole cache (not causal).
+            scores = attention(q, k, v, mask, dropout_p,
+                               is_causal=mask is None and start_pos is None)
         # concatenate heads and put through final linear layer
         concat = scores.transpose(1, 2).contiguous() \
             .view(bs, -1, self.d_model)
@@ -211,7 +302,8 @@ def get_clones(module, N):
 # build a decoder layer with two multi-head attention layers and
 # one feed-forward layer
 class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
-    def __init__(self, d_model, heads, dropout=0.1, kv_heads=None, use_kda=False):
+    def __init__(self, d_model, heads, dropout=0.1, kv_heads=None, use_kda=False,
+                 window=0):
         super().__init__()
         self.norm_1 = RMSNorm(d_model)
         self.norm_3 = RMSNorm(d_model)
@@ -223,7 +315,8 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
         if use_kda:
             self.attn_1 = KimiDeltaAttention(d_model, heads)
         else:
-            self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads, dropout=dropout)
+            self.attn_1 = MultiHeadAttention(heads, d_model, kv_heads=kv_heads,
+                                             dropout=dropout, window=window)
         self.ff = SwiGLU(d_model, dropout=dropout)
 
     def forward(self, x, mask, start_pos=None, cache_idx=0, v1=None, seg_ids=None,
@@ -247,9 +340,10 @@ class DecoderLayer(nn.Module):  # deleted any reference to encoder outputs
 class Decoder(nn.Module):
     def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
                  grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0,
-                 kda=0):
+                 kda=0, swa=0):
         super().__init__()
         self.N = N
+        self.swa = swa
         self.loops = loops
         self.grad_ckpt = grad_ckpt
         self.value_residual = value_residual
@@ -261,13 +355,13 @@ class Decoder(nn.Module):
             # Every layer is KDA except each kda-th one, which keeps full SDPA
             # attention: kda=1 -> all KDA, kda=4 -> Kimi-style 3:1 hybrid.
             self.layers = nn.ModuleList([
-                DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads,
+                DecoderLayer(d_model, heads, dropout, kv_heads=kv_heads, window=swa,
                              use_kda=not (kda > 1 and i % kda == kda - 1))
                 for i in range(N)
             ])
         else:
             self.layers = get_clones(DecoderLayer(d_model, heads, dropout,
-                                                  kv_heads=kv_heads), N)
+                                                  kv_heads=kv_heads, window=swa), N)
         self.norm = RMSNorm(d_model)
         if value_residual:
             # Per-layer value-mix scalars init 0 (sigmoid=0.5). Only full-
@@ -304,6 +398,10 @@ class Decoder(nn.Module):
 
     def forward(self, trg, mask, start_pos=None, seg_ids=None):
         rope = None
+        T = trg.size(1)
+        # Sliding-window layers read a blocked mask instead of the dense causal
+        # one; a window at least as wide as the sequence is just full attention.
+        windowed = bool(self.swa) and start_pos is None and T > self.swa
         if seg_ids is not None:
             # Document-aware training: no attention across boundaries, RoPE
             # positions restart at each new segment (KDA gets seg_ids directly).
@@ -311,10 +409,13 @@ class Decoder(nn.Module):
             # built once here instead of per layer -- at (B, T, rot_dim/2) each
             # they are the single largest thing the rotation holds on to.
             assert start_pos is None, "seg_ids is only supported in training windows"
-            mask = segment_mask(seg_ids)
+            if not windowed:
+                mask = segment_mask(seg_ids)
             pos_ids = segment_pos_ids(seg_ids)
             mha = next((l.attn_1 for l in self.layers if not l.is_kda), None)
             rope = mha.rope_tables(pos_ids) if mha is not None else None
+        if windowed:
+            mask = window_block_mask(self.swa, trg.device, seg_ids)
         x0 = x = self.embed(trg)
         half = (self.N + 1) // 2
         # Block outputs feed AttnRes boundaries; accumulates across the whole
@@ -353,12 +454,12 @@ class Decoder(nn.Module):
 class Transformer(nn.Module):
     def __init__(self, vocab, d_model, N, heads, dropout, kv_heads=None, loops=1,
                  grad_ckpt=False, value_residual=False, unet_skips=False, attn_res=0,
-                 kda=0):
+                 kda=0, swa=0):
         super().__init__()
         self.decoder = Decoder(vocab, d_model, N, heads, dropout,
                                kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
                                value_residual=value_residual, unet_skips=unet_skips,
-                               attn_res=attn_res, kda=kda)
+                               attn_res=attn_res, kda=kda, swa=swa)
         self.out = nn.Linear(d_model, vocab)
         self.out.weight = self.decoder.embed.embed.weight
 
@@ -386,11 +487,12 @@ def get_model(opt, vocab):
     unet_skips = bool(getattr(opt, 'unet_skips', False))
     attn_res = getattr(opt, 'attn_res', 0) or 0
     kda = getattr(opt, 'kda', 0) or 0
+    swa = getattr(opt, 'swa', 0) or 0
 
     model = Transformer(vocab, opt.d_model, opt.n_layers, opt.heads, opt.dropout,
                         kv_heads=kv_heads, loops=loops, grad_ckpt=grad_ckpt,
                         value_residual=value_residual, unet_skips=unet_skips,
-                        attn_res=attn_res, kda=kda)
+                        attn_res=attn_res, kda=kda, swa=swa)
     model.to(opt.device)
 
     if opt.loadname is not None:
@@ -443,6 +545,7 @@ def model_from_checkpoint(ckpt, device, dtype=None):
         unet_skips=cfg.get('unet_skips', False),
         attn_res=cfg.get('attn_res', 0),
         kda=cfg.get('kda', 0),
+        swa=cfg.get('swa', 0),
     )
     dtype = inference_dtype(device) if dtype is None else dtype
     # assign hands the checkpoint's tensors straight to the module rather than
