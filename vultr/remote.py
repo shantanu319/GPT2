@@ -8,6 +8,8 @@ import time
 REMOTE_ROOT = "/root/myowntransformer"
 STATE_FILE = ".vultr_instance.json"
 SSH_OPTS = [
+    "-o", "BatchMode=yes",
+    "-o", "IdentitiesOnly=yes",
     "-o", "StrictHostKeyChecking=no",
     "-o", "UserKnownHostsFile=/dev/null",
     "-o", "ConnectTimeout=15",

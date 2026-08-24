@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import pytest
 
 from vultr.pipeline import build_pipeline
-from vultr import smoke as smoke_module
+from vultr import jobs, smoke as smoke_module
+from vultr.remote import ssh_prefix
 
 
 def pipeline_args(**overrides):
@@ -40,6 +41,21 @@ def test_pipeline_is_resumable_across_all_training_stages():
 def test_pipeline_quotes_run_names():
     script = build_pipeline(pipeline_args(dir_name="run; touch /tmp/bad"))
     assert "DIR='run; touch /tmp/bad'" in script
+
+
+def test_ssh_is_noninteractive_and_preserves_watcher_command(monkeypatch):
+    state = {"ssh_private_key": "key", "ssh_host": "host"}
+    captured = []
+    monkeypatch.setattr(jobs, "load_state", lambda: state)
+    monkeypatch.setattr(
+        jobs, "run_remote",
+        lambda current, command, check: captured.append(command) or SimpleNamespace(returncode=0),
+    )
+    with pytest.raises(SystemExit) as exit_info:
+        jobs.ssh(SimpleNamespace(command=["test -f /root/checkpoint"]))
+    assert exit_info.value.code == 0
+    assert captured == ["test -f /root/checkpoint"]
+    assert "BatchMode=yes" in ssh_prefix(state)
 
 
 def test_smoke_destroys_instance_when_bootstrap_fails(monkeypatch, tmp_path):
