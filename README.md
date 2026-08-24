@@ -129,6 +129,53 @@ Piecemeal invocations:
     python vast/vast_train.py pull                         # rsync saved/ + tokenizer.json into ./vast_out
     python vast/vast_train.py destroy                      # stop billing
 
+Running on a Vultr Cloud GPU:
+
+`vultr_train.py` runs the same resumable prepare -> pretrain -> SFT -> DPO chain on
+Vultr's on-demand Cloud GPU instances. It uses the public plan catalog for live
+price/capacity discovery, provisions Ubuntu 24.04's GPU-enabled image, installs an
+ephemeral SSH key when needed, and bootstraps a Python 3 virtual environment.
+
+One-time setup:
+
+    pip install python-dotenv
+    echo 'VULTR_API_KEY=...' >> .env.local   # https://my.vultr.com/settings/#settingsapi
+
+The API key needs plan-list, instance create/read/delete, and SSH-key
+create/list/delete permissions. Vultr also requires the machine's public IP to be
+allowed under the account's API settings. The default SSH key pair is
+`~/.ssh/id_ed25519{,.pub}`; override both paths with CLI flags if necessary.
+
+Run the smoke test first. It discovers the cheapest available GPU plan, creates
+synthetic 1K-token shards, verifies CUDA, trains a 32-wide one-layer model in eager
+mode, pulls `ckpt_final.pt` into `vultr_out/smoke/`, and destroys the instance in a
+`finally` block:
+
+    python3 vultr/vultr_train.py plans
+    python3 vultr/vultr_train.py smoke
+
+As of August 2026 the cheapest plan is `vcg-a16-2c-8g-2vram`: a fractional
+2 GB NVIDIA A16 at $0.059/hour. Vultr has a one-hour minimum charge, so even a
+short smoke costs $0.059. Stopped instances still bill; only `destroy` stops billing.
+
+For a real run, the CLI selects the cheapest currently available plan with at least
+20 GB VRAM (override with `--plan`, `--region`, or `--min-vram`):
+
+    python3 vultr/vultr_train.py create
+    python3 vultr/vultr_train.py push
+    python3 vultr/vultr_train.py pipeline
+    PROVIDER=vultr ./scripts/watch_pipeline.sh
+    python3 vultr/vultr_train.py status
+    python3 vultr/vultr_train.py pull       # checkpoints and logs -> vultr_out/
+    python3 vultr/vultr_train.py destroy    # also removes a pipeline-owned SSH key
+
+The current instance lives in ignored `.vultr_instance.json`. The pipeline defaults
+to the same 101M shape and ~8B-token data cap as the Vast `pipeline` command. The
+watcher uses `watch_vultr_pipeline.log`, pulls on completion/timeout, and accepts the
+same `MAX_HOURS` and `DESTROY_ON_TIMEOUT` controls. See Vultr's
+[GPU provisioning guide](https://docs.vultr.com/products/compute/instances/cloud-gpu/provisioning)
+and [billing rules](https://docs.vultr.com/support/platform/billing/how-am-i-billed-for-my-servers).
+
 Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping at ±15, GQA (`-kv_heads`, default 2 of 8 heads on vast.ai — saves params + shrinks the KV cache), partial RoPE (rotate half the head dims), value residual learning (layer-1 V mixed into later layers via per-layer learnable scalars), U-net skip connections + an embedding shortcut with learnable scalar gates, opt-in block Attention Residuals (`-attn_res B` — softmax attention over previous block outputs replaces uniform residual accumulation, arXiv:2603.15031), opt-in Kimi Delta Attention layers (`-kda N` — every layer but each Nth runs per-channel gated delta-rule linear attention against a constant-size recurrent state instead of a KV cache, Kimi Linear arXiv:2510.26692), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds the local Polar-Express Muon as default (`-muon_impl local`), with opt-in per-head orthogonalization (`-muon_per_head` — attention projection updates are Newton-Schulz'd per head, in the style of Kimi K3's Per-Head Muon), a WSD schedule (`-schedule wsd`), Muon weight decay, torch.compile + fused chunked cross-entropy, shuffled pinned-prefetch data feeding (`-shuffle`), opt-in activation checkpointing (`-grad_ckpt`), gradient accumulation (`-grad_accum`), and capped mid-epoch validation (`-val_every`).
 
 Posttraining (SFT + DPO, target: chat-able under 100M params):
