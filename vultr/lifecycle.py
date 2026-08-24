@@ -79,6 +79,29 @@ def _find_instance_by_label(api, label, attempts=3):
     return None
 
 
+def _resolved_state(provisional, instance):
+    state = {
+        **provisional, "id": instance["id"], "ssh_host": instance.get("main_ip", ""),
+    }
+    state.pop("status", None)
+    return state
+
+
+def _definitive_rejection(error):
+    return any(f"HTTP {code}" in str(error) for code in (400, 401, 403, 404, 405, 409, 422))
+
+
+def _resolve_tracked(api, tracked):
+    if not tracked or "id" in tracked or not tracked.get("label"):
+        return tracked
+    recovered = _find_instance_by_label(api, tracked["label"])
+    if not recovered:
+        return tracked
+    state = _resolved_state(tracked, recovered)
+    save_state(state)
+    return state
+
+
 def provision(args, bootstrap_instance=True):
     api = client_from_env()
     if getattr(args, "compute", False):
@@ -122,8 +145,7 @@ def provision(args, bootstrap_instance=True):
             "activation_email": False,
         })
         instance_id = result["instance"]["id"]
-        state = {**provisional, "id": instance_id, "ssh_host": ""}
-        state.pop("status")
+        state = _resolved_state(provisional, {"id": instance_id})
         save_state(state)
         state.update(wait_ready(api, instance_id, args.ssh_private_key))
         save_state(state)
@@ -131,22 +153,27 @@ def provision(args, bootstrap_instance=True):
             bootstrap(state)
         print(f"instance ready: {state['ssh_host']} ({state['gpu']})")
         return api, state
-    except BaseException:
+    except BaseException as provision_error:
         try:
             if state:
                 destroy_state(api, state)
-            elif claimed and (recovered := _find_instance_by_label(api, provisional["label"])):
-                state = {**provisional, "id": recovered["id"], "ssh_host": ""}
-                state.pop("status")
-                save_state(state)
-                destroy_state(api, state)
-            else:
+            elif claimed and _definitive_rejection(provision_error):
                 try:
                     if key_created:
                         _delete_resource(api, f"/ssh-keys/{key_id}")
                 finally:
-                    if claimed:
-                        clear_state()
+                    clear_state()
+            elif claimed:
+                recovered = _find_instance_by_label(api, provisional["label"])
+                if recovered:
+                    state = _resolved_state(provisional, recovered)
+                    save_state(state)
+                    destroy_state(api, state)
+                else:
+                    print(f"WARNING: create outcome unresolved; kept {provisional['label']} in "
+                          ".vultr_instance.json", file=sys.stderr)
+            elif key_created:
+                _delete_resource(api, f"/ssh-keys/{key_id}")
         except Exception as cleanup_error:
             resource = state["id"] if state else key_id
             print(f"WARNING: cleanup incomplete for {resource}: {cleanup_error}", file=sys.stderr)
@@ -177,6 +204,8 @@ def destroy(args):
     api = client_from_env()
     tracked = load_state(required=False)
     instance_id = getattr(args, "id", None)
+    if not instance_id:
+        tracked = _resolve_tracked(api, tracked)
     if instance_id and (not tracked or tracked.get("id") != instance_id):
         state = {"id": instance_id}
     else:
@@ -189,7 +218,10 @@ def destroy(args):
 def status(args):
     api = client_from_env()
     tracked = load_state(required=False)
-    instance_id = getattr(args, "id", None) or (tracked or {}).get("id")
+    requested_id = getattr(args, "id", None)
+    if not requested_id:
+        tracked = _resolve_tracked(api, tracked)
+    instance_id = requested_id or (tracked or {}).get("id")
     if not instance_id:
         raise RuntimeError("no tracked instance; pass --id for recovery")
     state = tracked if tracked and tracked.get("id") == instance_id else None

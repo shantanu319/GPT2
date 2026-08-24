@@ -119,6 +119,29 @@ def test_ambiguous_create_response_recovers_instance_by_unique_label(monkeypatch
     assert ("DELETE", "/ssh-keys/key-1", None) in api.calls
 
 
+def test_unresolved_create_keeps_provisional_state_and_key(monkeypatch):
+    class LostResponseAPI(API):
+        def request(self, method, path, payload=None, auth=True):
+            if (method, path) == ("POST", "/instances"):
+                raise RuntimeError("transport error: response lost")
+            if (method, path) == ("GET", "/instances?per_page=500"):
+                return {"instances": []}
+            return super().request(method, path, payload, auth)
+
+    api = LostResponseAPI()
+    arrange(monkeypatch, api)
+    saved = []
+    cleared = []
+    monkeypatch.setattr(lifecycle, "save_state", lambda state: saved.append(state.copy()))
+    monkeypatch.setattr(lifecycle, "clear_state", lambda: cleared.append(True))
+    monkeypatch.setattr(lifecycle.time, "sleep", lambda seconds: None)
+    with pytest.raises(RuntimeError, match="response lost"):
+        lifecycle.provision(args())
+    assert saved[-1]["status"] == "provisioning"
+    assert not cleared
+    assert not any(call[:2] == ("DELETE", "/ssh-keys/key-1") for call in api.calls)
+
+
 def test_destroy_removes_only_pipeline_owned_key(monkeypatch):
     api = API()
     monkeypatch.setattr(lifecycle, "clear_state", lambda: None)
