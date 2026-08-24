@@ -17,6 +17,8 @@ class API:
 
     def request(self, method, path, payload=None, auth=True):
         self.calls.append((method, path, payload))
+        if method == "GET" and path.startswith("/regions/"):
+            return {"available_plans": ["vcg-test"]}
         if (method, path) == ("POST", "/instances"):
             return {"instance": {"id": "instance-1"}}
         if method == "GET" and path.startswith("/instances/"):

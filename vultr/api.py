@@ -56,6 +56,20 @@ def list_gpu_plans(client=None):
     return list_plans("vcg", client)
 
 
+def select_live_plan(client, plans, plan_type, selector):
+    remaining = [{**plan, "locations": list(plan.get("locations", []))} for plan in plans]
+    while True:
+        plan, region = selector(remaining)
+        path = f"/regions/{urllib.parse.quote(region)}/availability?type={plan_type}"
+        available = client.request("GET", path, auth=False).get("available_plans", [])
+        if plan["id"] in available:
+            return plan, region
+        for candidate in remaining:
+            if candidate["id"] == plan["id"]:
+                candidate["locations"].remove(region)
+                break
+
+
 def select_plan(plans, min_vram=20, plan_id=None, region=None):
     candidates = [plan for plan in plans if plan.get("deploy_ondemand")]
     if plan_id:

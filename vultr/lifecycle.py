@@ -3,7 +3,8 @@ import sys
 import time
 
 from vultr.api import (
-    client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_plan,
+    client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_live_plan,
+    select_plan,
 )
 from vultr.remote import (
     claim_state, clear_state, ensure_ssh_key, load_state, run_remote, save_state, wait_ready,
@@ -69,10 +70,16 @@ def _confirm_instance_deleted(api, instance_id, attempts=12):
 def provision(args, bootstrap_instance=True):
     api = client_from_env()
     if getattr(args, "compute", False):
-        plan, region = select_compute_plan(list_plans("vc2", api), region=args.region)
+        plan, region = select_live_plan(
+            api, list_plans("vc2", api), "vc2",
+            lambda plans: select_compute_plan(plans, region=args.region),
+        )
     else:
-        plan, region = select_plan(
-            list_gpu_plans(api), min_vram=args.min_vram, plan_id=args.plan, region=args.region
+        plan, region = select_live_plan(
+            api, list_gpu_plans(api), "vcg",
+            lambda plans: select_plan(
+                plans, min_vram=args.min_vram, plan_id=args.plan, region=args.region
+            ),
         )
     key_id = None
     key_created = False

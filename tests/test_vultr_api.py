@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from vultr.api import VultrAPI, select_compute_plan, select_plan
+from vultr.api import VultrAPI, select_compute_plan, select_live_plan, select_plan
 
 
 class Response:
@@ -56,6 +56,18 @@ def test_select_compute_plan_skips_too_small_instances():
     ]
     plan, region = select_compute_plan(compute)
     assert (plan["id"], region) == ("viable", "ewr")
+
+
+def test_select_live_plan_skips_regions_without_capacity():
+    class Client:
+        def request(self, method, path, auth=True):
+            available = ["cheap"] if "/ord/" in path else []
+            return {"available_plans": available}
+
+    plan, region = select_live_plan(
+        Client(), plans(), "vcg", lambda items: select_plan(items, plan_id="cheap")
+    )
+    assert (plan["id"], region) == ("cheap", "ord")
 
 
 def test_request_sends_bearer_token_and_json(monkeypatch):
