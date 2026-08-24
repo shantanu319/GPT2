@@ -21,6 +21,12 @@ esac
 DIR_NAME="${DIR_NAME:-${PROVIDER}_run}"
 SFT_DIR_NAME="${SFT_DIR_NAME:-${PROVIDER}_run_sft}"
 DPO_DIR_NAME="${DPO_DIR_NAME:-${PROVIDER}_run_dpo}"
+for name in "$DIR_NAME" "$SFT_DIR_NAME" "$DPO_DIR_NAME"; do
+  if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    echo "run names may contain only letters, numbers, dot, underscore, and hyphen" >&2
+    exit 2
+  fi
+done
 MAX_HOURS="${MAX_HOURS:-7}"
 DESTROY_ON_TIMEOUT="${DESTROY_ON_TIMEOUT:-0}"
 REMOTE=/root/myowntransformer

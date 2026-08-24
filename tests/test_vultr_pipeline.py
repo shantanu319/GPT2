@@ -95,3 +95,20 @@ def test_smoke_keep_flag_skips_cleanup(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError, match="boom"):
         smoke_module.smoke(smoke_args(tmp_path, keep=True))
+
+
+def test_smoke_honors_an_explicit_vram_floor(monkeypatch, tmp_path):
+    captured = []
+    state = {"id": "instance-1", "hourly_cost": 0.059}
+    monkeypatch.setattr(
+        smoke_module, "provision",
+        lambda args, **kwargs: captured.append(args.min_vram) or ("api", state),
+    )
+    monkeypatch.setattr(
+        smoke_module, "_bootstrap",
+        lambda *unused, **kwargs: (_ for _ in ()).throw(RuntimeError("stop")),
+    )
+    monkeypatch.setattr(smoke_module, "destroy_state", lambda *unused: None)
+    with pytest.raises(RuntimeError, match="stop"):
+        smoke_module.smoke(smoke_args(tmp_path))
+    assert captured == [99]

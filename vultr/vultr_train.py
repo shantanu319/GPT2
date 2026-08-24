@@ -29,7 +29,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    command = commands.add_parser("plans", help="list live on-demand GPU plans by price")
+    command = commands.add_parser("plans", help="list catalog on-demand GPU plans by price")
     command.add_argument("--min-vram", type=int, default=0)
     command.set_defaults(func=print_plans)
 

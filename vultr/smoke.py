@@ -44,7 +44,6 @@ print("synthetic smoke shards ready")
 
 
 def smoke(args):
-    args.min_vram = 2
     args.label = "mot-vultr-smoke"
     started = time.time()
     api = state = None
