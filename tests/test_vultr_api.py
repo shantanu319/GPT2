@@ -1,0 +1,117 @@
+import io
+import json
+import urllib.error
+
+import pytest
+
+from vultr.api import VultrAPI, per_device_vram, select_compute_plan, select_live_plan, select_plan
+
+
+class Response:
+    def __init__(self, body=b"{}"):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def read(self):
+        return self.body
+
+
+def plans():
+    return [
+        {"id": "cheap", "hourly_cost": 0.06, "gpu_vram_gb": 2,
+         "deploy_ondemand": True, "locations": ["ewr", "ord"]},
+        {"id": "roomy", "hourly_cost": 0.90, "gpu_vram_gb": 32,
+         "deploy_ondemand": True, "locations": ["sgp"]},
+        {"id": "sold-out", "hourly_cost": 0.50, "gpu_vram_gb": 24,
+         "deploy_ondemand": True, "locations": []},
+    ]
+
+
+def test_select_plan_chooses_cheapest_available_match():
+    plan, region = select_plan(plans(), min_vram=20)
+    assert (plan["id"], region) == ("roomy", "sgp")
+
+
+def test_select_plan_applies_vram_floor_per_device():
+    multi_gpu = {
+        "id": "two-small", "hourly_cost": 0.50, "gpu_vram_gb": 32, "gpu_count": 2,
+        "deploy_ondemand": True, "locations": ["ewr"],
+    }
+    plan, _ = select_plan([multi_gpu, *plans()], min_vram=20)
+    assert plan["id"] == "roomy"
+    assert per_device_vram(multi_gpu) == 16
+
+
+def test_select_plan_honors_exact_plan_and_region():
+    plan, region = select_plan(plans(), plan_id="cheap", region="ord")
+    assert (plan["id"], region) == ("cheap", "ord")
+
+
+def test_select_plan_rejects_unavailable_capacity():
+    with pytest.raises(RuntimeError, match="no on-demand"):
+        select_plan(plans(), plan_id="sold-out")
+
+
+def test_select_compute_plan_skips_too_small_instances():
+    compute = [
+        {"id": "tiny", "hourly_cost": 0.005, "ram": 512,
+         "deploy_ondemand": True, "locations": ["ewr"]},
+        {"id": "viable", "hourly_cost": 0.007, "ram": 1024,
+         "deploy_ondemand": True, "locations": ["ewr"]},
+    ]
+    plan, region = select_compute_plan(compute)
+    assert (plan["id"], region) == ("viable", "ewr")
+
+
+def test_select_live_plan_skips_regions_without_capacity():
+    class Client:
+        def request(self, method, path, auth=True):
+            available = ["cheap"] if "/ord/" in path else []
+            return {"available_plans": available}
+
+    plan, region = select_live_plan(
+        Client(), plans(), "vcg", lambda items: select_plan(items, plan_id="cheap")
+    )
+    assert (plan["id"], region) == ("cheap", "ord")
+
+
+def test_request_sends_bearer_token_and_json(monkeypatch):
+    captured = {}
+
+    def open_request(request, timeout):
+        captured.update(request=request, timeout=timeout)
+        return Response(json.dumps({"ok": True}).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", open_request)
+    result = VultrAPI("secret").request("POST", "/instances", {"plan": "cheap"})
+    request = captured["request"]
+    assert result == {"ok": True}
+    assert request.get_header("Authorization") == "Bearer secret"
+    assert json.loads(request.data) == {"plan": "cheap"}
+    assert captured["timeout"] == 30
+
+
+def test_request_surfaces_api_error_without_token(monkeypatch):
+    error = urllib.error.HTTPError(
+        "url", 403, "Forbidden", {}, io.BytesIO(b'{"error":"denied"}')
+    )
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError, match='HTTP 403.*denied'):
+        VultrAPI("secret").request("GET", "/instances")
+
+
+def test_request_normalizes_transport_errors_for_cleanup_retries(monkeypatch):
+    error = urllib.error.URLError("temporary failure")
+    monkeypatch.setattr("urllib.request.urlopen", lambda *args, **kwargs: (_ for _ in ()).throw(error))
+    with pytest.raises(RuntimeError, match="transport error.*temporary failure"):
+        VultrAPI("secret").request("DELETE", "/instances/test")
+
+
+def test_authenticated_request_requires_key():
+    with pytest.raises(RuntimeError, match="VULTR_API_KEY"):
+        VultrAPI().request("GET", "/instances")
