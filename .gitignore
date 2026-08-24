@@ -10,6 +10,9 @@ learning_curves.png
 modal_out/
 vast_out/
 .vast_instance.json
+vultr_out/
+.vultr_instance.json
 .env.local
 .DS_Store
 watch_pipeline.log
+watch_vultr_pipeline.log
