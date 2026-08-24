@@ -195,7 +195,9 @@ def destroy_state(api, state):
     if errors:
         raise RuntimeError(f"cleanup incomplete for instance {state['id']}: {errors}")
     tracked = load_state(required=False)
-    if tracked and tracked.get("id") == state["id"]:
+    same_id = tracked and tracked.get("id") == state["id"]
+    same_label = tracked and state.get("label") and tracked.get("label") == state["label"]
+    if same_id or same_label:
         clear_state()
     print(f"destroyed instance {state['id']}; billing stopped")
 
@@ -206,7 +208,9 @@ def destroy(args):
     instance_id = getattr(args, "id", None)
     if not instance_id:
         tracked = _resolve_tracked(api, tracked)
-    if instance_id and (not tracked or tracked.get("id") != instance_id):
+    if instance_id and tracked and "id" not in tracked:
+        state = {**tracked, "id": instance_id}
+    elif instance_id and (not tracked or tracked.get("id") != instance_id):
         state = {"id": instance_id}
     else:
         state = tracked
