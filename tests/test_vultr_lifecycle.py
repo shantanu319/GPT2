@@ -19,6 +19,8 @@ class API:
         self.calls.append((method, path, payload))
         if (method, path) == ("POST", "/instances"):
             return {"instance": {"id": "instance-1"}}
+        if method == "GET" and path.startswith("/instances/"):
+            raise RuntimeError("HTTP 404: gone")
         return {}
 
 
@@ -75,9 +77,13 @@ def test_destroy_removes_only_pipeline_owned_key(monkeypatch):
     lifecycle.destroy_state(api, state)
     assert api.calls == [
         ("DELETE", "/instances/instance-1", None),
+        ("GET", "/instances/instance-1", None),
         ("DELETE", "/ssh-keys/key-1", None),
     ]
 
     api.calls.clear()
     lifecycle.destroy_state(api, {**state, "ssh_key_created": False})
-    assert api.calls == [("DELETE", "/instances/instance-1", None)]
+    assert api.calls == [
+        ("DELETE", "/instances/instance-1", None),
+        ("GET", "/instances/instance-1", None),
+    ]

@@ -1,4 +1,6 @@
 import os
+import sys
+import time
 
 from vultr.api import (
     client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_plan,
@@ -34,6 +36,31 @@ def bootstrap(state):
     )
 
 
+def _delete_resource(api, path, retries=3):
+    for attempt in range(retries):
+        try:
+            api.request("DELETE", path)
+            return
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                return
+            if attempt == retries - 1:
+                raise
+            time.sleep(2 ** attempt)
+
+
+def _confirm_instance_deleted(api, instance_id, attempts=12):
+    for _ in range(attempts):
+        try:
+            api.request("GET", f"/instances/{instance_id}")
+        except RuntimeError as error:
+            if "HTTP 404" in str(error):
+                return
+            raise
+        time.sleep(2)
+    raise RuntimeError(f"instance {instance_id} still exists after delete")
+
+
 def provision(args, bootstrap_instance=True):
     api = client_from_env()
     if getattr(args, "compute", False):
@@ -44,7 +71,7 @@ def provision(args, bootstrap_instance=True):
         )
     public_key = os.path.expanduser(args.ssh_public_key)
     key_id, key_created = ensure_ssh_key(api, public_key)
-    instance_id = None
+    state = None
     try:
         print(f"creating {plan['id']} in {region} (${plan['hourly_cost']:.3f}/hr)...")
         result = api.request("POST", "/instances", {
@@ -57,30 +84,45 @@ def provision(args, bootstrap_instance=True):
             "activation_email": False,
         })
         instance_id = result["instance"]["id"]
-        state = wait_ready(api, instance_id, args.ssh_private_key)
-        state.update({
+        state = {
+            "id": instance_id, "ssh_host": "", "ssh_private_key": args.ssh_private_key,
             "plan": plan["id"], "region": region,
             "hourly_cost": plan["hourly_cost"], "gpu": plan.get("gpu_type", "CPU"),
             "ssh_key_id": key_id, "ssh_key_created": key_created,
-        })
+        }
+        save_state(state)
+        state.update(wait_ready(api, instance_id, args.ssh_private_key))
         save_state(state)
         if bootstrap_instance:
             bootstrap(state)
         print(f"instance ready: {state['ssh_host']} ({state['gpu']})")
         return api, state
-    except Exception:
-        if instance_id:
-            api.request("DELETE", f"/instances/{instance_id}")
-        if key_created:
-            api.request("DELETE", f"/ssh-keys/{key_id}")
-        clear_state()
+    except BaseException:
+        try:
+            if state:
+                destroy_state(api, state)
+            elif key_created:
+                _delete_resource(api, f"/ssh-keys/{key_id}")
+        except Exception as cleanup_error:
+            resource = state["id"] if state else key_id
+            print(f"WARNING: cleanup incomplete for {resource}: {cleanup_error}", file=sys.stderr)
         raise
 
 
 def destroy_state(api, state):
-    api.request("DELETE", f"/instances/{state['id']}")
-    if state.get("ssh_key_created"):
-        api.request("DELETE", f"/ssh-keys/{state['ssh_key_id']}")
+    errors = []
+    try:
+        _delete_resource(api, f"/instances/{state['id']}")
+        _confirm_instance_deleted(api, state["id"])
+    except Exception as error:
+        errors.append(error)
+    try:
+        if state.get("ssh_key_created"):
+            _delete_resource(api, f"/ssh-keys/{state['ssh_key_id']}")
+    except Exception as error:
+        errors.append(error)
+    if errors:
+        raise RuntimeError(f"cleanup incomplete for instance {state['id']}: {errors}")
     clear_state()
     print(f"destroyed instance {state['id']}; billing stopped")
 
