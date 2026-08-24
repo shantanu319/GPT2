@@ -6,17 +6,20 @@ from vultr.remote import REMOTE_ROOT, rsync, run_remote
 
 
 def _bootstrap(state, compute=False):
-    swap = ("fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile >/dev/null && "
-            "swapon /swapfile && ") if compute else ""
-    torch_index = "--index-url https://download.pytorch.org/whl/cpu " if compute else ""
+    swap = ("(swapon --show --noheadings | grep -q . || (fallocate -l 2G /swapfile && "
+            "chmod 600 /swapfile && mkswap /swapfile >/dev/null && swapon /swapfile)) && "
+            if compute else "")
+    runtime = ("/opt/myowntransformer/bin/pip install -q --index-url "
+               "https://download.pytorch.org/whl/cpu torch==2.11.0 && "
+               "/opt/myowntransformer/bin/pip install -q matplotlib" if compute else
+               "/opt/myowntransformer/bin/pip install -q torch==2.11.0 matplotlib")
     run_remote(
         state,
         "cloud-init status --wait && export DEBIAN_FRONTEND=noninteractive && "
         "apt-get update -qq && apt-get install -y -qq python3-venv rsync && "
         f"{swap}"
         "python3 -m venv /opt/myowntransformer && "
-        "/opt/myowntransformer/bin/pip install -q --upgrade pip && "
-        f"/opt/myowntransformer/bin/pip install -q {torch_index}torch==2.11.0 matplotlib",
+        "/opt/myowntransformer/bin/pip install -q --upgrade pip && " + runtime,
     )
 
 
@@ -67,7 +70,7 @@ def smoke(args):
         run_remote(state, f"mkdir -p {REMOTE_ROOT}")
         rsync(state, "./", f"root@{state['ssh_host']}:{REMOTE_ROOT}/")
         _make_data(state)
-        print("[smoke] running tiny eager CUDA training...")
+        print("[smoke] running tiny eager training...")
         run_remote(
             state,
             f"cd {REMOTE_ROOT} && MPLBACKEND=Agg /opt/myowntransformer/bin/python -u "
