@@ -1,6 +1,8 @@
 import os
 
-from vultr.api import client_from_env, list_gpu_plans, select_plan
+from vultr.api import (
+    client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_plan,
+)
 from vultr.remote import clear_state, ensure_ssh_key, load_state, run_remote, save_state, wait_ready
 
 
@@ -34,9 +36,12 @@ def bootstrap(state):
 
 def provision(args, bootstrap_instance=True):
     api = client_from_env()
-    plan, region = select_plan(
-        list_gpu_plans(api), min_vram=args.min_vram, plan_id=args.plan, region=args.region
-    )
+    if getattr(args, "compute", False):
+        plan, region = select_compute_plan(list_plans("vc2", api), region=args.region)
+    else:
+        plan, region = select_plan(
+            list_gpu_plans(api), min_vram=args.min_vram, plan_id=args.plan, region=args.region
+        )
     public_key = os.path.expanduser(args.ssh_public_key)
     key_id, key_created = ensure_ssh_key(api, public_key)
     instance_id = None
@@ -55,7 +60,7 @@ def provision(args, bootstrap_instance=True):
         state = wait_ready(api, instance_id, args.ssh_private_key)
         state.update({
             "plan": plan["id"], "region": region,
-            "hourly_cost": plan["hourly_cost"], "gpu": plan["gpu_type"],
+            "hourly_cost": plan["hourly_cost"], "gpu": plan.get("gpu_type", "CPU"),
             "ssh_key_id": key_id, "ssh_key_created": key_created,
         })
         save_state(state)
