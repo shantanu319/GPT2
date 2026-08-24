@@ -98,3 +98,14 @@ def test_destroy_removes_only_pipeline_owned_key(monkeypatch):
         ("DELETE", "/instances/instance-1", None),
         ("GET", "/instances/instance-1", None),
     ]
+
+
+def test_destroy_by_id_preserves_a_different_tracked_instance(monkeypatch):
+    api = API()
+    cleared = []
+    monkeypatch.setattr(lifecycle, "client_from_env", lambda: api)
+    monkeypatch.setattr(lifecycle, "load_state", lambda required=False: {"id": "tracked"})
+    monkeypatch.setattr(lifecycle, "clear_state", lambda: cleared.append(True))
+    lifecycle.destroy(SimpleNamespace(id="recovery"))
+    assert ("DELETE", "/instances/recovery", None) in api.calls
+    assert not cleared

@@ -62,13 +62,17 @@ def main():
     command.add_argument("--dpo-epochs", type=int, default=2)
     command.set_defaults(func=pipeline)
 
-    commands.add_parser("status", help="show instance and pipeline status").set_defaults(func=status)
+    command = commands.add_parser("status", help="show instance and pipeline status")
+    command.add_argument("--id", help="instance ID for recovery without a state file")
+    command.set_defaults(func=status)
 
     command = commands.add_parser("pull", help="download checkpoints and logs")
     command.add_argument("--out", default=PULL_DIR)
     command.set_defaults(func=pull)
 
-    commands.add_parser("destroy", help="destroy the instance and stop billing").set_defaults(func=destroy)
+    command = commands.add_parser("destroy", help="destroy the instance and stop billing")
+    command.add_argument("--id", help="instance ID for recovery without a state file")
+    command.set_defaults(func=destroy)
 
     command = commands.add_parser("smoke", help="run tiny training on the cheapest GPU, then destroy it")
     add_instance_args(command, min_vram=2)

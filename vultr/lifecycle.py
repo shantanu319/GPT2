@@ -142,22 +142,37 @@ def destroy_state(api, state):
         errors.append(error)
     if errors:
         raise RuntimeError(f"cleanup incomplete for instance {state['id']}: {errors}")
-    clear_state()
+    tracked = load_state(required=False)
+    if tracked and tracked.get("id") == state["id"]:
+        clear_state()
     print(f"destroyed instance {state['id']}; billing stopped")
 
 
 def destroy(args):
     api = client_from_env()
-    state = load_state()
+    tracked = load_state(required=False)
+    instance_id = getattr(args, "id", None)
+    if instance_id and (not tracked or tracked.get("id") != instance_id):
+        state = {"id": instance_id}
+    else:
+        state = tracked
+    if not state or "id" not in state:
+        raise RuntimeError("no tracked instance; pass --id for recovery")
     destroy_state(api, state)
 
 
 def status(args):
     api = client_from_env()
-    state = load_state()
-    info = api.request("GET", f"/instances/{state['id']}")["instance"]
-    print(f"instance {state['id']}: {info['status']} / {info['power_status']} / "
-          f"{info['server_status']} | {state['plan']} @ ${state['hourly_cost']:.3f}/hr")
-    if info["status"] == "active":
+    tracked = load_state(required=False)
+    instance_id = getattr(args, "id", None) or (tracked or {}).get("id")
+    if not instance_id:
+        raise RuntimeError("no tracked instance; pass --id for recovery")
+    state = tracked if tracked and tracked.get("id") == instance_id else None
+    info = api.request("GET", f"/instances/{instance_id}")["instance"]
+    plan = (state or {}).get("plan", info.get("plan", "unknown plan"))
+    rate = f" @ ${state['hourly_cost']:.3f}/hr" if state else ""
+    print(f"instance {instance_id}: {info['status']} / {info['power_status']} / "
+          f"{info['server_status']} | {plan}{rate}")
+    if info["status"] == "active" and state and state.get("ssh_host"):
         run_remote(state, "cd /root/myowntransformer && tail -n 20 pipeline.log 2>/dev/null || true",
                    check=False)
