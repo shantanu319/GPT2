@@ -56,6 +56,14 @@ def test_provision_passes_ephemeral_key_and_records_cost(monkeypatch):
     assert state["ssh_key_created"] is True
 
 
+def test_gpu_bootstrap_fails_closed_without_cuda(monkeypatch):
+    commands = []
+    monkeypatch.setattr(lifecycle, "run_remote", lambda state, command: commands.append(command))
+    lifecycle.bootstrap({})
+    assert "nvidia-smi" in commands[0]
+    assert "assert torch.cuda.is_available()" in commands[0]
+
+
 def test_provision_cleans_up_instance_and_key_when_readiness_fails(monkeypatch):
     api = API()
     arrange(monkeypatch, api)
