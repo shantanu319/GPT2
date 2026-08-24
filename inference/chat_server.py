@@ -21,9 +21,10 @@ import sys
 import torch
 
 from core.chat_format import DEFAULT_SYSTEM, IM_END, IM_START, render_turn
-from core.model import load_checkpoint, model_from_checkpoint, nopeak_mask
+from core.model import load_checkpoint
 from core.tokenizer import BPETokenizer
-from inference.sample import decode_loop, prefill_logits, reprefill_window
+from inference.sample import (BACKENDS, build_backend, checkpoint_params,
+                              decode_loop, reprefill_window)
 
 
 def log(msg):
@@ -36,18 +37,9 @@ def _send(obj):
     sys.stdout.flush()
 
 
-def _resolve_device(no_cuda):
-    if not no_cuda:
-        if torch.cuda.is_available():
-            return torch.device("cuda:0")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-    return torch.device("cpu")
-
-
 @torch.no_grad()
 def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
-                  max_tokens, temperature, top_p, max_context, device,
+                  max_tokens, temperature, top_p, max_context, backend,
                   stop_ids=None):
     """Extend context_ids with new_prompt_ids, generate up to max_tokens, append
     generated tokens in place. Returns (newly_generated_ids, new_cache_len).
@@ -63,16 +55,15 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     if cache_len + len(new_prompt_ids) > max_context:
         model.reset_cache()
         window = reprefill_window(context_ids, max_context)
-        last_logits = prefill_logits(model, window, device)
+        last_logits = backend.prefill(model, window)
         cache_len = len(window)
     elif cache_len == 0:
-        last_logits = prefill_logits(model, new_prompt_ids, device)
+        last_logits = backend.prefill(model, new_prompt_ids)
         cache_len = len(new_prompt_ids)
     else:
         # Multi-turn continuation: extend the cache with the whole new prompt in
         # one forward, under a rectangular causal mask over cache + prompt.
-        last_logits = prefill_logits(model, new_prompt_ids, device,
-                                     start_pos=cache_len)
+        last_logits = backend.prefill(model, new_prompt_ids, start_pos=cache_len)
         cache_len += len(new_prompt_ids)
 
     stop_ids = set(stop_ids or ())
@@ -82,7 +73,7 @@ def generate_into(context_ids, cache_len, new_prompt_ids, model, eos_id,
     start = len(context_ids)
     n, cache_len = decode_loop(model, last_logits, context_ids, cache_len,
                                max_tokens, temperature, top_p, max_context,
-                               device, stop_ids)
+                               backend, stop_ids)
     return context_ids[start:start + n], cache_len
 
 
@@ -95,15 +86,15 @@ def main():
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--max-context', type=int, default=512)
     parser.add_argument('--no-cuda', action='store_true')
+    parser.add_argument('--backend', choices=BACKENDS, default='torch',
+                        help='Inference runtime: torch (CUDA/MPS/CPU), or MLX on '
+                             'Apple silicon, optionally 4- or 8-bit quantized')
     parser.add_argument('--raw', action='store_true',
                         help='Disable the chat template (raw LM continuation), '
                              'e.g. for pretrain-only checkpoints')
     parser.add_argument('--system', default=DEFAULT_SYSTEM,
                         help='System prompt used in chat-template mode')
     args = parser.parse_args()
-
-    device = _resolve_device(args.no_cuda)
-    log(f"device: {device}")
 
     tokenizer = BPETokenizer()
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
@@ -113,8 +104,9 @@ def main():
     if 'config' not in ckpt or ckpt['config'] is None:
         _send({"type": "error", "error": "checkpoint missing 'config' field"})
         return
-    model = model_from_checkpoint(ckpt, device)
-    log(f"model loaded: {sum(p.numel() for p in model.parameters()):,} params")
+    model, backend, label = build_backend(ckpt, args.backend, args.no_cuda)
+    log(f"backend: {label}")
+    log(f"model loaded: {checkpoint_params(ckpt):,} params")
 
     eos_id = tokenizer.special_tokens.get('<|endoftext|>')
     im_end_id = tokenizer.special_tokens.get(IM_END)
@@ -163,7 +155,7 @@ def main():
                     temperature=msg.get("temperature", args.temperature),
                     top_p=msg.get("top_p", args.top_p),
                     max_context=args.max_context,
-                    device=device,
+                    backend=backend,
                     stop_ids=stop_ids,
                 )
                 if chat_mode and new_ids and new_ids[-1] in stop_ids | {eos_id}:

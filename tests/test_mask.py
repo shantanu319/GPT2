@@ -34,21 +34,21 @@ def test_chunked_prefill_matches_token_by_token():
     """Feeding a chunk into an existing cache must equal feeding it one token
     at a time -- the batched multi-turn prefill path in chat_server."""
     from core.model import Transformer
-    from inference.sample import prefill_logits
+    from inference.sample import TorchBackend
 
-    dev = torch.device("cpu")
+    backend = TorchBackend(torch.device("cpu"))
     torch.manual_seed(0)
     model = Transformer(vocab=64, d_model=32, N=2, heads=2, dropout=0.0, kv_heads=1).eval()
     ctx, new = [3, 9, 14, 2, 7], [11, 5, 30, 1]
 
     with torch.no_grad():
         model.reset_cache()
-        prefill_logits(model, ctx, dev)
+        backend.prefill(model, ctx)
         for i, tok in enumerate(new):
             one = model(torch.tensor([[tok]]), None, start_pos=len(ctx) + i)[:, -1, :]
 
         model.reset_cache()
-        prefill_logits(model, ctx, dev)
-        chunk = prefill_logits(model, new, dev, start_pos=len(ctx))
+        backend.prefill(model, ctx)
+        chunk = backend.prefill(model, new, start_pos=len(ctx))
 
     assert torch.allclose(one, chunk, atol=1e-5)

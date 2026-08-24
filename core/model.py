@@ -67,10 +67,12 @@ class RMSNorm(nn.RMSNorm):
 
 def attention(q, k, v, mask=None, dropout_p=0.0, is_causal=False):
     # Wrap SDPA so we keep the (1, T, S) bool-mask convention used by nopeak_mask.
+    # enable_gqa lets it broadcast fewer KV heads over the query groups itself;
+    # with as many KV heads as query heads it is a no-op.
     if mask is not None and mask.dim() == 3:
         mask = mask.unsqueeze(1)
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p,
-                                          is_causal=is_causal)
+                                          is_causal=is_causal, enable_gqa=True)
 
 
 def window_band_mask(T, S, offset, window, device):
@@ -154,7 +156,6 @@ class MultiHeadAttention(nn.Module):
         self.h = heads
         self.h_kv = kv_heads or heads
         assert heads % self.h_kv == 0, "heads must be divisible by kv_heads"
-        self.groups = heads // self.h_kv
 
         # rotate an even number of dims per head
         self.rot_dim = max(2, int(self.d_k * rope_frac) // 2 * 2)
@@ -260,15 +261,8 @@ class MultiHeadAttention(nn.Module):
         dropout_p = self.dropout.p if self.training else 0.0
         if start_pos is None and self.window and T > self.window:
             scores = window_attention(q, k, v, self.window, mask, dropout_p,
-                                      enable_gqa=self.groups > 1)
-        elif mask is None and start_pos is None and q.device.type == 'cuda':
-            # Training fast path: flash SDPA handles GQA without expanding K/V.
-            scores = F.scaled_dot_product_attention(
-                q, k, v, is_causal=True, dropout_p=dropout_p, enable_gqa=True)
+                                      enable_gqa=True)
         else:
-            if self.groups > 1:
-                k = k.repeat_interleave(self.groups, dim=1)
-                v = v.repeat_interleave(self.groups, dim=1)
             # mask None + no cache means causal training; mask None + cache means
             # single-chunk decode attending over the whole cache (not causal).
             scores = attention(q, k, v, mask, dropout_p,
