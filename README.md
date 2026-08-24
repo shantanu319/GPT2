@@ -163,7 +163,7 @@ the verified smoke completed in 4.4 minutes and pulled a 16-step checkpoint. Sto
 instances still bill; only `destroy` stops billing.
 
 For a real run, the CLI selects the cheapest currently available plan with at least
-20 GB VRAM (override with `--plan`, `--region`, or `--min-vram`):
+20 GB VRAM per GPU (override with `--plan`, `--region`, or `--min-vram`):
 
     python3 vultr/vultr_train.py create
     python3 vultr/vultr_train.py push
