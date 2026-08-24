@@ -4,7 +4,7 @@ import urllib.error
 
 import pytest
 
-from vultr.api import VultrAPI, select_compute_plan, select_live_plan, select_plan
+from vultr.api import VultrAPI, per_device_vram, select_compute_plan, select_live_plan, select_plan
 
 
 class Response:
@@ -35,6 +35,16 @@ def plans():
 def test_select_plan_chooses_cheapest_available_match():
     plan, region = select_plan(plans(), min_vram=20)
     assert (plan["id"], region) == ("roomy", "sgp")
+
+
+def test_select_plan_applies_vram_floor_per_device():
+    multi_gpu = {
+        "id": "two-small", "hourly_cost": 0.50, "gpu_vram_gb": 32, "gpu_count": 2,
+        "deploy_ondemand": True, "locations": ["ewr"],
+    }
+    plan, _ = select_plan([multi_gpu, *plans()], min_vram=20)
+    assert plan["id"] == "roomy"
+    assert per_device_vram(multi_gpu) == 16
 
 
 def test_select_plan_honors_exact_plan_and_region():

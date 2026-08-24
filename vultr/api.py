@@ -3,6 +3,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from fractions import Fraction
 
 
 BASE_URL = "https://api.vultr.com/v2"
@@ -70,12 +71,18 @@ def select_live_plan(client, plans, plan_type, selector):
                 break
 
 
+def per_device_vram(plan):
+    count = Fraction(str(plan.get("gpu_count") or 1))
+    total = plan.get("gpu_vram_gb", 0)
+    return total / float(count) if count > 1 else total
+
+
 def select_plan(plans, min_vram=20, plan_id=None, region=None):
     candidates = [plan for plan in plans if plan.get("deploy_ondemand")]
     if plan_id:
         candidates = [plan for plan in candidates if plan["id"] == plan_id]
     else:
-        candidates = [plan for plan in candidates if plan.get("gpu_vram_gb", 0) >= min_vram]
+        candidates = [plan for plan in candidates if per_device_vram(plan) >= min_vram]
     if region:
         candidates = [plan for plan in candidates if region in plan.get("locations", [])]
     else:

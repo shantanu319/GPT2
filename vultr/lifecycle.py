@@ -4,8 +4,8 @@ import time
 import uuid
 
 from vultr.api import (
-    client_from_env, list_gpu_plans, list_plans, select_compute_plan, select_live_plan,
-    select_plan,
+    client_from_env, list_gpu_plans, list_plans, per_device_vram, select_compute_plan,
+    select_live_plan, select_plan,
 )
 from vultr.remote import (
     claim_state, clear_state, ensure_ssh_key, load_state, run_remote, save_state, wait_ready,
@@ -19,13 +19,15 @@ DEFAULT_PRIVATE_KEY = "~/.ssh/id_ed25519"
 
 def print_plans(args):
     plans = sorted(list_gpu_plans(), key=lambda plan: (plan["hourly_cost"], plan["id"]))
-    print(f"{'plan':<34} {'gpu':<14} {'VRAM':>6} {'$/hr':>7}  regions")
+    print(f"{'plan':<34} {'gpu':<14} {'count':>5} {'VRAM/GPU':>9} {'$/hr':>7}  regions")
     for plan in plans:
-        if plan.get("gpu_vram_gb", 0) < args.min_vram:
+        vram = per_device_vram(plan)
+        if vram < args.min_vram:
             continue
         regions = ",".join(plan.get("locations", [])) or "unavailable"
         print(f"{plan['id']:<34} {plan['gpu_type']:<14} "
-              f"{plan['gpu_vram_gb']:>4}GB {plan['hourly_cost']:>7.3f}  {regions}")
+              f"{str(plan.get('gpu_count', 1)):>5} {vram:>7g}GB "
+              f"{plan['hourly_cost']:>7.3f}  {regions}")
 
 
 def bootstrap(state):
