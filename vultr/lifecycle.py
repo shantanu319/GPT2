@@ -83,11 +83,13 @@ def provision(args, bootstrap_instance=True):
         )
     key_id = None
     key_created = False
+    claimed = False
     state = None
     try:
         public_key = os.path.expanduser(args.ssh_public_key)
         key_id, key_created = ensure_ssh_key(api, public_key)
         claim_state()
+        claimed = True
         print(f"creating {plan['id']} in {region} (${plan['hourly_cost']:.3f}/hr)...")
         result = api.request("POST", "/instances", {
             "region": region,
@@ -121,7 +123,8 @@ def provision(args, bootstrap_instance=True):
                     if key_created:
                         _delete_resource(api, f"/ssh-keys/{key_id}")
                 finally:
-                    clear_state()
+                    if claimed:
+                        clear_state()
         except Exception as cleanup_error:
             resource = state["id"] if state else key_id
             print(f"WARNING: cleanup incomplete for {resource}: {cleanup_error}", file=sys.stderr)

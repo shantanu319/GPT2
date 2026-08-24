@@ -81,6 +81,22 @@ def test_provision_cleans_up_instance_and_key_when_readiness_fails(monkeypatch):
     assert ("DELETE", "/ssh-keys/key-1", None) in api.calls
 
 
+def test_refused_second_provision_preserves_tracked_state(monkeypatch):
+    api = API()
+    arrange(monkeypatch, api)
+    cleared = []
+    monkeypatch.setattr(
+        lifecycle, "claim_state", lambda: (_ for _ in ()).throw(RuntimeError("already tracks live"))
+    )
+    monkeypatch.setattr(lifecycle, "clear_state", lambda: cleared.append(True))
+
+    with pytest.raises(RuntimeError, match="already tracks live"):
+        lifecycle.provision(args())
+
+    assert not cleared
+    assert ("DELETE", "/ssh-keys/key-1", None) in api.calls
+
+
 def test_destroy_removes_only_pipeline_owned_key(monkeypatch):
     api = API()
     monkeypatch.setattr(lifecycle, "clear_state", lambda: None)
