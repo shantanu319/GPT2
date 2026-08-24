@@ -53,6 +53,8 @@ def main():
     command.add_argument("--heads", type=int, default=8)
     command.add_argument("--kv-heads", type=int, default=2)
     command.add_argument("--batchsize", type=int, default=128)
+    command.add_argument("--grad-accum", type=int, default=1)
+    command.add_argument("--grad-ckpt", action="store_true")
     command.add_argument("--seqlen", type=int, default=1024)
     command.add_argument("--epochs", type=int, default=1)
     command.add_argument("--warmup-steps", type=int, default=1000)

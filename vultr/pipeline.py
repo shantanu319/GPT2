@@ -16,6 +16,7 @@ def build_pipeline(args):
     train_args = (
         f"-d_model {args.d_model} -n_layers {args.n_layers} -heads {args.heads} "
         f"-kv_heads {args.kv_heads} -batchsize {args.batchsize} -seqlen {args.seqlen} "
+        f"-grad_accum {args.grad_accum} -grad_ckpt {int(args.grad_ckpt)} "
         f"-epochs {args.epochs} -warmup_steps {args.warmup_steps} "
         f"-save_every {args.save_every} -val_every {args.val_every}"
     )

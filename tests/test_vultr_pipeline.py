@@ -12,6 +12,7 @@ def pipeline_args(**overrides):
     values = {
         "max_train_docs": 10, "d_model": 64, "n_layers": 2, "heads": 2,
         "kv_heads": 1, "batchsize": 4, "seqlen": 64, "epochs": 1,
+        "grad_accum": 1, "grad_ckpt": False,
         "warmup_steps": 2, "save_every": 0, "val_every": 0,
         "dir_name": "base", "sft_dir_name": "chat", "dpo_dir_name": "preference",
         "sft_epochs": 1, "dpo_epochs": 1,
@@ -37,6 +38,12 @@ def test_pipeline_is_resumable_across_all_training_stages():
     assert '[[ ! -f "$DATA/dpo_train.bin" ]]' in script
     assert '[[ ! -f "saved/$DPO/dpo_final.pt" ]]' in script
     assert "PIPELINE COMPLETE" in script
+
+
+def test_pipeline_forwards_pretrain_memory_controls():
+    script = build_pipeline(pipeline_args(batchsize=16, grad_accum=8, grad_ckpt=True))
+    assert "-batchsize 16" in script
+    assert "-grad_accum 8 -grad_ckpt 1" in script
 
 
 def test_pipeline_quotes_run_names():
