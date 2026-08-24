@@ -71,7 +71,7 @@ while true; do
   fi
   tail_line=$("${CLI[@]}" ssh "tail -1 $REMOTE/pipeline.log 2>/dev/null" 2>/dev/null | tail -1)
   note "poll: ${tail_line:-no pipeline.log yet}"
-  if ! "${CLI[@]}" ssh "pgrep -f remote_pipeline.sh >/dev/null" >/dev/null 2>&1; then
+  if ! "${CLI[@]}" ssh "pgrep -f '[r]emote_pipeline.sh' >/dev/null" >/dev/null 2>&1; then
     note "WARNING: pipeline process not running — relaunch with ./scripts/watch_pipeline.sh"
   fi
   sleep 300
