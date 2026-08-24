@@ -125,3 +125,19 @@ def test_smoke_honors_an_explicit_vram_floor(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="stop"):
         smoke_module.smoke(smoke_args(tmp_path))
     assert captured == [99]
+
+
+def test_smoke_does_not_accept_a_stale_local_checkpoint(monkeypatch, tmp_path):
+    checkpoint = tmp_path / "smoke" / "ckpt_final.pt"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"old checkpoint")
+    state = {"id": "instance-1", "hourly_cost": 0.059, "ssh_host": "host"}
+    monkeypatch.setattr(smoke_module, "provision", lambda *args, **kwargs: ("api", state))
+    monkeypatch.setattr(smoke_module, "_bootstrap", lambda *args, **kwargs: None)
+    monkeypatch.setattr(smoke_module, "run_remote", lambda *args, **kwargs: None)
+    monkeypatch.setattr(smoke_module, "rsync", lambda *args, **kwargs: None)
+    monkeypatch.setattr(smoke_module, "_make_data", lambda *args: None)
+    monkeypatch.setattr(smoke_module, "destroy_state", lambda *args: None)
+    with pytest.raises(RuntimeError, match="missing or empty"):
+        smoke_module.smoke(smoke_args(tmp_path))
+    assert not checkpoint.exists()

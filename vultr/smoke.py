@@ -79,10 +79,12 @@ def smoke(args):
         )
         destination = os.path.join(args.out, "smoke")
         os.makedirs(destination, exist_ok=True)
-        rsync(state, f"root@{state['ssh_host']}:{REMOTE_ROOT}/saved/smoke/", f"{destination}/")
         checkpoint = os.path.join(destination, "ckpt_final.pt")
-        if not os.path.getsize(checkpoint):
-            raise RuntimeError("smoke checkpoint is empty")
+        if os.path.exists(checkpoint):
+            os.remove(checkpoint)
+        rsync(state, f"root@{state['ssh_host']}:{REMOTE_ROOT}/saved/smoke/", f"{destination}/")
+        if not os.path.isfile(checkpoint) or not os.path.getsize(checkpoint):
+            raise RuntimeError("smoke checkpoint is missing or empty")
         elapsed = (time.time() - started) / 60
         print(f"[smoke] PASS in {elapsed:.1f} min: {checkpoint}")
         print(f"[smoke] Vultr minimum one-hour charge: ${state['hourly_cost']:.3f}")
