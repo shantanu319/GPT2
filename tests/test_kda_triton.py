@@ -68,6 +68,23 @@ def test_fused_scan_is_as_accurate_as_the_loop(with_state):
         assert err_f <= 2 * err_l + 1e-12, f"{name}: fused {err_f:.3e} > loop {err_l:.3e}"
 
 
+def test_fused_scan_with_no_gradient_on_the_final_state():
+    """The training path keeps only o and drops S, so the kernel is handed no
+    gradient for the state it ends on -- the one case the parity test above,
+    which uses both outputs, cannot reach."""
+    args = _scan_inputs()
+    out = []
+    for fused in (True, False):
+        kda.kda_triton.ENABLED = fused
+        cloned = [x.detach().clone().requires_grad_(True) for x in args]
+        kda.chunk_scan(*cloned[:5], cloned[5], None)[0].square().sum().backward()
+        out.append([x.grad.double() for x in cloned])
+    kda.kda_triton.ENABLED = True
+    for name, f, l in zip(NAMES[2:], *out):
+        scale = l.abs().max().item()
+        assert (f - l).abs().max().item() <= 1e-5 * scale, name
+
+
 def test_fused_scan_takes_the_triton_path():
     """Guard the dispatch itself: a silent fallback would make the rest of
     this file compare the loop against itself."""
@@ -80,6 +97,7 @@ def test_fused_scan_takes_the_triton_path():
         kda.kda_triton.ENABLED = True
     assert not kda.kda_triton.supported(u.cpu(), w.cpu())
     assert not kda.kda_triton.supported(u[..., :8], w[..., :8])  # tile < 16
+    assert not kda.kda_triton.supported(u.double(), w.double())
 
 
 def test_fused_scan_needs_no_grad_state_when_nothing_requires_grad():

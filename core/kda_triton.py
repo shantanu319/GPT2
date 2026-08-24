@@ -4,19 +4,21 @@ core.kda.chunk_scan walks the chunks in Python: a 4k-token window at
 chunk_size 64 is 64 iterations of four small matmuls, and the running state
 makes a round trip to HBM on every one of them. Inductor cannot fuse across
 the carried dependency, so the scan stays launch-bound however well the rest
-of the layer compiles. Here the whole scan is one kernel per (batch, head)
+of the layer compiles. Here the scan is a single kernel per (batch, head)
 with the state resident in registers for its entire length.
 
 Loads are cast to fp32 on arrival: under autocast the operands arrive bf16,
 and a state that is accumulated over NT chunks wants more mantissa than that.
 """
+import os
+
 import torch
 import triton
 import triton.language as tl
 
-ENABLED = True    # off switch for A/B benchmarking
+ENABLED = os.environ.get('KDA_FUSED', '1') != '0'   # A/B off switch
 PRECISION = None  # tl.dot input_precision; None reads it off the operands
-WARPS = None      # (forward, backward) warp counts; None picks them by precision
+WARPS = None      # per-kernel warp counts; None picks them by precision
 STAGES = 1        # the loop is serially dependent, so there is nothing to pipeline
 
 # Tensor-core matmuls want a few wide warps. The fp32 path has no tensor cores,
@@ -151,6 +153,9 @@ class _ChunkScan(torch.autograd.Function):
         u, w, qg, a, kg, dec = (x.contiguous() for x in (u, w, qg, a, kg, dec))
         o = torch.empty_like(u)
         SN = u.new_empty(B, H, K, V, dtype=torch.float32)
+        # the training path keeps only o, so let dSN arrive as None rather
+        # than as a materialized block of zeros to load and add
+        ctx.set_materialize_grads(False)
         save = any(ctx.needs_input_grad)
         prec, (warps, _, _) = _plan((u, w, qg, a, kg, dec))
         SS = u.new_empty(B, H, NT, K, V, dtype=torch.float32) if save else o
@@ -188,9 +193,11 @@ class _ChunkScan(torch.autograd.Function):
 
 
 def supported(u, w):
-    """tl.dot wants power-of-two tiles of at least 16 in every dimension."""
+    """tl.dot wants power-of-two tiles of at least 16 in every dimension, and
+    the state accumulates in fp32, so fp64 operands have to stay on the loop
+    rather than be silently rounded."""
     dims = (u.size(-2), u.size(-1), w.size(-1))
-    return (ENABLED and u.is_cuda
+    return (ENABLED and u.is_cuda and u.dtype is not torch.float64
             and all(d >= 16 and not d & (d - 1) for d in dims))
 
 
