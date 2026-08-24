@@ -246,6 +246,9 @@ def model_from_checkpoint(ckpt, dtype=mx.bfloat16, quantize=0):
 
     quantize (4 or 8) trades accuracy for a smaller, faster weight read."""
     cfg = ckpt['config']
+    if cfg.get('swa', 0):
+        raise ValueError(
+            "MLX inference does not support sliding-window attention; use --backend torch")
     model = Transformer(
         vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
         heads=cfg['heads'], kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),

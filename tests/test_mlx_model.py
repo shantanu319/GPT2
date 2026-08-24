@@ -76,3 +76,8 @@ def test_reset_cache_restarts_generation():
     first = np.array(m(X[:, :5], start_pos=0))
     m.reset_cache()
     assert np.array_equal(first, np.array(m(X[:, :5], start_pos=0)))
+
+
+def test_checkpoint_loader_rejects_sliding_window_attention():
+    with pytest.raises(ValueError, match="sliding-window attention"):
+        mmod.model_from_checkpoint({'config': {'swa': 64}, 'model': {}})
