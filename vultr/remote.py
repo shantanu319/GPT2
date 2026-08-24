@@ -2,6 +2,7 @@ import json
 import os
 import shlex
 import subprocess
+import tempfile
 import time
 
 
@@ -33,8 +34,24 @@ def load_state(required=True):
 
 
 def save_state(state):
-    with open(STATE_FILE, "w") as handle:
-        json.dump(state, handle, indent=2)
+    directory = os.path.dirname(os.path.abspath(STATE_FILE))
+    descriptor, temp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(STATE_FILE)}.", dir=directory
+    )
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(state, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, STATE_FILE)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 
 def claim_state():

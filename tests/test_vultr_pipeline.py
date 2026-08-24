@@ -68,6 +68,19 @@ def test_state_claim_refuses_to_overwrite_an_active_instance(monkeypatch, tmp_pa
         remote.claim_state()
 
 
+def test_interrupted_state_write_preserves_previous_record(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    monkeypatch.setattr(remote, "STATE_FILE", str(state_file))
+    remote.save_state({"status": "provisioning", "label": "recover-me"})
+    monkeypatch.setattr(
+        remote.json, "dump", lambda *unused, **kwargs: (_ for _ in ()).throw(OSError("disk full"))
+    )
+    with pytest.raises(OSError, match="disk full"):
+        remote.save_state({"id": "would-be-lost"})
+    assert remote.load_state() == {"status": "provisioning", "label": "recover-me"}
+    assert list(tmp_path.iterdir()) == [state_file]
+
+
 def test_smoke_destroys_instance_when_bootstrap_fails(monkeypatch, tmp_path):
     state = {"id": "instance-1", "hourly_cost": 0.059}
     destroyed = []
