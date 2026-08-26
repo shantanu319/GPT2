@@ -19,7 +19,7 @@ from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
 from selfdirect.loop import JOURNAL_FILE, Arm, backoff, short_names, take_block
 from selfdirect.loop import main as loop_main
-from selfdirect.report import read_journal, summarize
+from selfdirect.report import print_summary, read_journal, summarize
 
 CORPUS = ("the quick brown fox jumps over the lazy dog "
           "hello world hello there hello friends " * 30)
@@ -364,3 +364,23 @@ def test_summarize_reports_no_reward_for_an_arm_never_studied(tmp_path):
               'probe_after': {'a': 1.0, 'b': 1.0}}]
     rows = {r['arm']: r for r in summarize(read_journal(_journal(tmp_path, lines)))}
     assert rows['b']['reward'] is None
+
+
+def test_summary_does_not_name_a_winner_when_the_weights_are_flat(tmp_path, capsys):
+    flat = {'a': 0.34, 'b': 0.33, 'c': 0.33}
+    probe = {'a': 1.0, 'b': 1.0, 'c': 1.0}
+    lines = [{'round': 1, 'step': 1, 'studied': 'a', 'seconds': 1.0, 'reward': 0.0,
+              'probs': flat, 'probe_before': probe, 'probe_after': probe}]
+    rounds = read_journal(_journal(tmp_path, lines))
+    print_summary(rounds, summarize(rounds))
+    assert 'stayed near uniform' in capsys.readouterr().out
+
+
+def test_summary_names_the_winner_when_one_arm_dominates(tmp_path, capsys):
+    won = {'a': 0.7, 'b': 0.15, 'c': 0.15}
+    probe = {'a': 1.0, 'b': 1.0, 'c': 1.0}
+    lines = [{'round': 1, 'step': 1, 'studied': 'a', 'seconds': 1.0, 'reward': 0.0,
+              'probs': won, 'probe_before': probe, 'probe_after': probe}]
+    rounds = read_journal(_journal(tmp_path, lines))
+    print_summary(rounds, summarize(rounds))
+    assert 'settled on a at 70%' in capsys.readouterr().out

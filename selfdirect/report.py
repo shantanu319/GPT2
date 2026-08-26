@@ -59,9 +59,12 @@ def print_summary(rounds, rows):
     start = mean_probe(rounds[0]['probe_before'])
     now = mean_probe(rounds[-1]['probe_after'])
     print(f"\nmean probe loss {start:.4f} -> {now:.4f} ({now - start:+.4f})")
-    top = rows[0]
-    print(f"the director settled on {top['arm']} at {top['weight']*100:.0f}% "
-          f"(uniform would be {100/len(rows):.0f}%)")
+    top, uniform = rows[0], 1 / len(rows)
+    if top['weight'] < 1.25 * uniform:
+        print("the director stayed near uniform — no arm paid consistently better")
+    else:
+        print(f"the director settled on {top['arm']} at {top['weight']*100:.0f}% "
+              f"(uniform would be {uniform*100:.0f}%)")
 
 
 def print_comparison(runs):
