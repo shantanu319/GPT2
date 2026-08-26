@@ -287,7 +287,12 @@ the other way:
   round-to-round *delta*, so the same tokens have to be scored every time —
   otherwise sampling noise arrives on the same order as the progress being
   measured. It is also disjoint from the arm's train shard, so the loop can
-  never train on its own reward signal.
+  never train on its own reward signal. It is *not* held out of whatever the
+  starting checkpoint was pretrained on — but that matters less than it
+  sounds: the 98M checkpoint scores 2.62 on `prepare.py`'s train split against
+  2.76 on its held-out val split, a 0.14-nat gap, while the five arm probes
+  span 1.9 nats (openmath 1.35 to fineweb-edu 3.27). What separates the arms is
+  domain difficulty, an order of magnitude above the memorization gap.
 - **Probes run fp32 in eval mode.** Measured on MPS, a bf16 autocast probe was
   both less precise and *slower*: under `no_grad` autocast's cast cache is dead,
   so every weight is re-cast on every forward.
