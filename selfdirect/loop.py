@@ -124,6 +124,23 @@ def short_names(names, width=4):
     return [n[:width] for n in names]
 
 
+def round_reward(before, after, idx, mode):
+    """Mean probe-loss drop across arms -- what the director is paid.
+
+    'global' counts every arm, the studied one included: the total-nats
+    objective. It does not stop a run specializing. Measured on the 98M
+    checkpoint, 41 rounds took camel-physics down 0.60 while cosmopedia,
+    finemath and fineweb-edu rose by 0.26 between them, and that is a win
+    arithmetically.
+
+    'transfer' leaves the studied arm out, so an arm is paid only for what it
+    does to the others and improving itself earns nothing."""
+    drops = [b - a for b, a in zip(before, after)]
+    if mode == 'transfer':
+        drops = drops[:idx] + drops[idx + 1:]
+    return sum(drops) / len(drops)
+
+
 def backoff(opt, history):
     """Halve the LR when the global probe loss is no better than it was
     lr_patience rounds ago.
@@ -216,11 +233,10 @@ def run(model, arms, director, opt):
         train_loss = train_block(model, arms[idx], opt)
         after = probe_all(model, arms, opt)
 
-        # Reward: mean probe-loss drop over every arm, not just the one studied.
         # Absolute nats, not proportional: the objective is the loss a uniform
         # mixture of the probes would report, so a domain the model is already
         # good at has less left to give and should say so.
-        reward = sum(b - a for b, a in zip(before, after)) / len(arms)
+        reward = round_reward(before, after, idx, opt.reward)
         scaled = director.update(idx, reward)
         # Folding `after` into the running best first makes the gap below the
         # amount given back since that arm's best, and never negative.
@@ -235,6 +251,7 @@ def run(model, arms, director, opt):
                 'round': opt.round, 'step': opt.step, 'studied': names[idx],
                 'train_loss': train_loss, 'reward': reward, 'scaled': scaled,
                 'forgetting': forgetting, 'lr_scale': opt.lr_scale,
+                'reward_mode': opt.reward,
                 'seconds': round(time.time() - started, 2),
                 'probs': dict(zip(names, probs)),
                 'probe_before': dict(zip(names, before)),
@@ -313,6 +330,10 @@ def parse_args():
     p.add_argument('--lr-floor', type=float, default=0.03,
                    help='Floor for that backoff, as a fraction of the peak LR')
     p.add_argument('--ce-chunk', type=int, default=16384)
+    p.add_argument('--reward', choices=['global', 'transfer'], default='global',
+                   help="What the director is paid: 'global' is the mean probe "
+                        "drop over every arm, 'transfer' leaves the studied arm "
+                        "out so it earns nothing for improving itself")
     p.add_argument('--eta', type=float, default=0.08, help='Director step size')
     p.add_argument('--explore', type=float, default=0.1,
                    help='Total probability held back for exploration')

@@ -17,7 +17,8 @@ from core.model import load_checkpoint, model_from_config
 from core.tokenizer import BPETokenizer
 from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
-from selfdirect.loop import JOURNAL_FILE, Arm, backoff, short_names, take_block
+from selfdirect.loop import (JOURNAL_FILE, Arm, backoff, round_reward,
+                             short_names, take_block)
 from selfdirect.loop import main as loop_main
 from selfdirect.report import print_summary, read_journal, summarize
 
@@ -384,3 +385,16 @@ def test_summary_names_the_winner_when_one_arm_dominates(tmp_path, capsys):
     rounds = read_journal(_journal(tmp_path, lines))
     print_summary(rounds, summarize(rounds))
     assert 'settled on a at 70%' in capsys.readouterr().out
+
+
+def test_global_reward_counts_the_studied_arm():
+    before, after = [2.0, 3.0, 4.0], [1.0, 3.0, 4.0]
+    assert round_reward(before, after, 0, 'global') == pytest.approx(1 / 3)
+
+
+def test_transfer_reward_pays_nothing_for_improving_the_studied_arm():
+    """A run that collapses one arm's loss while the rest drift up is a win
+    under 'global' and a loss under 'transfer' — the whole point of the mode."""
+    before, after = [2.0, 3.0, 4.0], [1.4, 3.1, 4.15]
+    assert round_reward(before, after, 0, 'global') > 0
+    assert round_reward(before, after, 0, 'transfer') == pytest.approx(-0.125)

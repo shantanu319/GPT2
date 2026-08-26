@@ -274,11 +274,21 @@ Each round of `loop.py`:
    arms, not just the one that was studied**
 5. update the director, journal the round, repeat
 
-Step 4 is the whole continual-learning story. A domain that improves itself by
-damaging the others scores near zero, so not-forgetting is the objective the
-director maximises rather than a guard bolted on beside it. `report.py` prints
-per-arm forgetting (how far each arm's probe loss has drifted back off its own
-best) so the claim is checkable rather than asserted.
+Step 4 is where the continual-learning question lives, and measuring it
+falsified the obvious design. The default reward (`--reward global`) is the
+mean drop over every arm including the studied one, which is the total-nats
+objective — and it does **not** stop the model specializing. Over 41 rounds on
+the 98M checkpoint the director drove camel-physics down 0.60 nats while
+cosmopedia, finemath and fineweb-edu rose 0.26 between them, and by that
+objective it was right to: −0.60 beats +0.26. It also beat the uniform control
+(2.3151 vs 2.3333), so the director works; the objective it was given is what
+lets specialization through.
+
+`--reward transfer` leaves the studied arm out of its own reward, so an arm is
+paid only for what it does to the other four and improving itself earns
+nothing. `report.py` prints per-arm forgetting (how far each arm's probe loss
+has drifted back off its own best), so which objective you picked is visible in
+the output rather than taken on trust.
 
 Design points worth stating, because each was a decision that could have gone
 the other way:
