@@ -164,7 +164,7 @@ def fetch_source_to_disk(source, quota, cache_dir):
     return path
 
 
-def _read_docs(path):
+def read_docs(path):
     with open(path, 'rb') as f:
         while True:
             head = f.read(8)
@@ -177,7 +177,7 @@ def _read_docs(path):
 def local_mixed_stream(fetch_paths, sources, seed=1337, max_docs=None):
     """mixed_stream over on-disk fetch caches: same rng, same drop-on-exhaust."""
     rng = random.Random(seed)
-    iters = [(s.name, _read_docs(fetch_paths[s.name]), s.weight) for s in sources]
+    iters = [(s.name, read_docs(fetch_paths[s.name]), s.weight) for s in sources]
     n = 0
     while iters:
         if max_docs is not None and n >= max_docs:
@@ -220,7 +220,7 @@ def _bpe_training_corpus(stream, num_docs):
     return '\n'.join(texts)
 
 
-def _encode_text(tokenizer, text, eos_id):
+def encode_text(tokenizer, text, eos_id):
     ids = tokenizer.encode_ordinary(text)
     ids.append(eos_id)
     arr = np.array(ids, dtype=BIN_DTYPE)
@@ -242,7 +242,7 @@ def _iter_encoded(tokenizer, tokenizer_path, stream, eos_id, max_docs, num_worke
 
     if num_workers <= 1:
         for i, text in enumerate(texts()):
-            yield i, _encode_text(tokenizer, text, eos_id)
+            yield i, encode_text(tokenizer, text, eos_id)
         return
 
     # Fork beats spawn here by ~3-4x (no Python re-import cost per worker, and
@@ -253,7 +253,7 @@ def _iter_encoded(tokenizer, tokenizer_path, stream, eos_id, max_docs, num_worke
         ctx = mp.get_context('fork')
     except ValueError:
         for i, text in enumerate(texts()):
-            yield i, _encode_text(tokenizer, text, eos_id)
+            yield i, encode_text(tokenizer, text, eos_id)
         return
 
     with ctx.Pool(processes=num_workers,
