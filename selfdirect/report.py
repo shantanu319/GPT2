@@ -36,8 +36,11 @@ def summarize(rounds):
     return sorted(rows, key=lambda r: -r['weight'])
 
 
+def mean_probe(probe):
+    return sum(probe.values()) / len(probe)
+
+
 def print_summary(rounds, rows):
-    mean = lambda d: sum(d.values()) / len(d)
     print(f"{len(rounds)} rounds, {rounds[-1]['step']} optimizer steps, "
           f"{sum(r['seconds'] for r in rounds) / 60:.1f} min")
     print(f"\n{'arm':<16}{'studied':>9}{'weight':>9}{'probe start':>13}"
@@ -46,11 +49,46 @@ def print_summary(rounds, rows):
         print(f"{r['arm']:<16}{r['rounds']:>4} ({r['share']*100:2.0f}%)"
               f"{r['weight']*100:>8.1f}%{r['start']:>13.4f}{r['now']:>11.4f}"
               f"{r['best']:>9.4f}{r['forgotten']:>+11.4f}")
-    start, now = mean(rounds[0]['probe_before']), mean(rounds[-1]['probe_after'])
+    start = mean_probe(rounds[0]['probe_before'])
+    now = mean_probe(rounds[-1]['probe_after'])
     print(f"\nmean probe loss {start:.4f} -> {now:.4f} ({now - start:+.4f})")
     top = rows[0]
     print(f"the director settled on {top['arm']} at {top['weight']*100:.0f}% "
           f"(uniform would be {100/len(rows):.0f}%)")
+
+
+def print_comparison(runs):
+    """Head to head across runs that consumed the same tokens per round, so a
+    round index is a fair x-axis for all of them."""
+    print(f"\n{'run':<22}{'rounds':>7}{'probe start':>13}{'probe end':>11}"
+          f"{'improved':>11}{'forgotten':>11}")
+    for label, rounds in runs:
+        start, end = mean_probe(rounds[0]['probe_before']), mean_probe(rounds[-1]['probe_after'])
+        print(f"{label:<22}{len(rounds):>7}{start:>13.4f}{end:>11.4f}"
+              f"{start - end:>+11.4f}{rounds[-1]['forgetting']:>11.4f}")
+    best = min(runs, key=lambda r: mean_probe(r[1][-1]['probe_after']))
+    print(f"lowest final probe loss: {best[0]}")
+
+
+def plot_comparison(runs, path):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    plt.figure(figsize=(10, 5))
+    for label, rounds in runs:
+        plt.plot([0] + [r['round'] for r in rounds],
+                 [mean_probe(rounds[0]['probe_before'])] +
+                 [mean_probe(r['probe_after']) for r in rounds],
+                 label=label, linewidth=1.6)
+    plt.xlabel('round (identical tokens per round across runs)')
+    plt.ylabel('mean probe loss over all arms')
+    plt.title('Self-directed curriculum vs. the mixture it was given')
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=130)
+    print(f"wrote {path}")
 
 
 def plot(rounds, path):
@@ -88,6 +126,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--out', default='saved/selfdirect')
+    parser.add_argument('--compare', nargs='*', default=[],
+                        help='Other run directories to put head to head with --out')
     parser.add_argument('--no-plot', action='store_true')
     args = parser.parse_args()
 
@@ -95,6 +135,12 @@ def main():
     print_summary(rounds, summarize(rounds))
     if not args.no_plot:
         plot(rounds, os.path.join(args.out, 'curriculum.png'))
+    if args.compare:
+        runs = [(os.path.basename(d.rstrip('/')), read_journal(d))
+                for d in [args.out] + args.compare]
+        print_comparison(runs)
+        if not args.no_plot:
+            plot_comparison(runs, os.path.join(args.out, 'comparison.png'))
 
 
 if __name__ == '__main__':
