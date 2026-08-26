@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import numpy as np
@@ -123,6 +124,22 @@ def short_names(names, width=4):
     return [n[:width] for n in names]
 
 
+def backoff(opt, history):
+    """Halve the LR when the global probe loss is no better than it was
+    lr_patience rounds ago.
+
+    pretrain/train.py early-stops on a stalled validation loss; a run with no
+    horizon has nothing to stop into, so the analogous move is to shorten the
+    step. It reads the mean the director already computes, so it costs nothing,
+    and it only ever goes down -- floored, so the loop keeps learning."""
+    p = opt.lr_patience
+    if not p or opt.round % p or len(history) <= p or opt.lr_scale <= opt.lr_floor:
+        return
+    if history[-1] >= history[0]:
+        opt.lr_scale = max(opt.lr_floor, opt.lr_scale / 2)
+        print(f"probe loss no better than {p} rounds ago -> LR x{opt.lr_scale:g}")
+
+
 def set_lr(optimizers, factor):
     for o in optimizers:
         for group in o.param_groups:
@@ -147,7 +164,8 @@ def train_block(model, arm, opt):
         micro += 1
         if micro % opt.grad_accum:
             continue
-        set_lr(opt.optimizers, min(1.0, (opt.step + 1) / max(opt.warmup_steps, 1)))
+        set_lr(opt.optimizers,
+               opt.lr_scale * min(1.0, (opt.step + 1) / max(opt.warmup_steps, 1)))
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
         for o in opt.optimizers:
             o.step()
@@ -163,6 +181,8 @@ def save_state(model, arms, director, opt, path):
                         'cursors': {a.name: a.cursor for a in arms},
                         'round': opt.round,
                         'best_probe': opt.best_probe,
+                        'lr_scale': opt.lr_scale,
+                        'probe_history': list(opt.probe_history),
                     }})
 
 
@@ -177,6 +197,8 @@ def load_state(model, arms, director, opt, path):
     for arm in arms:
         arm.cursor = sd['cursors'][arm.name]
     opt.step, opt.round, opt.best_probe = state['step'], sd['round'], sd['best_probe']
+    opt.lr_scale = sd['lr_scale']
+    opt.probe_history.extend(sd['probe_history'])
     print(f"resumed from {path}: round {opt.round}, step {opt.step}")
 
 
@@ -185,6 +207,7 @@ def run(model, arms, director, opt):
     labels = short_names(names)
     journal = os.path.join(opt.out, JOURNAL_FILE)
     before = probe_all(model, arms, opt)
+    history = opt.probe_history
 
     for _ in range(opt.rounds):
         idx = director.choose()
@@ -204,12 +227,15 @@ def run(model, arms, director, opt):
         opt.best_probe = [min(b, a) for b, a in zip(opt.best_probe, after)]
         forgetting = sum(a - b for a, b in zip(after, opt.best_probe))
         opt.round += 1
+        history.append(sum(after) / len(after))
+        backoff(opt, history)
 
         with open(journal, 'a') as f:
             f.write(json.dumps({
                 'round': opt.round, 'step': opt.step, 'studied': names[idx],
                 'train_loss': train_loss, 'reward': reward, 'scaled': scaled,
-                'forgetting': forgetting, 'seconds': round(time.time() - started, 2),
+                'forgetting': forgetting, 'lr_scale': opt.lr_scale,
+                'seconds': round(time.time() - started, 2),
                 'probs': dict(zip(names, probs)),
                 'probe_before': dict(zip(names, before)),
                 'probe_after': dict(zip(names, after)),
@@ -279,6 +305,11 @@ def parse_args():
                         'on the last for reasons that have nothing to do with '
                         'which arm was picked')
     p.add_argument('--grad-clip', type=float, default=1.0)
+    p.add_argument('--lr-patience', type=int, default=10,
+                   help='Halve the LR when the mean probe loss is no better '
+                        'than it was this many rounds ago (0 disables)')
+    p.add_argument('--lr-floor', type=float, default=0.03,
+                   help='Floor for that backoff, as a fraction of the peak LR')
     p.add_argument('--ce-chunk', type=int, default=16384)
     p.add_argument('--eta', type=float, default=0.08, help='Director step size')
     p.add_argument('--explore', type=float, default=0.1,
@@ -323,6 +354,8 @@ def main():
                                      scalar_lr=opt.scalar_lr, muon_impl=opt.muon_impl)
     opt.step, opt.round = 0, 0
     opt.best_probe = [float('inf')] * len(arms)
+    opt.lr_scale = 1.0
+    opt.probe_history = deque(maxlen=max(opt.lr_patience, 1) + 1)
 
     director = Director([a.name for a in arms], eta=opt.eta, explore=opt.explore,
                         decay=opt.decay, window=opt.window, seed=opt.seed)

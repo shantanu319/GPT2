@@ -2,8 +2,10 @@
 import json
 import os
 import random
+import types
 import struct
 import sys
+from collections import deque
 from unittest import mock
 
 import numpy as np
@@ -15,7 +17,7 @@ from core.model import load_checkpoint, model_from_config
 from core.tokenizer import BPETokenizer
 from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
-from selfdirect.loop import JOURNAL_FILE, Arm, short_names, take_block
+from selfdirect.loop import JOURNAL_FILE, Arm, backoff, short_names, take_block
 from selfdirect.loop import main as loop_main
 from selfdirect.report import read_journal, summarize
 
@@ -307,3 +309,35 @@ def test_loop_state_is_a_loadable_training_checkpoint(tmp_path):
     model = model_from_config(ckpt['config'], torch.device('cpu'))
     model.load_state_dict(ckpt['model'])   # what inference/sample.py does
     assert ckpt['config']['vocab_size'] == 64
+
+
+def _backoff_opt(**kw):
+    return types.SimpleNamespace(lr_patience=4, lr_floor=0.03, lr_scale=1.0,
+                                 round=4, **kw)
+
+
+def test_backoff_halves_the_lr_when_the_probe_stops_improving():
+    opt = _backoff_opt()
+    backoff(opt, deque([2.0, 2.0, 2.0, 2.0, 2.1], maxlen=5))
+    assert opt.lr_scale == 0.5
+
+
+def test_backoff_leaves_the_lr_alone_while_the_probe_is_falling():
+    opt = _backoff_opt()
+    backoff(opt, deque([2.0, 1.9, 1.8, 1.7, 1.6], maxlen=5))
+    assert opt.lr_scale == 1.0
+
+
+def test_backoff_only_fires_on_its_patience_cadence():
+    opt = _backoff_opt()
+    opt.round = 5                                   # not a multiple of patience
+    backoff(opt, deque([2.0, 2.0, 2.0, 2.0, 2.1], maxlen=5))
+    assert opt.lr_scale == 1.0
+
+
+def test_backoff_stops_at_the_floor():
+    opt = _backoff_opt()
+    stalled = deque([2.0] * 5, maxlen=5)
+    for _ in range(20):
+        backoff(opt, stalled)
+    assert opt.lr_scale == 0.03
