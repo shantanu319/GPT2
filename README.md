@@ -295,7 +295,16 @@ the other way:
   measured round delta within 3% of the full 33k one at a seventh of the cost
   (`--probe-tokens`).
 - **No LR schedule past warmup.** WSD and cosine both anneal toward a horizon;
-  a run that is meant never to end does not have one.
+  a run that is meant never to end does not have one. Instead the loop watches
+  the same mean the director reads: every `--lr-patience` rounds, if the global
+  probe loss is no better than it was that many rounds ago, it halves the LR
+  (floored at `--lr-floor`). That is the horizonless analogue of `train.py`'s
+  early stop on a stalled validation loss.
+- **Continuing a checkpoint wants a far lower LR than pretraining it.** At
+  `train.py`'s `-muon_lr 0.03`, or even `0.01`, the 98M checkpoint diverges
+  outright — mean probe loss 2.40 -> 2.93 over 40 steps, on both the local and
+  the stdlib Muon alike, which is what prompted the backoff above. `selfdirect`
+  defaults to `1e-3` Muon / `1e-4` embed, measured as the best of a sweep.
 - **Arms are just named shards.** The director never learns what an arm *is*,
   so splitting a domain by difficulty into `finemath:easy` / `finemath:hard`
   needs no change to the policy at all.
