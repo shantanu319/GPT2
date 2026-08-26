@@ -254,3 +254,63 @@ cargo run --manifest-path inference/chat/Cargo.toml --release -- \
   --no-cuda
 
 (This checkpoint is a pre-ChatML pretrain model, so the CLI falls back to raw mode. It needs a tokenizer.json in data_cache/cosmopedia — from any prepare run, or pull one from a vast.ai run: `python vast/vast_train.py pull` drops one in vast_out/.
+
+## Self-directed continual training (`selfdirect/`)
+
+The model picks what it studies next. Not by writing a curriculum in English —
+at 98M parameters its prose is not worth reading — but from the one signal it
+does produce reliably: **where it is currently learning fastest**.
+
+    fetch_cache/fetch_<source>.bin ─ domains.py ─► data_cache/selfdirect/<arm>/{train,probe}.bin
+                                   ─ loop.py ────► saved/<run>/{state.pt, journal.jsonl}
+                                   ─ report.py ──► the curriculum, as a table and curriculum.png
+
+Each round of `loop.py`:
+
+1. probe every arm on a small fixed held-out slice of it
+2. the **director** (`director.py`) samples one arm from its exponential weights
+3. train a block of steps on that arm, resuming from that arm's own cursor
+4. probe every arm again — **the reward is the mean probe-loss drop across all
+   arms, not just the one that was studied**
+5. update the director, journal the round, repeat
+
+Step 4 is the whole continual-learning story. A domain that improves itself by
+damaging the others scores near zero, so not-forgetting is the objective the
+director maximises rather than a guard bolted on beside it. `report.py` prints
+per-arm forgetting (how far each arm's probe loss has drifted back off its own
+best) so the claim is checkable rather than asserted.
+
+Design points worth stating, because each was a decision that could have gone
+the other way:
+
+- **The probe is fixed and never reshuffled.** The control signal is a
+  round-to-round *delta*, so the same tokens have to be scored every time —
+  otherwise sampling noise arrives on the same order as the progress being
+  measured. It is also disjoint from the arm's train shard, so the loop can
+  never train on its own reward signal.
+- **Probes run fp32 in eval mode.** Measured on MPS, a bf16 autocast probe was
+  both less precise and *slower*: under `no_grad` autocast's cast cache is dead,
+  so every weight is re-cast on every forward.
+- **The probe can be small.** On the 98M checkpoint a 4k-token probe put the
+  measured round delta within 3% of the full 33k one at a seventh of the cost
+  (`--probe-tokens`).
+- **No LR schedule past warmup.** WSD and cosine both anneal toward a horizon;
+  a run that is meant never to end does not have one.
+- **Arms are just named shards.** The director never learns what an arm *is*,
+  so splitting a domain by difficulty into `finemath:easy` / `finemath:hard`
+  needs no change to the policy at all.
+
+Running it:
+
+    python -m pretrain.prepare --max-train-docs 20000    # once, if fetch_cache/ is empty
+    python -m selfdirect.domains --output-dir data_cache/selfdirect
+    python -m selfdirect.loop --checkpoint saved/model/ckpt_final.pt \
+        --out saved/selfdirect --rounds 200
+    python -m selfdirect.report --out saved/selfdirect
+
+`state.pt` holds weights, optimizers, per-arm cursors and director state in one
+file, so `--resume` picks the run up mid-curriculum — and because it is also an
+ordinary training checkpoint, `inference/sample.py` reads it directly.
+
+`--eta 0` freezes the director at a uniform mixture, which is the control:
+identical code path, identical seed, a curriculum chosen at random.

@@ -265,7 +265,10 @@ def parse_args():
     p.add_argument('--muon-lr', type=float, default=0.01)
     p.add_argument('--embed-lr', type=float, default=1e-3)
     p.add_argument('--scalar-lr', type=float, default=0.005)
-    p.add_argument('--muon-impl', choices=['local', 'torch'], default='local')
+    p.add_argument('--muon-impl', choices=['local', 'torch'], default='torch',
+                   help="stdlib torch.optim.Muon, as sft/finetune.py uses. "
+                        "Measured 22%% faster per step than pretrain/muon.py "
+                        "on MPS (1.33s vs 1.70s at 98M params)")
     p.add_argument('--warmup-steps', type=int, default=50,
                    help='Kept short: while the LR ramps, every round improves '
                         'on the last for reasons that have nothing to do with '
