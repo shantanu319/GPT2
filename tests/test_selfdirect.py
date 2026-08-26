@@ -1,14 +1,17 @@
 """Tests for the self-directed curriculum: arm shards and the director policy."""
+import json
 import random
 import struct
 
 import numpy as np
+import pytest
 
 from core.data import load_bin
 from core.tokenizer import BPETokenizer
 from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
-from selfdirect.loop import Arm, short_names, take_block
+from selfdirect.loop import JOURNAL_FILE, Arm, short_names, take_block
+from selfdirect.report import read_journal, summarize
 
 CORPUS = ("the quick brown fox jumps over the lazy dog "
           "hello world hello there hello friends " * 30)
@@ -185,3 +188,37 @@ def test_short_names_keeps_arms_distinguishable():
     assert short_names(['finemath', 'fineweb-edu', 'cosmopedia']) == \
         ['finem', 'finew', 'cosmo']
     assert short_names(['a', 'b']) == ['a', 'b']
+
+
+# --- report ---------------------------------------------------------------
+
+def _journal(tmp_path, lines):
+    (tmp_path / JOURNAL_FILE).write_text(''.join(json.dumps(l) + '\n' for l in lines))
+    return str(tmp_path)
+
+
+def test_summarize_counts_choices_and_tracks_forgetting(tmp_path):
+    probs = {'a': 0.7, 'b': 0.3}
+    lines = [
+        {'round': 1, 'step': 10, 'studied': 'a', 'seconds': 1.0, 'probs': probs,
+         'probe_before': {'a': 4.0, 'b': 5.0}, 'probe_after': {'a': 3.0, 'b': 4.5}},
+        {'round': 2, 'step': 20, 'studied': 'a', 'seconds': 1.0, 'probs': probs,
+         'probe_before': {'a': 3.0, 'b': 4.5}, 'probe_after': {'a': 2.5, 'b': 4.9}},
+    ]
+    rows = {r['arm']: r for r in summarize(read_journal(_journal(tmp_path, lines)))}
+
+    assert rows['a']['rounds'] == 2 and rows['b']['rounds'] == 0
+    assert rows['a']['start'] == 4.0 and rows['a']['now'] == 2.5
+    # b was never studied and its probe loss rose back off its best — forgetting.
+    assert rows['b']['best'] == 4.5
+    assert rows['b']['forgotten'] == pytest.approx(0.4)
+    assert rows['a']['forgotten'] == 0.0
+
+
+def test_report_rows_are_ordered_by_final_weight(tmp_path):
+    lines = [{'round': 1, 'step': 1, 'studied': 'b', 'seconds': 1.0,
+              'probs': {'a': 0.2, 'b': 0.5, 'c': 0.3},
+              'probe_before': {'a': 1.0, 'b': 1.0, 'c': 1.0},
+              'probe_after': {'a': 1.0, 'b': 1.0, 'c': 1.0}}]
+    rows = summarize(read_journal(_journal(tmp_path, lines)))
+    assert [r['arm'] for r in rows] == ['b', 'c', 'a']
