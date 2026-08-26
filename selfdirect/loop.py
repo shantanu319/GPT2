@@ -194,10 +194,15 @@ def run(model, arms, director, opt):
         after = probe_all(model, arms, opt)
 
         # Reward: mean probe-loss drop over every arm, not just the one studied.
+        # Absolute nats, not proportional: the objective is the loss a uniform
+        # mixture of the probes would report, so a domain the model is already
+        # good at has less left to give and should say so.
         reward = sum(b - a for b, a in zip(before, after)) / len(arms)
         scaled = director.update(idx, reward)
+        # Folding `after` into the running best first makes the gap below the
+        # amount given back since that arm's best, and never negative.
         opt.best_probe = [min(b, a) for b, a in zip(opt.best_probe, after)]
-        forgetting = sum(max(0.0, a - b) for a, b in zip(after, opt.best_probe))
+        forgetting = sum(a - b for a, b in zip(after, opt.best_probe))
         opt.round += 1
 
         with open(journal, 'a') as f:
