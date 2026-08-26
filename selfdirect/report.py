@@ -30,9 +30,14 @@ def summarize(rounds):
     now = rounds[-1]['probe_after']
     best = {n: min(r['probe_after'][n] for r in rounds) for n in names}
     final = rounds[-1]['probs']
+    # Mean reward while studying each arm: what the director was reading. If
+    # these are all the same, there was nothing for it to find.
+    paid = {n: [r['reward'] for r in rounds if r['studied'] == n] for n in names}
     rows = [{'arm': n, 'rounds': studied[n], 'share': studied[n] / len(rounds),
              'weight': final[n], 'start': start[n], 'now': now[n],
-             'best': best[n], 'forgotten': now[n] - best[n]} for n in names]
+             'best': best[n], 'forgotten': now[n] - best[n],
+             'reward': sum(paid[n]) / len(paid[n]) if paid[n] else None}
+            for n in names]
     return sorted(rows, key=lambda r: -r['weight'])
 
 
@@ -43,11 +48,13 @@ def mean_probe(probe):
 def print_summary(rounds, rows):
     print(f"{len(rounds)} rounds, {rounds[-1]['step']} optimizer steps, "
           f"{sum(r['seconds'] for r in rounds) / 60:.1f} min")
-    print(f"\n{'arm':<16}{'studied':>9}{'weight':>9}{'probe start':>13}"
-          f"{'probe now':>11}{'best':>9}{'forgotten':>11}")
+    print(f"\n{'arm':<16}{'studied':>9}{'weight':>9}{'mean reward':>13}"
+          f"{'probe start':>13}{'probe now':>11}{'best':>9}{'forgotten':>11}")
     for r in rows:
+        reward = f"{r['reward']:+.5f}" if r['reward'] is not None else '-'
         print(f"{r['arm']:<16}{r['rounds']:>4} ({r['share']*100:2.0f}%)"
-              f"{r['weight']*100:>8.1f}%{r['start']:>13.4f}{r['now']:>11.4f}"
+              f"{r['weight']*100:>8.1f}%{reward:>13}"
+              f"{r['start']:>13.4f}{r['now']:>11.4f}"
               f"{r['best']:>9.4f}{r['forgotten']:>+11.4f}")
     start = mean_probe(rounds[0]['probe_before'])
     now = mean_probe(rounds[-1]['probe_after'])

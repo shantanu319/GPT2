@@ -208,9 +208,11 @@ def _journal(tmp_path, lines):
 def test_summarize_counts_choices_and_tracks_forgetting(tmp_path):
     probs = {'a': 0.7, 'b': 0.3}
     lines = [
-        {'round': 1, 'step': 10, 'studied': 'a', 'seconds': 1.0, 'probs': probs,
+        {'round': 1, 'step': 10, 'studied': 'a', 'seconds': 1.0, 'reward': 0.75,
+         'probs': probs,
          'probe_before': {'a': 4.0, 'b': 5.0}, 'probe_after': {'a': 3.0, 'b': 4.5}},
-        {'round': 2, 'step': 20, 'studied': 'a', 'seconds': 1.0, 'probs': probs,
+        {'round': 2, 'step': 20, 'studied': 'a', 'seconds': 1.0, 'reward': 0.05,
+         'probs': probs,
          'probe_before': {'a': 3.0, 'b': 4.5}, 'probe_after': {'a': 2.5, 'b': 4.9}},
     ]
     rows = {r['arm']: r for r in summarize(read_journal(_journal(tmp_path, lines)))}
@@ -224,7 +226,7 @@ def test_summarize_counts_choices_and_tracks_forgetting(tmp_path):
 
 
 def test_report_rows_are_ordered_by_final_weight(tmp_path):
-    lines = [{'round': 1, 'step': 1, 'studied': 'b', 'seconds': 1.0,
+    lines = [{'round': 1, 'step': 1, 'studied': 'b', 'seconds': 1.0, 'reward': 0.0,
               'probs': {'a': 0.2, 'b': 0.5, 'c': 0.3},
               'probe_before': {'a': 1.0, 'b': 1.0, 'c': 1.0},
               'probe_after': {'a': 1.0, 'b': 1.0, 'c': 1.0}}]
@@ -341,3 +343,24 @@ def test_backoff_stops_at_the_floor():
     for _ in range(20):
         backoff(opt, stalled)
     assert opt.lr_scale == 0.03
+
+
+def test_summarize_reports_mean_reward_per_arm(tmp_path):
+    probs = {'a': 0.5, 'b': 0.5}
+    probe = {'a': 1.0, 'b': 1.0}
+    lines = [{'round': i + 1, 'step': i, 'studied': s, 'seconds': 1.0, 'reward': w,
+              'probs': probs, 'probe_before': probe, 'probe_after': probe}
+             for i, (s, w) in enumerate([('a', 0.1), ('a', 0.3), ('b', -0.2)])]
+    rows = {r['arm']: r for r in summarize(read_journal(_journal(tmp_path, lines)))}
+
+    assert rows['a']['reward'] == pytest.approx(0.2)
+    assert rows['b']['reward'] == pytest.approx(-0.2)
+
+
+def test_summarize_reports_no_reward_for_an_arm_never_studied(tmp_path):
+    lines = [{'round': 1, 'step': 1, 'studied': 'a', 'seconds': 1.0, 'reward': 0.1,
+              'probs': {'a': 0.5, 'b': 0.5},
+              'probe_before': {'a': 1.0, 'b': 1.0},
+              'probe_after': {'a': 1.0, 'b': 1.0}}]
+    rows = {r['arm']: r for r in summarize(read_journal(_journal(tmp_path, lines)))}
+    assert rows['b']['reward'] is None
