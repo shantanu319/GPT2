@@ -1,16 +1,22 @@
 """Tests for the self-directed curriculum: arm shards and the director policy."""
 import json
+import os
 import random
 import struct
+import sys
+from unittest import mock
 
 import numpy as np
 import pytest
+import torch
 
 from core.data import load_bin
+from core.model import load_checkpoint, model_from_config
 from core.tokenizer import BPETokenizer
 from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
 from selfdirect.loop import JOURNAL_FILE, Arm, short_names, take_block
+from selfdirect.loop import main as loop_main
 from selfdirect.report import read_journal, summarize
 
 CORPUS = ("the quick brown fox jumps over the lazy dog "
@@ -222,3 +228,82 @@ def test_report_rows_are_ordered_by_final_weight(tmp_path):
               'probe_after': {'a': 1.0, 'b': 1.0, 'c': 1.0}}]
     rows = summarize(read_journal(_journal(tmp_path, lines)))
     assert [r['arm'] for r in rows] == ['b', 'c', 'a']
+
+
+def test_eta_zero_pins_the_director_to_a_uniform_mixture():
+    """--eta 0 is the control for 'did the curriculum help', so it has to stay
+    exactly uniform no matter what rewards arrive."""
+    d = Director(list('abcde'), eta=0.0, seed=4)
+    _bandit(d, lambda r: 0, 200)
+    assert d.probs() == pytest.approx([0.2] * 5)
+
+
+# --- end to end -----------------------------------------------------------
+
+def _fake_arm_dir(tmp_path, names, vocab=64, tokens=4096, probe=512):
+    rng = np.random.default_rng(0)
+    for i, name in enumerate(names):
+        d = tmp_path / name
+        d.mkdir(parents=True)
+        # Each arm gets its own slice of the vocab, so the arms are genuinely
+        # different distributions and their probe losses can diverge.
+        lo = 1 + i * 8
+        rng.integers(lo, lo + 8, tokens, dtype=np.uint16).tofile(d / 'train.bin')
+        rng.integers(lo, lo + 8, probe, dtype=np.uint16).tofile(d / 'probe.bin')
+    (tmp_path / 'arms.json').write_text(json.dumps({
+        'vocab_size': vocab, 'eos_id': vocab - 1,
+        'arms': [{'name': n, 'train_tokens': tokens, 'probe_tokens': probe}
+                 for n in names]}))
+    return str(tmp_path)
+
+
+def _run_loop(data_dir, out, rounds, extra=()):
+    argv = ['selfdirect.loop', '--data-dir', data_dir, '--out', out,
+            '--rounds', str(rounds), '--block-steps', '2', '--batchsize', '2',
+            '--seqlen', '32', '--probe-tokens', '256', '--warmup-steps', '2',
+            '--save-every', '0', '--no-cuda', '--muon-impl', 'torch',
+            '-d_model', '16', '-n_layers', '1', '-heads', '2', *extra]
+    with mock.patch.object(sys, 'argv', argv):
+        loop_main()
+
+
+def test_loop_runs_end_to_end_and_journals_every_round(tmp_path):
+    data = _fake_arm_dir(tmp_path / 'arms', ['alpha', 'beta'])
+    out = str(tmp_path / 'run')
+    _run_loop(data, out, rounds=3)
+
+    rounds = read_journal(out)
+    assert [r['round'] for r in rounds] == [1, 2, 3]
+    assert all(r['studied'] in ('alpha', 'beta') for r in rounds)
+    # Each round's "before" is the previous round's "after" — the probe is
+    # measured once per round, not twice.
+    assert rounds[1]['probe_before'] == rounds[0]['probe_after']
+    assert os.path.exists(os.path.join(out, 'state.pt'))
+
+
+def test_loop_resumes_where_it_stopped(tmp_path):
+    data = _fake_arm_dir(tmp_path / 'arms', ['alpha', 'beta'])
+    out = str(tmp_path / 'run')
+    _run_loop(data, out, rounds=2)
+    # No -d_model on the resume: the architecture comes back out of state.pt.
+    argv = ['selfdirect.loop', '--data-dir', data, '--out', out, '--rounds', '2',
+            '--block-steps', '2', '--batchsize', '2', '--seqlen', '32',
+            '--probe-tokens', '256', '--warmup-steps', '2', '--save-every', '0',
+            '--no-cuda', '--muon-impl', 'torch', '--resume']
+    with mock.patch.object(sys, 'argv', argv):
+        loop_main()
+
+    rounds = read_journal(out)
+    assert [r['round'] for r in rounds] == [1, 2, 3, 4]
+    assert rounds[3]['step'] == 8          # 4 rounds x 2 steps, counted through
+
+
+def test_loop_state_is_a_loadable_training_checkpoint(tmp_path):
+    data = _fake_arm_dir(tmp_path / 'arms', ['alpha', 'beta'])
+    out = str(tmp_path / 'run')
+    _run_loop(data, out, rounds=1)
+
+    ckpt = load_checkpoint(os.path.join(out, 'state.pt'))
+    model = model_from_config(ckpt['config'], torch.device('cpu'))
+    model.load_state_dict(ckpt['model'])   # what inference/sample.py does
+    assert ckpt['config']['vocab_size'] == 64
