@@ -528,16 +528,9 @@ def load_checkpoint(path):
     return torch.load(path, map_location='cpu', mmap=True, weights_only=False)
 
 
-def model_from_checkpoint(ckpt, device, dtype=None):
-    """Rebuild a Transformer from a checkpoint's saved config, weights loaded
-    and ready for inference.
-
-    The weights are converted once here rather than under torch.autocast:
-    autocast's cast cache is only live while grad mode is on, so under
-    no_grad it re-casts every weight on every forward, which dominates
-    single-token decode."""
-    cfg = ckpt['config']
-    model = Transformer(
+def model_from_config(cfg, device):
+    """An untrained Transformer with the architecture a saved config describes."""
+    return Transformer(
         vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
         heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
         kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
@@ -546,7 +539,18 @@ def model_from_checkpoint(ckpt, device, dtype=None):
         attn_res=cfg.get('attn_res', 0),
         kda=cfg.get('kda', 0),
         swa=cfg.get('swa', 0),
-    )
+    ).to(device)
+
+
+def model_from_checkpoint(ckpt, device, dtype=None):
+    """Rebuild a Transformer from a checkpoint's saved config, weights loaded
+    and ready for inference.
+
+    The weights are converted once here rather than under torch.autocast:
+    autocast's cast cache is only live while grad mode is on, so under
+    no_grad it re-casts every weight on every forward, which dominates
+    single-token decode."""
+    model = model_from_config(ckpt['config'], device)
     dtype = inference_dtype(device) if dtype is None else dtype
     # assign hands the checkpoint's tensors straight to the module rather than
     # copying into the freshly initialized ones, which are discarded anyway --

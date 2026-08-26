@@ -18,7 +18,8 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import data_feeder_masked, load_bin, load_bin_u8
-from core.model import LOGIT_SOFTCAP, Transformer, load_checkpoint, nopeak_mask
+from core.model import (LOGIT_SOFTCAP, load_checkpoint, model_from_config,
+                        nopeak_mask)
 from core.tokenizer import BPETokenizer
 from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
@@ -120,16 +121,7 @@ def main():
     cfg = ckpt['config']
     if cfg is None:
         raise ValueError("checkpoint lacks config — retrain with current train.py")
-    model = Transformer(
-        vocab=cfg['vocab_size'], d_model=cfg['d_model'], N=cfg['n_layers'],
-        heads=cfg['heads'], dropout=cfg.get('dropout', 0.0),
-        kv_heads=cfg.get('kv_heads'), loops=cfg.get('loops', 1),
-        value_residual=cfg.get('value_residual', False),
-        unet_skips=cfg.get('unet_skips', False),
-        attn_res=cfg.get('attn_res', 0),
-        kda=cfg.get('kda', 0),
-        swa=cfg.get('swa', 0),
-    ).to(device)
+    model = model_from_config(cfg, device)
     model.load_state_dict(ckpt['model'])
     print(f"loaded {sum(p.numel() for p in model.parameters()):,} params "
           f"from {args.checkpoint}")
