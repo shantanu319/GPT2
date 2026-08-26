@@ -1,10 +1,12 @@
 """Tests for the self-directed curriculum: arm shards and the director policy."""
+import random
 import struct
 
 import numpy as np
 
 from core.data import load_bin
 from core.tokenizer import BPETokenizer
+from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
 
 CORPUS = ("the quick brown fox jumps over the lazy dog "
@@ -82,3 +84,71 @@ def test_arm_shards_are_uint16_token_ids(tmp_path):
     train = load_bin(str(tmp_path / 'x' / 'train.bin'))
     assert train.dtype == np.uint16
     assert train[-1] == eos  # every doc is EOS-terminated
+
+
+# --- director -------------------------------------------------------------
+
+def _bandit(director, best_of, rounds, seed=0, noise=0.02, switch=None):
+    """Drive a director with a synthetic reward: `best_of(round)` names the arm
+    worth 0.10 and every other arm 0.02. Returns the final probabilities."""
+    rng = random.Random(seed)
+    for r in range(rounds):
+        i = director.choose()
+        reward = (0.10 if i == best_of(r) else 0.02) + rng.gauss(0, noise)
+        director.update(i, reward)
+    return director.probs()
+
+
+def test_probs_are_a_distribution_with_an_exploration_floor():
+    d = Director(list('abcde'), explore=0.1)
+    d.log_w = [10.0, -10.0, -10.0, -10.0, -10.0]
+    probs = d.probs()
+    assert abs(sum(probs) - 1.0) < 1e-12
+    assert min(probs) >= 0.1 / 5 - 1e-12   # no arm is ever starved to zero
+    assert probs[0] == max(probs)
+
+
+def test_director_concentrates_on_the_arm_that_pays():
+    probs = _bandit(Director(list('abcde'), seed=1), lambda r: 0, 300)
+    assert probs[0] > 0.7
+    assert probs[0] > 5 * max(probs[1:])
+
+
+def test_director_follows_a_moving_optimum():
+    d = Director(list('abcde'), seed=1)
+    _bandit(d, lambda r: 0, 200)
+    assert d.probs()[0] > 0.7
+    probs = _bandit(d, lambda r: 4, 300, seed=7)
+    assert probs[4] > 0.7 and probs[0] < 0.2
+
+
+def test_decay_bounds_drift_when_the_reward_is_pure_noise():
+    """Without decay the log-weights are an unbiased random walk, so a long
+    enough run drifts into a strong preference on no signal at all."""
+    def noise_run(decay):
+        d = Director(list('abcde'), decay=decay, seed=3)
+        rng = random.Random(11)
+        for _ in range(3000):
+            d.update(d.choose(), rng.gauss(0, 0.01))
+        return max(d.probs())
+
+    assert noise_run(0.01) < noise_run(0.0)
+    assert noise_run(0.01) < 0.5
+
+
+def test_rescale_ranks_against_the_recent_window():
+    d = Director(list('ab'))
+    assert d.rescale(0.5) == 0.0          # empty window carries no information
+    d.recent.extend([0.0, 1.0, 2.0, 3.0])
+    assert d.rescale(9.0) == 1.0
+    assert d.rescale(-9.0) == -1.0
+    assert d.rescale(1.5) == 0.0          # exactly the median
+
+
+def test_state_dict_round_trips_including_the_rng():
+    a = Director(list('abcde'), seed=5)
+    _bandit(a, lambda r: 2, 50)
+    b = Director(list('abcde'), seed=999)
+    b.load_state_dict(a.state_dict())
+    assert b.probs() == a.probs()
+    assert [b.choose() for _ in range(20)] == [a.choose() for _ in range(20)]
