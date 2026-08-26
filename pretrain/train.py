@@ -150,7 +150,7 @@ def _checkpoint_path(opt, tag):
     return os.path.join(opt.dir_name, f'{base}_{tag}.pt')
 
 
-def _batch_loss(model, inX, out, opt, seg=None):
+def batch_loss(model, inX, out, opt, seg=None):
     """Fused chunked CE on CUDA (mask=None engages the causal flash path);
     otherwise the old soft-capped logits + F.cross_entropy route. With seg
     (document segment ids) the decoder builds the intra-document mask itself."""
@@ -204,7 +204,7 @@ def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
         for g, lr0 in groups:
             g['lr'] = lr0 * frac
         with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-            loss = _batch_loss(model, inX, out, opt, seg=seg)
+            loss = batch_loss(model, inX, out, opt, seg=seg)
         (loss / grad_accum).backward()
         micro += 1
         if micro % grad_accum != 0:
@@ -279,7 +279,7 @@ def train_model(model, opt):
                                    getattr(opt, 'momentum_warmup', 0))
 
             with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
-                loss = _batch_loss(model, inX, out, opt, seg=seg)
+                loss = batch_loss(model, inX, out, opt, seg=seg)
 
             epoch_loss += loss.detach() * out.numel()
             epoch_tokens += out.numel()
@@ -338,7 +338,7 @@ def validate_model(model, opt, max_batches=None):
             seg = rest[0] if rest else None
             if max_batches is not None and i >= max_batches:
                 break
-            loss = _batch_loss(model, inX, out, opt, seg=seg)
+            loss = batch_loss(model, inX, out, opt, seg=seg)
             total_loss += loss * out.numel()
             total_tokens += out.numel()
 
@@ -390,7 +390,7 @@ def test_model(model, opt, epoch):
     with torch.no_grad(), torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
         for x_in, x_out, *rest in _feeder(opt, opt.test):
             seg = rest[0] if rest else None
-            loss = _batch_loss(model, x_in, x_out, opt, seg=seg)
+            loss = batch_loss(model, x_in, x_out, opt, seg=seg)
             total_loss += loss * x_out.numel()
             total_tokens += x_out.numel()
 
