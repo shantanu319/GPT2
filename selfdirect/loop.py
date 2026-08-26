@@ -292,10 +292,12 @@ def parse_args():
                    help='Probe tokens read per arm per round (0 = the whole '
                         'shard). The probe is fixed, so this trades how '
                         'representative the reward is against its cost')
-    p.add_argument('--lr', type=float, default=3e-4, help='AdamW peak LR')
-    p.add_argument('--muon-lr', type=float, default=0.01)
-    p.add_argument('--embed-lr', type=float, default=1e-3)
-    p.add_argument('--scalar-lr', type=float, default=0.005)
+    # An order of magnitude under pretrain/train.py's: at its -muon_lr 0.03,
+    # or even 0.01, continuing the 98M checkpoint diverges outright (mean probe
+    # loss 2.40 -> 2.93 over 40 steps, on both Muon implementations alike).
+    p.add_argument('--muon-lr', type=float, default=1e-3)
+    p.add_argument('--embed-lr', type=float, default=1e-4)
+    p.add_argument('--scalar-lr', type=float, default=3e-4)
     p.add_argument('--muon-impl', choices=['local', 'torch'], default='torch',
                    help="stdlib torch.optim.Muon, as sft/finetune.py uses. "
                         "Measured 22%% faster per step than pretrain/muon.py "
