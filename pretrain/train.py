@@ -133,7 +133,10 @@ class EarlyStopper:
         return False
 
 
-def save_checkpoint(model, optimizers, step, path, config=None):
+def save_checkpoint(model, optimizers, step, path, config=None, extra=None):
+    """extra is merged in alongside the standard keys, so a caller with its own
+    resume state can keep it in the one file sample.py already knows how to
+    read."""
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     # Strip torch.compile's wrapper prefix so checkpoints load into eager models.
     state = {k.replace('_orig_mod.', ''): v for k, v in model.state_dict().items()}
@@ -142,6 +145,7 @@ def save_checkpoint(model, optimizers, step, path, config=None):
         'model': state,
         'optimizers': [o.state_dict() for o in optimizers],
         'config': config,
+        **(extra or {}),
     }, path)
 
 

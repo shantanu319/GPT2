@@ -8,6 +8,7 @@ from core.data import load_bin
 from core.tokenizer import BPETokenizer
 from selfdirect.director import Director
 from selfdirect.domains import build_arm, discover_arms
+from selfdirect.loop import Arm, short_names, take_block
 
 CORPUS = ("the quick brown fox jumps over the lazy dog "
           "hello world hello there hello friends " * 30)
@@ -152,3 +153,35 @@ def test_state_dict_round_trips_including_the_rng():
     b.load_state_dict(a.state_dict())
     assert b.probs() == a.probs()
     assert [b.choose() for _ in range(20)] == [a.choose() for _ in range(20)]
+
+
+# --- loop -----------------------------------------------------------------
+
+def _arm(tokens):
+    return Arm('x', np.arange(tokens, dtype=np.uint16), np.zeros(4, dtype=np.uint16))
+
+
+def test_take_block_reads_forward_across_rounds():
+    arm = _arm(100)
+    assert list(take_block(arm, 30)) == list(range(30))
+    assert list(take_block(arm, 30)) == list(range(30, 60))
+    assert arm.cursor == 60
+
+
+def test_take_block_wraps_at_the_end_of_a_shard():
+    arm = _arm(100)
+    arm.cursor = 90
+    assert list(take_block(arm, 20)) == list(range(90, 100)) + list(range(10))
+    assert arm.cursor == 10
+
+
+def test_take_block_handles_a_block_longer_than_the_shard():
+    arm = _arm(10)
+    assert list(take_block(arm, 25)) == (list(range(10)) * 3)[:25]
+    assert arm.cursor == 5
+
+
+def test_short_names_keeps_arms_distinguishable():
+    assert short_names(['finemath', 'fineweb-edu', 'cosmopedia']) == \
+        ['finem', 'finew', 'cosmo']
+    assert short_names(['a', 'b']) == ['a', 'b']
