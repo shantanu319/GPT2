@@ -128,13 +128,14 @@ def round_reward(before, after, idx, mode):
     """Mean probe-loss drop across arms -- what the director is paid.
 
     'global' counts every arm, the studied one included: the total-nats
-    objective. It does not stop a run specializing. Measured on the 98M
-    checkpoint, 41 rounds took camel-physics down 0.60 while cosmopedia,
-    finemath and fineweb-edu rose by 0.26 between them, and that is a win
-    arithmetically.
+    objective. It does not stop a run specializing -- over 60 rounds it drove
+    camel-physics from 2.31 to 1.66 and gave that arm 36% of the curriculum,
+    while finemath was starved to 3% and drifted 0.15 off its best.
 
     'transfer' leaves the studied arm out, so an arm is paid only for what it
-    does to the others and improving itself earns nothing."""
+    does to the others. Under it camel-physics scores negative and falls to 14%
+    of the curriculum, cosmopedia leads instead, and total forgetting drops from
+    0.34 to 0.20 for 91% of the same gain."""
     drops = [b - a for b, a in zip(before, after)]
     if mode == 'transfer':
         drops = drops[:idx] + drops[idx + 1:]
@@ -330,10 +331,13 @@ def parse_args():
     p.add_argument('--lr-floor', type=float, default=0.03,
                    help='Floor for that backoff, as a fraction of the peak LR')
     p.add_argument('--ce-chunk', type=int, default=16384)
-    p.add_argument('--reward', choices=['global', 'transfer'], default='global',
-                   help="What the director is paid: 'global' is the mean probe "
-                        "drop over every arm, 'transfer' leaves the studied arm "
-                        "out so it earns nothing for improving itself")
+    p.add_argument('--reward', choices=['transfer', 'global'], default='transfer',
+                   help="What the director is paid. 'transfer' leaves the "
+                        "studied arm out, so it earns nothing for improving "
+                        "itself; 'global' counts every arm. Over 60 rounds on "
+                        "the 98M checkpoint transfer kept 91%% of global's gain "
+                        "for 59%% of its forgetting, so it is the default for a "
+                        "loop whose point is not forgetting")
     p.add_argument('--eta', type=float, default=0.08, help='Director step size')
     p.add_argument('--explore', type=float, default=0.1,
                    help='Total probability held back for exploration')

@@ -284,11 +284,43 @@ objective it was right to: −0.60 beats +0.26. It also beat the uniform control
 (2.3151 vs 2.3333), so the director works; the objective it was given is what
 lets specialization through.
 
-`--reward transfer` leaves the studied arm out of its own reward, so an arm is
-paid only for what it does to the other four and improving itself earns
-nothing. `report.py` prints per-arm forgetting (how far each arm's probe loss
-has drifted back off its own best), so which objective you picked is visible in
-the output rather than taken on trust.
+`--reward transfer` (the default) leaves the studied arm out of its own reward,
+so an arm is paid only for what it does to the other four. `report.py` prints
+per-arm forgetting — how far each arm has drifted back off its own best — so
+which objective you picked is visible in the output rather than taken on trust.
+
+### What the runs measured
+
+Four 60-round runs from the same 98M checkpoint and seed, 10 steps x 4 x 256
+tokens per round, so every run consumed identical tokens. `improved` is the
+mean probe-loss drop over the five arms; `forgotten` is summed over them.
+
+| run | reward | LR backoff | improved | forgotten |
+| --- | --- | --- | --- | --- |
+| director | global | off | +0.0481 | 0.7437 |
+| uniform (`--eta 0`) | global | off | +0.0201 | 0.6632 |
+| director | global | on | **+0.1269** | 0.3361 |
+| director | transfer | on | +0.1151 | **0.1994** |
+
+Three things fall out of that:
+
+**Directing beats not directing.** Against an identical run with the director
+pinned to a uniform mixture, the self-directed curriculum improved 2.4x as
+much. The per-arm reward column shows it was reading real signal, not drifting:
+openmath and camel-physics paid, fineweb-edu and finemath cost, and it drove
+those two to 8% and 4% of the curriculum.
+
+**The backoff matters more than the curriculum does.** All runs bottom out
+around round 20; without the backoff they then decay (the unguarded director
+gave back 0.047 nats between rounds 20 and 60), and with it the same seed and
+curriculum keeps improving. It fired at round 20 in both guarded runs, unprompted.
+
+**The reward decides what "better" means.** Under `global` the director spends
+36% of the curriculum on camel-physics, takes it from 2.31 to 1.66, and starves
+finemath to 3%. Under `transfer` camel-physics scores *negative* — its
+self-improvement earns nothing and it damages the others — so it falls to 14%,
+cosmopedia leads instead, and no arm is starved. That costs 9% of the gain and
+halves the forgetting, which is the trade a continual loop should want.
 
 Design points worth stating, because each was a decision that could have gone
 the other way:
