@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from vultr.pipeline import build_pipeline
+from vultr.pipeline import TRAIN_FLAGS, build_pipeline
 from vultr import jobs, smoke as smoke_module
 from vultr import remote
 from vultr.remote import ssh_prefix
@@ -148,3 +148,50 @@ def test_smoke_does_not_accept_a_stale_local_checkpoint(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="missing or empty"):
         smoke_module.smoke(smoke_args(tmp_path))
     assert not checkpoint.exists()
+
+
+def test_pipeline_forwards_every_declared_train_flag():
+    script = build_pipeline(pipeline_args())
+    for name, _kind, _default in TRAIN_FLAGS:
+        assert f"-{name} " in script, f"{name} never reaches pretrain.train"
+
+
+def test_pipeline_defaults_enable_the_validated_arch_opt_ins():
+    script = build_pipeline(pipeline_args())
+    assert "-kda 4" in script
+    assert "-swa 1024" in script
+    assert "-muon_per_head 1" in script
+
+
+def test_pipeline_arch_flags_are_overridable():
+    script = build_pipeline(pipeline_args(kda=0, swa=0, attn_res=4, loops=2))
+    assert "-kda 0" in script and "-swa 0" in script
+    assert "-attn_res 4" in script and "-loops 2" in script
+
+
+def test_pipeline_launches_training_under_torchrun_when_multi_gpu():
+    script = build_pipeline(pipeline_args())
+    assert '--nproc-per-node="$GPUS"' in script
+    line = next(l for l in script.splitlines() if "-m pretrain.train" in l)
+    assert '"${LAUNCH[@]}"' in line
+
+
+def test_only_gradient_averaged_stages_run_multi_rank():
+    """SFT and DPO have no all-reduce yet; launching them per-rank would let
+    every rank train on the same batches and drift apart."""
+    script = build_pipeline(pipeline_args())
+    for stage in ("sft.finetune", "dpo.dpo "):
+        line = next(l for l in script.splitlines() if f"-m {stage}" in l)
+        assert line.strip().startswith('"$PY"'), f"{stage} must stay single-rank"
+
+
+def test_pipeline_counts_gpus_when_gpus_is_auto():
+    assert "nvidia-smi -L" in build_pipeline(pipeline_args())
+    assert "GPUS=8" in build_pipeline(pipeline_args(gpus="8"))
+
+
+def test_pipeline_data_prep_stays_single_process():
+    script = build_pipeline(pipeline_args())
+    for stage in ("pretrain.prepare", "sft.sft_prepare", "dpo.dpo_prepare"):
+        line = next(l for l in script.splitlines() if f"-m {stage}" in l)
+        assert line.strip().startswith('"$PY"'), f"{stage} should not be launched per-rank"

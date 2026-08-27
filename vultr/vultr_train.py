@@ -9,6 +9,7 @@ if __package__ is None:
 from dotenv import load_dotenv
 
 from vultr.jobs import PULL_DIR, pipeline, pull, push, ssh
+from vultr.pipeline import add_train_args
 from vultr.lifecycle import (
     DEFAULT_PRIVATE_KEY, DEFAULT_PUBLIC_KEY, GPU_OS_ID, destroy, print_plans, provision, status,
 )
@@ -48,20 +49,11 @@ def main():
     command.add_argument("--sft-dir-name", default="vultr_run_sft")
     command.add_argument("--dpo-dir-name", default="vultr_run_dpo")
     command.add_argument("--max-train-docs", type=int, default=1_000_000)
-    command.add_argument("--d-model", type=int, default=512)
-    command.add_argument("--n-layers", type=int, default=30)
-    command.add_argument("--heads", type=int, default=8)
-    command.add_argument("--kv-heads", type=int, default=2)
-    command.add_argument("--batchsize", type=int, default=128)
-    command.add_argument("--grad-accum", type=int, default=1)
-    command.add_argument("--grad-ckpt", action="store_true")
-    command.add_argument("--seqlen", type=int, default=1024)
-    command.add_argument("--epochs", type=int, default=1)
-    command.add_argument("--warmup-steps", type=int, default=1000)
-    command.add_argument("--save-every", type=int, default=4000)
-    command.add_argument("--val-every", type=int, default=2000)
+    command.add_argument("--gpus", default="auto",
+                         help="ranks to launch; 'auto' counts the box's GPUs")
     command.add_argument("--sft-epochs", type=int, default=1)
     command.add_argument("--dpo-epochs", type=int, default=2)
+    add_train_args(command)
     command.set_defaults(func=pipeline)
 
     command = commands.add_parser("status", help="show instance and pipeline status")
