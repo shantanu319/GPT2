@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import data_feeder, load_bin
+from core import dist
 from core.model import LOGIT_SOFTCAP, get_model, nopeak_mask
 from core.tokenizer import BPETokenizer
 from pretrain.config import parse_args
@@ -20,7 +21,7 @@ from pretrain.muon import Muon as LocalMuon
 def resolve_device(no_cuda):
     if not no_cuda:
         if torch.cuda.is_available():
-            return torch.device("cuda:0")
+            return torch.device(f"cuda:{dist.local_rank()}")
         if torch.backends.mps.is_available():
             return torch.device("mps")
     return torch.device("cpu")
@@ -137,6 +138,8 @@ def save_checkpoint(model, optimizers, step, path, config=None, extra=None):
     """extra is merged in alongside the standard keys, so a caller with its own
     resume state can keep it in the one file sample.py already knows how to
     read."""
+    if not dist.is_main():
+        return
     os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
     # Strip torch.compile's wrapper prefix so checkpoints load into eager models.
     state = {k.replace('_orig_mod.', ''): v for k, v in model.state_dict().items()}
@@ -175,7 +178,8 @@ def _feeder(opt, data, **kw):
     """data_feeder with the run's doc-masking setting applied (None = off;
     main() sets opt.eos_id from the tokenizer when -doc_mask is on)."""
     return data_feeder(data, opt.batchsize, opt.seqlen, opt.device,
-                       eos_id=getattr(opt, 'eos_id', None), **kw)
+                       eos_id=getattr(opt, 'eos_id', None),
+                       rank=dist.rank(), world=dist.world_size(), **kw)
 
 
 def _apply_momentum_warmup(optimizers, step, warmup):
@@ -197,7 +201,7 @@ def _apply_momentum_warmup(optimizers, step, warmup):
 def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
     """After an early stop, anneal the LR linearly to 0 over a short tail so the
     final checkpoint isn't left mid-schedule (hot)."""
-    print(f"cooldown: annealing LR to 0 over {cooldown_steps} steps")
+    dist.printr(f"cooldown: annealing LR to 0 over {cooldown_steps} steps")
     groups = [(g, g['lr']) for o in opt.optimizers for g in o.param_groups]
     for o in opt.optimizers:
         o.zero_grad()
@@ -213,19 +217,20 @@ def run_lr_cooldown(model, opt, grad_accum, cooldown_steps):
         micro += 1
         if micro % grad_accum != 0:
             continue
+        dist.average_grads(model.parameters())
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
         for o in opt.optimizers:
             o.step()
             o.zero_grad()
         cd += 1
         if cd % opt.printevery == 0:
-            print(f"cooldown | step {cd}/{cooldown_steps} | loss {loss.item():.4f}")
+            dist.printr(f"cooldown | step {cd}/{cooldown_steps} | loss {loss.item():.4f}")
         if cd >= cooldown_steps:
             break
 
 
 def train_model(model, opt):
-    print("training model...")
+    dist.printr("training model...")
     model.train()
     train_curve = []   # (step, batch loss) recorded at each print log
     val_curve = []     # (step, val loss) recorded at each eval
@@ -293,6 +298,7 @@ def train_model(model, opt):
             if micro % grad_accum != 0:
                 continue
 
+            dist.average_grads(model.parameters())
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
             for o in opt.optimizers:
                 o.step()
@@ -300,21 +306,23 @@ def train_model(model, opt):
 
             if iter % opt.printevery == 0:
                 current_pplx = math.exp(loss.item())
-                print(f"Epoch {epoch+1} | iter {iter} | step {step} | Loss: {loss.item():.4f} | pplx: {current_pplx:.2f}")
+                dist.printr(f"Epoch {epoch+1} | iter {iter} | step {step} | Loss: {loss.item():.4f} | pplx: {current_pplx:.2f}")
                 train_curve.append((step, loss.item()))
 
             step += 1
             if opt.save_every and step % opt.save_every == 0:
                 path = _checkpoint_path(opt, f'step{step}')
                 save_checkpoint(model, opt.optimizers, step, path, config=opt.model_config)
-                print(f"Saved checkpoint: {path}")
+                dist.printr(f"Saved checkpoint: {path}")
             if val_every and step % val_every == 0:
                 eval_and_check(max_batches=val_batches)
                 if stop_training:
                     break
 
-        train_loss = (epoch_loss / epoch_tokens).item()
-        print(f"Epoch {epoch+1} finished: Train Loss = {train_loss:.4f}")
+        loss_sum, tok_sum = dist.sum_across(
+            [epoch_loss.item(), epoch_tokens], opt.device)
+        train_loss = loss_sum / tok_sum
+        dist.printr(f"Epoch {epoch+1} finished: Train Loss = {train_loss:.4f}")
 
         # Validate at the end of each epoch:
         eval_and_check(max_batches=None)
@@ -326,13 +334,13 @@ def train_model(model, opt):
 
     final_path = _checkpoint_path(opt, 'final')
     save_checkpoint(model, opt.optimizers, step, final_path, config=opt.model_config)
-    print(f"Saved final checkpoint: {final_path}")
+    dist.printr(f"Saved final checkpoint: {final_path}")
 
     return train_curve, val_curve
 
 
 def validate_model(model, opt, max_batches=None):
-    print("validating model...")
+    dist.printr("validating model...")
     model.eval()  # Set to evaluation mode so dropout, etc. are disabled
     total_loss = torch.zeros((), device=opt.device)
     total_tokens = 0
@@ -346,11 +354,13 @@ def validate_model(model, opt, max_batches=None):
             total_loss += loss * out.numel()
             total_tokens += out.numel()
 
-    if total_tokens == 0:
-        print("validation skipped: val set yields no full batches")
+    loss_sum, tok_sum = dist.sum_across(
+        [total_loss.item(), total_tokens], opt.device)
+    if tok_sum == 0:
+        dist.printr("validation skipped: val set yields no full batches")
         return float('inf')
-    avg_loss = (total_loss / total_tokens).item()
-    print(f"Validation Loss = {avg_loss:.4f}")
+    avg_loss = loss_sum / tok_sum
+    dist.printr(f"Validation Loss = {avg_loss:.4f}")
     return avg_loss
 
 
@@ -386,7 +396,7 @@ def plot_learning_curves(train_curve, val_curve, test_loss=None, path='learning_
 
 
 def test_model(model, opt, epoch):
-    print("testing model...")
+    dist.printr("testing model...")
     model.eval()
     total_loss = torch.zeros((), device=opt.device)
     total_tokens = 0
@@ -398,9 +408,11 @@ def test_model(model, opt, epoch):
             total_loss += loss * x_out.numel()
             total_tokens += x_out.numel()
 
-    avg_loss = (total_loss / total_tokens).item()
+    loss_sum, tok_sum = dist.sum_across(
+        [total_loss.item(), total_tokens], opt.device)
+    avg_loss = loss_sum / tok_sum
     pplx = math.exp(avg_loss)
-    print(f"Epoch {epoch+1}: Test Loss = {avg_loss:.4f} | Perplexity = {pplx:.2f}")
+    dist.printr(f"Epoch {epoch+1}: Test Loss = {avg_loss:.4f} | Perplexity = {pplx:.2f}")
 
     return avg_loss
 
@@ -413,16 +425,19 @@ def main():
     opt.verbose = False
 
     opt.device = resolve_device(opt.no_cuda)
+    if opt.device.type == 'cuda':
+        torch.cuda.set_device(opt.device)
+    dist.init(opt.device)
 
     time_name = time.strftime("%y%m%d_%H%M%S")
     opt.time_name = time_name
     dir_name = "saved/%s" % (opt.dir_name)
-    if not os.path.exists(dir_name):
-        os.makedirs(dir_name)
+    if dist.is_main():
+        os.makedirs(dir_name, exist_ok=True)
     opt.dir_name = dir_name
     opt.log_file = dir_name + "log_file.txt"
 
-    print(str(opt))
+    dist.printr(str(opt))
 
     tok_path = os.path.join(opt.data_dir, 'tokenizer.json')
     train_bin = os.path.join(opt.data_dir, 'train.bin')
@@ -471,19 +486,24 @@ def main():
     }
 
     params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'total params: {params}')
+    dist.printr(f'total params: {params}')
+    dist.printr(f'world size: {dist.world_size()} | '
+                f'tokens per step: {opt.batchsize * opt.seqlen * opt.grad_accum * dist.world_size():,}')
 
     opt.optimizers = make_optimizers(model, muon_lr=opt.muon_lr,
                                      embed_lr=opt.embed_lr,
                                      scalar_lr=opt.scalar_lr,
                                      muon_impl=opt.muon_impl,
                                      muon_per_head=bool(getattr(opt, 'muon_per_head', 0)))
-    batches_per_epoch = max(1, len(opt.train) // (opt.batchsize * opt.seqlen))
+    batches_per_epoch = max(1, len(opt.train)
+                            // (opt.batchsize * opt.seqlen * dist.world_size()))
     opt.total_steps = max(1, opt.epochs * batches_per_epoch // max(1, opt.grad_accum))
 
     train_curve, val_curve = train_model(model, opt)
     test_loss = test_model(model, opt, -1)
-    plot_learning_curves(train_curve, val_curve, test_loss=test_loss)
+    if dist.is_main():
+        plot_learning_curves(train_curve, val_curve, test_loss=test_loss)
+    dist.shutdown()
 
 
 if __name__ == "__main__":

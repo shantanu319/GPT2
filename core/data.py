@@ -48,11 +48,17 @@ class _PinnedRing:
         return out
 
 
-def _window_order(num_sequences, batch_size, shuffle, seed):
+def _window_order(num_sequences, batch_size, shuffle, seed, rank=0, world=1):
     n_batches = num_sequences // batch_size
     if shuffle:
-        return list(np.random.default_rng(seed).permutation(n_batches))
-    return list(range(n_batches))
+        order = list(np.random.default_rng(seed).permutation(n_batches))
+    else:
+        order = list(range(n_batches))
+    if world > 1:
+        # Truncate the ragged tail so every rank yields the same number of
+        # batches; a short rank would deadlock the next gradient all-reduce.
+        order = order[:len(order) - len(order) % world][rank::world]
+    return order
 
 
 def segment_ids_np(tokens2d, eos_id):
@@ -76,7 +82,8 @@ def _slice(data, b, batch_size, seq_len, dtype):
     return np.asarray(data[lo:hi]).astype(dtype, copy=False)
 
 
-def data_feeder_masked(data, mask, batch_size, seq_len, device, eos_id=None):
+def data_feeder_masked(data, mask, batch_size, seq_len, device, eos_id=None,
+                       rank=0, world=1):
     """Like data_feeder, but also yields a loss mask aligned with the targets.
 
     data: uint16 token memmap; mask: uint8 memmap of the same length
@@ -85,7 +92,7 @@ def data_feeder_masked(data, mask, batch_size, seq_len, device, eos_id=None):
     inputs (documents/conversations end at EOS; see segment_ids_np)."""
     total = min(len(data), len(mask))
     num_sequences = total // seq_len
-    order = _window_order(num_sequences, batch_size, shuffle=False, seed=0)
+    order = _window_order(num_sequences, batch_size, False, 0, rank, world)
     if not order:
         return
 
@@ -132,7 +139,8 @@ def data_feeder_masked(data, mask, batch_size, seq_len, device, eos_id=None):
             yield batch[:, :-1], batch[:, 1:], mbatch[:, 1:], seg[:, :-1]
 
 
-def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42, eos_id=None):
+def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42, eos_id=None,
+                rank=0, world=1):
     """Yields (inputs, targets) windows of (batch_size, seq_len), shifted by one.
 
     shuffle=True serves the windows in a seeded-permuted order for the pass
@@ -142,7 +150,7 @@ def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42, eos_i
     inputs (documents end at EOS; see segment_ids_np)."""
     total = len(data)
     num_sequences = total // seq_len
-    order = _window_order(num_sequences, batch_size, shuffle, seed)
+    order = _window_order(num_sequences, batch_size, shuffle, seed, rank, world)
     if not order:
         return
 
