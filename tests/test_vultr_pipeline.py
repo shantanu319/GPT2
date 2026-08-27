@@ -24,6 +24,7 @@ def pipeline_args(**overrides):
 def smoke_args(tmp_path, keep=False):
     return SimpleNamespace(
         keep=keep, out=str(tmp_path), min_vram=99, label="old", compute=False,
+        ranks=1,
         plan=None, region=None, os_id=2284,
         ssh_public_key="public", ssh_private_key="private",
     )
@@ -144,6 +145,7 @@ def test_smoke_does_not_accept_a_stale_local_checkpoint(monkeypatch, tmp_path):
     monkeypatch.setattr(smoke_module, "run_remote", lambda *args, **kwargs: None)
     monkeypatch.setattr(smoke_module, "rsync", lambda *args, **kwargs: None)
     monkeypatch.setattr(smoke_module, "_make_data", lambda *args: None)
+    monkeypatch.setattr(smoke_module, "_gpu_count", lambda *args: 1)
     monkeypatch.setattr(smoke_module, "destroy_state", lambda *args: None)
     with pytest.raises(RuntimeError, match="missing or empty"):
         smoke_module.smoke(smoke_args(tmp_path))
@@ -193,3 +195,40 @@ def test_pipeline_data_prep_stays_single_process():
     for stage in ("pretrain.prepare", "sft.sft_prepare", "dpo.dpo_prepare"):
         line = next(l for l in script.splitlines() if f"-m {stage}" in l)
         assert line.strip().startswith('"$PY"'), f"{stage} should not be launched per-rank"
+
+
+def _smoke_run(monkeypatch, tmp_path, ranks, gpus):
+    """Drive smoke far enough to capture the training command it issues."""
+    commands = []
+    state = {"id": "instance-1", "hourly_cost": 0.059, "ssh_host": "host"}
+    monkeypatch.setattr(smoke_module, "provision", lambda *a, **k: ("api", state))
+    monkeypatch.setattr(smoke_module, "_bootstrap", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_module, "_make_data", lambda *a: None)
+    monkeypatch.setattr(smoke_module, "_gpu_count", lambda *a: gpus)
+    monkeypatch.setattr(smoke_module, "rsync", lambda *a, **k: None)
+    monkeypatch.setattr(smoke_module, "destroy_state", lambda *a: None)
+    monkeypatch.setattr(smoke_module, "run_remote",
+                        lambda s, command, **k: commands.append(command))
+    args = smoke_args(tmp_path)
+    args.ranks = ranks
+    with pytest.raises(RuntimeError, match="missing or empty"):
+        smoke_module.smoke(args)
+    return next(c for c in commands if "pretrain.train" in c)
+
+
+def test_smoke_exercises_the_multi_rank_path(monkeypatch, tmp_path):
+    command = _smoke_run(monkeypatch, tmp_path, ranks=2, gpus=2)
+    assert "torch.distributed.run --standalone --nproc-per-node=2" in command
+    assert "-no_cuda" not in command
+
+
+def test_smoke_falls_back_to_cpu_when_ranks_outnumber_gpus(monkeypatch, tmp_path):
+    """resolve_device hands rank N cuda:N, so 2 ranks on 1 GPU cannot run."""
+    command = _smoke_run(monkeypatch, tmp_path, ranks=2, gpus=1)
+    assert "--nproc-per-node=2" in command
+    assert "-no_cuda" in command
+
+
+def test_smoke_single_rank_skips_the_launcher(monkeypatch, tmp_path):
+    command = _smoke_run(monkeypatch, tmp_path, ranks=1, gpus=1)
+    assert "torch.distributed.run" not in command

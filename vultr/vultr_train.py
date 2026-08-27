@@ -76,6 +76,8 @@ def main():
     )
     add_instance_args(command, min_vram=2)
     command.add_argument("--compute", action="store_true", help="use the cheapest viable shared CPU plan")
+    command.add_argument("--ranks", type=int, default=2,
+                         help="ranks to launch; needs a GPU each or it falls back to CPU/gloo")
     command.add_argument("--keep", action="store_true")
     command.add_argument("--out", default=PULL_DIR)
     command.set_defaults(func=smoke)

@@ -24,6 +24,8 @@ def _bootstrap(state, compute=False):
 
 
 def _make_data(state):
+    """Train lands as two numbered shards so the smoke also covers the sharded
+    read path the big run depends on."""
     script = r"""from pathlib import Path
 import numpy as np
 from core.tokenizer import BPETokenizer
@@ -33,7 +35,9 @@ root.mkdir(parents=True, exist_ok=True)
 specials = {"<|im_start|>": 256, "<|im_end|>": 257, "<|endoftext|>": 258}
 BPETokenizer(special_tokens=specials).save(root / "tokenizer.json")
 rng = np.random.default_rng(1337)
-for split in ("train", "val", "test"):
+for index in range(2):
+    rng.integers(0, 259, 2048, dtype=np.uint16).tofile(root / f"train_{index:05d}.bin")
+for split in ("val", "test"):
     rng.integers(0, 259, 1024, dtype=np.uint16).tofile(root / f"{split}.bin")
 print("synthetic smoke shards ready")
 """
@@ -41,6 +45,15 @@ print("synthetic smoke shards ready")
         state,
         f"cd {REMOTE_ROOT} && /opt/myowntransformer/bin/python - <<'PY'\n{script}PY",
     )
+
+
+def _gpu_count(state):
+    result = run_remote(state, "nvidia-smi -L 2>/dev/null | wc -l",
+                        check=False, capture_output=True)
+    try:
+        return int((result.stdout or b"0").decode().strip())
+    except ValueError:
+        return 0
 
 
 def smoke(args):
@@ -69,13 +82,24 @@ def smoke(args):
         run_remote(state, f"mkdir -p {REMOTE_ROOT}")
         rsync(state, "./", f"root@{state['ssh_host']}:{REMOTE_ROOT}/")
         _make_data(state)
-        print("[smoke] running tiny eager training...")
+        ranks = max(1, args.ranks)
+        gpus = 0 if args.compute else _gpu_count(state)
+        # NCCL needs a GPU per rank and resolve_device hands rank N cuda:N, so
+        # a box with fewer GPUs than ranks runs the check on CPU over gloo.
+        on_gpu = gpus >= ranks
+        launcher = ("-m torch.distributed.run --standalone "
+                    f"--nproc-per-node={ranks}" if ranks > 1 else "")
+        backend = "nccl" if on_gpu and ranks > 1 else ("gloo" if ranks > 1 else "single")
+        print(f"[smoke] running tiny eager training on {ranks} rank(s) "
+              f"({backend}, {'GPU' if on_gpu else 'CPU'})...")
         run_remote(
             state,
-            f"cd {REMOTE_ROOT} && MPLBACKEND=Agg /opt/myowntransformer/bin/python -u "
+            f"cd {REMOTE_ROOT} && MPLBACKEND=Agg PYTHONUNBUFFERED=1 "
+            f"/opt/myowntransformer/bin/python {launcher} "
             "-m pretrain.train -data_dir data_cache/smoke -d_model 32 -n_layers 1 "
             "-heads 1 -kv_heads 1 -batchsize 2 -seqlen 32 -epochs 1 -warmup_steps 2 "
-            "-save_every 0 -val_every 0 -printevery 8 -no_compile -dir_name smoke",
+            "-save_every 0 -val_every 0 -printevery 8 -no_compile -dir_name smoke"
+            + ("" if on_gpu else " -no_cuda"),
         )
         destination = os.path.join(args.out, "smoke")
         os.makedirs(destination, exist_ok=True)
