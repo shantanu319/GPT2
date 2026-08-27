@@ -70,11 +70,12 @@ def print_summary(rounds, rows):
 def print_comparison(runs):
     """Head to head across runs that consumed the same tokens per round, so a
     round index is a fair x-axis for all of them."""
-    print(f"\n{'run':<22}{'rounds':>7}{'probe start':>13}{'probe end':>11}"
+    w = max(len(label) for label, _ in runs) + 2
+    print(f"\n{'run':<{w}}{'rounds':>7}{'probe start':>13}{'probe end':>11}"
           f"{'improved':>11}{'forgotten':>11}")
     for label, rounds in runs:
         start, end = mean_probe(rounds[0]['probe_before']), mean_probe(rounds[-1]['probe_after'])
-        print(f"{label:<22}{len(rounds):>7}{start:>13.4f}{end:>11.4f}"
+        print(f"{label:<{w}}{len(rounds):>7}{start:>13.4f}{end:>11.4f}"
               f"{start - end:>+11.4f}{rounds[-1]['forgetting']:>11.4f}")
     best = min(runs, key=lambda r: mean_probe(r[1][-1]['probe_after']))
     print(f"lowest final probe loss: {best[0]}")
