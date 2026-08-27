@@ -13,6 +13,8 @@ Run once to produce:
 Then train.py points at {output_dir} and mmaps the .bin files directly.
 """
 import argparse
+import itertools
+import json
 import multiprocessing as mp
 import os
 import random
@@ -24,7 +26,7 @@ import numpy as np
 from datasets import load_dataset
 
 from core.chat_format import EOS_TOKEN, special_token_map
-from core.data import BIN_DTYPE
+from core.data import BIN_DTYPE, shard_paths
 from core.tokenizer import BPETokenizer
 
 
@@ -263,38 +265,122 @@ def _iter_encoded(tokenizer, tokenizer_path, stream, eos_id, max_docs, num_worke
             yield i, arr
 
 
+# 500M tokens = 1 GB per shard: small enough that a preemption loses little,
+# large enough that 200B tokens is 400 files rather than 40,000.
+SHARD_TOKENS = 500_000_000
+
+
+def _shard_path(train_path, index):
+    stem, ext = os.path.splitext(train_path)
+    return f"{stem}_{index:05d}{ext}"
+
+
+def _manifest_path(train_path):
+    """Keyed to the train path, not the directory: one output dir holds the
+    pretrain, SFT and DPO bins, and their manifests must not collide."""
+    return f"{os.path.splitext(train_path)[0]}_manifest.json"
+
+
+def _read_manifest(train_path, val_path, test_path):
+    """Rewind to the last sealed shard: drop the partial train shard and cut
+    val/test back to the byte counts recorded alongside it."""
+    path = _manifest_path(train_path)
+    empty = {'docs': 0, 'shards': 0, 'train_tokens': 0, 'val_bytes': 0,
+             'test_bytes': 0, 'complete': False}
+    if not os.path.exists(path):
+        return empty
+    with open(path) as handle:
+        state = json.load(handle)
+    state.setdefault('complete', False)
+    if state['complete']:
+        return state
+    for stale in shard_paths(train_path)[state['shards']:]:
+        os.remove(stale)
+    for target, key in ((val_path, 'val_bytes'), (test_path, 'test_bytes')):
+        if os.path.exists(target):
+            with open(target, 'r+b') as handle:
+                handle.truncate(state[key])
+    return state
+
+
+def _write_manifest(train_path, state):
+    path = _manifest_path(train_path)
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as handle:
+        json.dump(state, handle)
+    os.replace(tmp, path)
+
+
 def _tokenize_stream_three_bins(
     tokenizer, tokenizer_path, stream, eos_id, train_path, val_path, test_path,
-    max_docs=None, holdout_period=500, num_workers=1,
+    max_docs=None, holdout_period=500, num_workers=1, shard_tokens=SHARD_TOKENS,
 ):
-    """Single-pass streaming tokenize into three .bin shards.
+    """Streaming tokenize into numbered train shards plus val/test.
 
-    Doc index i routes as: i % holdout_period == 0 -> val,
-    == 1 -> test, else -> train. Deterministic and single-pass."""
-    train_tokens = 0
-    val_tokens = 0
-    test_tokens = 0
-    tmp_paths = [p + '.tmp' for p in (train_path, val_path, test_path)]
-    with open(tmp_paths[0], 'wb') as trf, open(tmp_paths[1], 'wb') as vf, open(tmp_paths[2], 'wb') as tf:
-        for i, arr in _iter_encoded(tokenizer, tokenizer_path, stream, eos_id,
-                                     max_docs, num_workers):
-            bucket = i % holdout_period
+    Doc index i routes as: i % holdout_period == 0 -> val, == 1 -> test, else
+    -> train. Every sealed shard is a resume point, so a preempted run picks
+    up at the last one instead of re-tokenizing the corpus from scratch.
+    """
+    state = _read_manifest(train_path, val_path, test_path)
+    if state['complete']:
+        print(f"  already tokenized: {state['train_tokens']:,} train tokens "
+              f"in {state['shards']} shards")
+        return state['train_tokens'], state['val_bytes'] // 2, state['test_bytes'] // 2
+    if state['docs']:
+        print(f"  resuming after {state['docs']:,} docs "
+              f"({state['shards']} shards, {state['train_tokens']:,} tokens)")
+        stream = itertools.islice(stream, state['docs'], None)
+        if max_docs is not None:
+            max_docs -= state['docs']
+    if max_docs is not None and max_docs <= 0:
+        return state['train_tokens'], state['val_bytes'] // 2, state['test_bytes'] // 2
+
+    docs, shard, train_tokens = state['docs'], state['shards'], state['train_tokens']
+    val_bytes, test_bytes = state['val_bytes'], state['test_bytes']
+    shard_tmp = _shard_path(train_path, shard) + '.tmp'
+    trf = open(shard_tmp, 'wb')
+    with open(val_path, 'ab') as vf, open(test_path, 'ab') as tf:
+        for _, arr in _iter_encoded(tokenizer, tokenizer_path, stream, eos_id,
+                                    max_docs, num_workers):
+            bucket = docs % holdout_period
+            docs += 1
             if bucket == 0:
                 vf.write(arr.tobytes())
-                val_tokens += len(arr)
+                val_bytes += arr.nbytes
             elif bucket == 1:
                 tf.write(arr.tobytes())
-                test_tokens += len(arr)
+                test_bytes += arr.nbytes
             else:
                 trf.write(arr.tobytes())
                 train_tokens += len(arr)
-            if (i + 1) % 10000 == 0:
-                total = train_tokens + val_tokens + test_tokens
-                print(f"  tokenized {i + 1} docs, {total:,} tokens total")
-    # Atomic finalize: a killed run never leaves reusable partial shards.
-    for tmp, final in zip(tmp_paths, (train_path, val_path, test_path)):
-        os.replace(tmp, final)
-    return train_tokens, val_tokens, test_tokens
+            if trf.tell() >= shard_tokens * arr.itemsize:
+                trf.close()
+                os.replace(shard_tmp, _shard_path(train_path, shard))
+                shard += 1
+                for handle in (vf, tf):
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                _write_manifest(train_path, {
+                    'docs': docs, 'shards': shard, 'train_tokens': train_tokens,
+                    'val_bytes': val_bytes, 'test_bytes': test_bytes,
+                    'complete': False,
+                })
+                shard_tmp = _shard_path(train_path, shard) + '.tmp'
+                trf = open(shard_tmp, 'wb')
+            if docs % 10000 == 0:
+                print(f"  tokenized {docs:,} docs, "
+                      f"{train_tokens + (val_bytes + test_bytes) // 2:,} tokens total")
+        trf.close()
+        if os.path.getsize(shard_tmp):
+            os.replace(shard_tmp, _shard_path(train_path, shard))
+            shard += 1
+        else:
+            os.remove(shard_tmp)
+    _write_manifest(train_path, {
+        'docs': docs, 'shards': shard, 'train_tokens': train_tokens,
+        'val_bytes': val_bytes, 'test_bytes': test_bytes, 'complete': True,
+    })
+    return train_tokens, val_bytes // 2, test_bytes // 2
 
 
 def main():
@@ -310,6 +396,8 @@ def main():
                         help='Reserve 1-in-N docs each for val and test from the train stream.')
     parser.add_argument('--seed', type=int, default=1337,
                         help='Seed for the weighted source interleave')
+    parser.add_argument('--shard-tokens', type=int, default=SHARD_TOKENS,
+                        help='Tokens per train shard; each sealed shard is a resume point')
     args = parser.parse_args()
 
     assert args.vocab_size > 256, "vocab_size must leave room for base bytes"
@@ -376,9 +464,11 @@ def main():
         tokenizer, tok_path, make_stream(), eos_id,
         train_path, val_path, test_path,
         max_docs=args.max_train_docs, holdout_period=args.holdout_period,
-        num_workers=num_workers,
+        num_workers=num_workers, shard_tokens=args.shard_tokens,
     )
-    print(f"  wrote {n_train:,} tokens to {train_path}")
+    shards = shard_paths(train_path)
+    print(f"  wrote {n_train:,} tokens across {len(shards)} shards "
+          f"({os.path.basename(shards[0])}...)" if shards else "  wrote no train shards")
     print(f"  wrote {n_val:,} tokens to {val_path}")
     print(f"  wrote {n_test:,} tokens to {test_path}")
 

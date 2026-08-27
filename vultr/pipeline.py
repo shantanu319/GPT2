@@ -103,7 +103,8 @@ else
 fi
 step "launching on $GPUS GPU(s)"
 
-if [[ ! -f "$DATA/train.bin" ]]; then
+prepared() {{ "$PY" -c "import json,sys;sys.exit(0 if json.load(open('$DATA/train_manifest.json')).get('complete') else 1)" 2>/dev/null; }}
+if ! prepared; then
   step prepare
   "$PY" -m pretrain.prepare --output-dir "$DATA" {prepare_args}
 fi

@@ -1,9 +1,13 @@
 """Tests for prepare.py — focus on parity between serial and parallel encode."""
+import json
+import os
+
 import numpy as np
 
-from core.data import BIN_DTYPE
+from core.data import BIN_DTYPE, shard_paths
 from core.tokenizer import BPETokenizer
-from pretrain.prepare import _iter_encoded, _tokenize_stream_three_bins, mixed_stream, Source
+from pretrain.prepare import (_iter_encoded, _read_manifest, _shard_path,
+                              _tokenize_stream_three_bins, mixed_stream, Source)
 
 
 CORPUS = (
@@ -59,6 +63,11 @@ def test_iter_encoded_respects_max_docs(tmp_path):
     assert [i for i, _ in out] == [0, 1, 2, 3, 4]
 
 
+def _shard_bytes(train_path):
+    """Train is written as numbered shards; concatenate them to compare."""
+    return b''.join(open(p, 'rb').read() for p in shard_paths(str(train_path)))
+
+
 def test_three_bins_parallel_byte_equal_to_serial(tmp_path):
     tok, tok_path, eos_id = _train_tokenizer(tmp_path)
     holdout = 5  # forces several rows into val + test buckets
@@ -80,7 +89,7 @@ def test_three_bins_parallel_byte_equal_to_serial(tmp_path):
     )
 
     assert s_n == p_n
-    assert s_train.read_bytes() == p_train.read_bytes()
+    assert _shard_bytes(s_train) == _shard_bytes(p_train)
     assert s_val.read_bytes() == p_val.read_bytes()
     assert s_test.read_bytes() == p_test.read_bytes()
 
@@ -151,3 +160,77 @@ def test_local_fast_path_matches_serial(monkeypatch, tmp_path):
 def test_default_sources_weights_sum_to_one():
     import pretrain.prepare as prepare
     assert abs(sum(s.weight for s in prepare.SOURCES) - 1.0) < 1e-9
+
+
+def _kill_after_last_shard(tmp_path):
+    """A killed run never writes its final manifest, so the last one on disk
+    is the mid-run entry with complete=False."""
+    path = f"{tmp_path}/train_manifest.json"
+    state = json.load(open(path))
+    state['complete'] = False
+    json.dump(state, open(path, 'w'))
+    return state
+
+
+def test_tokenize_resumes_from_the_last_sealed_shard(tmp_path):
+    """A preempted run must not re-tokenize the corpus from scratch."""
+    tok, tok_path, eos_id = _train_tokenizer(tmp_path)
+    paths = [str(tmp_path / f'{n}.bin') for n in ('train', 'val', 'test')]
+
+    whole = _tokenize_stream_three_bins(tok, tok_path, _rows(), eos_id, *paths,
+                                        holdout_period=5, num_workers=1)
+    reference = (_shard_bytes(paths[0]),
+                 open(paths[1], 'rb').read(), open(paths[2], 'rb').read())
+
+    for path in shard_paths(paths[0]) + paths[1:]:
+        os.remove(path)
+    os.remove(f"{tmp_path}/train_manifest.json")
+
+    # Kill the run partway by capping it, then let it finish from the manifest.
+    shard = 40  # bytes -> seals a shard every couple of docs
+    _tokenize_stream_three_bins(tok, tok_path, _rows()[:20], eos_id, *paths,
+                                holdout_period=5, num_workers=1,
+                                shard_tokens=shard)
+    state = _kill_after_last_shard(tmp_path)
+    assert 0 < state['docs'] < len(TEXTS)
+
+    resumed = _tokenize_stream_three_bins(tok, tok_path, _rows(), eos_id, *paths,
+                                          holdout_period=5, num_workers=1,
+                                          shard_tokens=shard)
+    assert resumed == whole
+    assert (_shard_bytes(paths[0]),
+            open(paths[1], 'rb').read(), open(paths[2], 'rb').read()) == reference
+
+
+def test_partial_shard_is_discarded_on_resume(tmp_path):
+    """The in-flight shard is not a resume point; a torn write must not be
+    mistaken for tokenized data."""
+    tok, tok_path, eos_id = _train_tokenizer(tmp_path)
+    paths = [str(tmp_path / f'{n}.bin') for n in ('train', 'val', 'test')]
+    _tokenize_stream_three_bins(tok, tok_path, _rows(), eos_id, *paths,
+                                holdout_period=5, num_workers=1, shard_tokens=40)
+    state = _kill_after_last_shard(tmp_path)
+
+    # Simulate a kill after the manifest was written: an extra shard and
+    # trailing bytes in val that the manifest does not account for.
+    with open(_shard_path(paths[0], state['shards']), 'wb') as handle:
+        handle.write(b'\xff' * 64)
+    with open(paths[1], 'ab') as handle:
+        handle.write(b'\xff' * 8)
+
+    recovered = _read_manifest(*paths)
+    assert recovered == state
+    assert len(shard_paths(paths[0])) == state['shards']
+    assert os.path.getsize(paths[1]) == state['val_bytes']
+
+
+def test_completed_prepare_is_not_redone(tmp_path):
+    tok, tok_path, eos_id = _train_tokenizer(tmp_path)
+    paths = [str(tmp_path / f'{n}.bin') for n in ('train', 'val', 'test')]
+    first = _tokenize_stream_three_bins(tok, tok_path, _rows(), eos_id, *paths,
+                                        holdout_period=5, num_workers=1)
+    assert json.load(open(f"{tmp_path}/train_manifest.json"))['complete']
+    # An empty stream would produce nothing if it actually re-tokenized.
+    again = _tokenize_stream_three_bins(tok, tok_path, iter([]), eos_id, *paths,
+                                        holdout_period=5, num_workers=1)
+    assert again == first

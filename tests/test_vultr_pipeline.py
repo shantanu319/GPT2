@@ -31,7 +31,7 @@ def smoke_args(tmp_path, keep=False):
 
 def test_pipeline_is_resumable_across_all_training_stages():
     script = build_pipeline(pipeline_args())
-    assert '[[ ! -f "$DATA/train.bin" ]]' in script
+    assert "if ! prepared; then" in script
     assert '[[ ! -f "saved/$DIR/ckpt_final.pt" ]]' in script
     assert '[[ ! -f "$DATA/sft_train.bin" ]]' in script
     assert '[[ ! -f "saved/$SFT/sft_final.pt" ]]' in script

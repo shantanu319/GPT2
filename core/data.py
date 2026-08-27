@@ -1,3 +1,6 @@
+import glob
+import os
+
 import numpy as np
 import torch
 
@@ -5,8 +8,57 @@ import torch
 BIN_DTYPE = np.uint16
 
 
+class ShardedArray:
+    """Read-only concatenation of memmapped shards, indexed as one array.
+
+    The feeders only ever ask for len() and one contiguous window at a time,
+    so shards are never materialized together — which is the point when the
+    corpus is bigger than RAM.
+    """
+
+    def __init__(self, paths, dtype=BIN_DTYPE):
+        self.parts = [np.memmap(p, dtype=dtype, mode='r') for p in paths]
+        self.bounds = np.cumsum([0] + [len(part) for part in self.parts])
+        self.dtype = dtype
+
+    def __len__(self):
+        return int(self.bounds[-1])
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice):
+            shard = int(np.searchsorted(self.bounds, key, side='right')) - 1
+            return self.parts[shard][key - self.bounds[shard]]
+        lo, hi, _ = key.indices(len(self))
+        first = int(np.searchsorted(self.bounds, lo, side='right')) - 1
+        pieces = []
+        for i in range(first, len(self.parts)):
+            start, end = self.bounds[i], self.bounds[i + 1]
+            if start >= hi:
+                break
+            pieces.append(self.parts[i][max(lo, start) - start:min(hi, end) - start])
+        if len(pieces) == 1:
+            return pieces[0]
+        return np.concatenate(pieces) if pieces else np.empty(0, dtype=self.dtype)
+
+
+def shard_paths(path):
+    """The shard set that stands in for `path`: train.bin -> train_00000.bin..."""
+    stem, ext = os.path.splitext(path)
+    return sorted(glob.glob(f"{stem}_[0-9]*{ext}"))
+
+
 def load_bin(path):
-    return np.memmap(path, dtype=BIN_DTYPE, mode='r')
+    """A single .bin, or the numbered shards that replaced it."""
+    if os.path.exists(path):
+        return np.memmap(path, dtype=BIN_DTYPE, mode='r')
+    shards = shard_paths(path)
+    if not shards:
+        raise FileNotFoundError(path)
+    return ShardedArray(shards)
+
+
+def bin_exists(path):
+    return os.path.exists(path) or bool(shard_paths(path))
 
 
 def load_bin_u8(path):

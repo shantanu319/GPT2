@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
-from core.data import data_feeder, load_bin
+from core.data import bin_exists, data_feeder, load_bin
 from core import dist
 from core.model import LOGIT_SOFTCAP, get_model, nopeak_mask
 from core.tokenizer import BPETokenizer
@@ -444,7 +444,7 @@ def main():
     val_bin = os.path.join(opt.data_dir, 'val.bin')
     test_bin = os.path.join(opt.data_dir, 'test.bin')
     for p in (tok_path, train_bin, val_bin, test_bin):
-        if not os.path.exists(p):
+        if not bin_exists(p):
             raise FileNotFoundError(
                 f"missing {p} — run `python -m pretrain.prepare --output-dir {opt.data_dir}` first"
             )
