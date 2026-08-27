@@ -124,7 +124,7 @@ fi
 
 if [[ ! -f "saved/$SFT/sft_final.pt" ]]; then
   step sft
-  "$PY" -m sft.finetune --checkpoint "saved/$DIR/ckpt_final.pt" \
+  "${{LAUNCH[@]}}" -m sft.finetune --checkpoint "saved/$DIR/ckpt_final.pt" \
     --data-dir "$DATA" --dir-name "$SFT" --epochs {args.sft_epochs}
 fi
 
@@ -135,7 +135,7 @@ fi
 
 if [[ ! -f "saved/$DPO/dpo_final.pt" ]]; then
   step dpo
-  "$PY" -m dpo.dpo --checkpoint "saved/$SFT/sft_final.pt" \
+  "${{LAUNCH[@]}}" -m dpo.dpo --checkpoint "saved/$SFT/sft_final.pt" \
     --data-dir "$DATA" --dir-name "$DPO" --epochs {args.dpo_epochs}
 fi
 

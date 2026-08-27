@@ -1,6 +1,8 @@
 import math
+from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from core.model import Transformer
@@ -168,3 +170,40 @@ def test_dpo_loss_and_metrics_values():
     loss0, margin0, acc0 = dpo_loss_and_metrics(torch.zeros(2), torch.zeros(2), beta)
     assert math.isclose(loss0.item(), math.log(2), rel_tol=1e-6)
     assert margin0 == 0.0 and acc0 == 0.0
+
+
+def _pairs(lengths):
+    """lengths: list of (chosen_len, rejected_len). Offsets don't matter here."""
+    return np.array([[0, c, 0, r] for c, r in lengths], dtype=np.int32)
+
+
+@pytest.mark.parametrize("lengths", [
+    [(5, 5)], [(1, 1)], [(0, 0)], [(1, 5)], [(5, 1)], [(2, 1)], [(1, 2)],
+])
+def test_viable_matches_build_batch(lengths):
+    """viable() decides skips from lengths alone so every rank agrees. If it
+    ever disagrees with build_batch, ranks run different step counts."""
+    from dpo.dpo import build_batch, viable
+    total = sum(c + r for c, r in lengths)
+    tokens = np.arange(max(1, total), dtype=np.uint16)
+    masks = np.ones_like(tokens, dtype=np.uint8)
+    pairs = _pairs(lengths)
+    ids = range(len(lengths))
+    built = build_batch(tokens, masks, pairs, ids, max_len=16, pad_id=0,
+                        device=torch.device('cpu'))
+    assert viable(pairs, ids, max_len=16) == (built is not None)
+
+
+def test_batch_indices_shards_equally_and_skips_degenerates():
+    from dpo.dpo import batch_indices
+    args = SimpleNamespace(batchsize=1, max_len=16)
+    # batch 2 is degenerate, so 9 viable batches shard 4-way as 2 each.
+    lengths = [(5, 5)] * 10
+    lengths[2] = (1, 1)
+    pairs = _pairs(lengths)
+    assert batch_indices(pairs, args) == [0, 1, 3, 4, 5, 6, 7, 8, 9]
+    shards = [batch_indices(pairs, args, rank=r, world=4) for r in range(4)]
+    assert [len(s) for s in shards] == [2, 2, 2, 2]
+    flat = [i for s in shards for i in s]
+    assert len(flat) == len(set(flat))
+    assert 2 not in flat

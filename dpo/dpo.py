@@ -29,6 +29,7 @@ from core.data import load_bin, load_bin_u8
 from core.model import LOGIT_SOFTCAP, Transformer, load_checkpoint
 from core.tokenizer import BPETokenizer
 from pretrain.fused_ce import chunked_cross_entropy
+from core import dist
 from pretrain.train import lr_factor, resolve_device, save_checkpoint
 from sft.finetune import make_sft_optimizers
 
@@ -134,11 +135,32 @@ def make_dpo_optimizers(model, muon_lr, adamw_lr):
     return [adamw]
 
 
-def batches(tokens, masks, pairs, args, device, max_batches=None):
-    """Yield (index, batch) for the deterministic pass over `pairs`, skipping
-    degenerate ones. Every epoch sees exactly this sequence."""
+def viable(pairs, pair_ids, max_len):
+    """Whether build_batch would return a batch for these pairs, decided from
+    the length columns alone. Ranks must agree on which batches are skipped or
+    they run different step counts and the gradient all-reduce deadlocks, so
+    this has to be answerable without building the tensors."""
+    return any(min(int(pairs[p][side + 1]), max_len) >= 2
+               for p in pair_ids for side in (0, 2))
+
+
+def batch_indices(pairs, args, max_batches=None, rank=0, world=1):
+    """The deterministic pass over `pairs`, minus degenerate batches, sharded.
+
+    Every rank derives the same viable list before slicing its own stride, so
+    the shards stay equal-length."""
     n = max(1, len(pairs) // args.batchsize)
-    for i in range(n if max_batches is None else min(n, max_batches)):
+    order = [i for i in range(n)
+             if viable(pairs, range(i * args.batchsize, (i + 1) * args.batchsize),
+                       args.max_len)]
+    if world > 1:
+        order = order[:len(order) - len(order) % world][rank::world]
+    return order if max_batches is None else order[:max_batches]
+
+
+def batches(tokens, masks, pairs, args, device, max_batches=None, rank=0, world=1):
+    """Yield (index, batch) for this rank's share of the pass over `pairs`."""
+    for i in batch_indices(pairs, args, max_batches, rank, world):
         pair_ids = range(i * args.batchsize, (i + 1) * args.batchsize)
         batch = build_batch(tokens, masks, pairs, pair_ids, args.max_len,
                             args.pad_id, device)
@@ -155,14 +177,16 @@ def reference_logprobs(ref, tokens, masks, pairs, args, device, max_batches=None
     sequence_logprobs is padding-invariant, so a batch's values do not depend
     on how the pairs were grouped either."""
     return {i: sequence_logprobs(ref, *batch, device)
-            for i, batch in batches(tokens, masks, pairs, args, device, max_batches)}
+            for i, batch in batches(tokens, masks, pairs, args, device, max_batches,
+                                    rank=dist.rank(), world=dist.world_size())}
 
 
 @torch.no_grad()
 def validate(policy, ref_logps, tokens, masks, pairs, args, device, max_batches=50):
     policy.eval()
     total_loss, total_margin, total_acc, count = 0.0, 0.0, 0.0, 0
-    for i, batch in batches(tokens, masks, pairs, args, device, max_batches):
+    for i, batch in batches(tokens, masks, pairs, args, device, max_batches,
+                            rank=dist.rank(), world=dist.world_size()):
         pi = sequence_logprobs(policy, *batch, device)
         loss, margin, acc = dpo_loss_and_metrics(pi, ref_logps[i], args.beta)
         total_loss += loss.item()
@@ -170,9 +194,11 @@ def validate(policy, ref_logps, tokens, masks, pairs, args, device, max_batches=
         total_acc += acc
         count += 1
     policy.train()
+    total_loss, total_margin, total_acc, count = dist.sum_across(
+        [total_loss, total_margin, total_acc, count], device)
     avg_loss = total_loss / max(1, count)
-    print(f"DPO val loss = {avg_loss:.4f} | margin = {total_margin / max(1, count):.4f} "
-          f"| acc = {total_acc / max(1, count):.3f}")
+    dist.printr(f"DPO val loss = {avg_loss:.4f} | margin = {total_margin / max(1, count):.4f} "
+                f"| acc = {total_acc / max(1, count):.3f}")
     return avg_loss
 
 
@@ -200,7 +226,10 @@ def main():
     args = parser.parse_args()
 
     device = resolve_device(args.no_cuda)
-    print(f"device: {device}")
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    dist.init(device)
+    dist.printr(f"device: {device} | world size: {dist.world_size()}")
 
     tokenizer = BPETokenizer()
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
@@ -232,8 +261,8 @@ def main():
     ref.eval()
     for p in ref.parameters():
         p.requires_grad_(False)
-    print(f"loaded {sum(p.numel() for p in policy.parameters()):,} params "
-          f"from {args.checkpoint} (policy + frozen reference)")
+    dist.printr(f"loaded {sum(p.numel() for p in policy.parameters()):,} params "
+                f"from {args.checkpoint} (policy + frozen reference)")
 
     train_tokens = load_bin(os.path.join(args.data_dir, 'dpo_train.bin'))
     train_masks = load_bin_u8(os.path.join(args.data_dir, 'dpo_train_mask.bin'))
@@ -243,24 +272,26 @@ def main():
     val_pairs = load_pairs(os.path.join(args.data_dir, 'dpo_val_pairs.bin'))
 
     optimizers = make_dpo_optimizers(policy, muon_lr=args.muon_lr, adamw_lr=args.lr)
-    batches_per_epoch = max(1, len(train_pairs) // args.batchsize)
+    batches_per_epoch = max(1, len(train_pairs) // (args.batchsize * dist.world_size()))
     total_steps = max(1, args.epochs * batches_per_epoch)
 
     save_dir = os.path.join('saved', args.dir_name)
-    os.makedirs(save_dir, exist_ok=True)
+    if dist.is_main():
+        os.makedirs(save_dir, exist_ok=True)
 
     policy.train()
-    print("precomputing reference log-probs...")
+    dist.printr("precomputing reference log-probs...")
     train_ref = reference_logprobs(ref, train_tokens, train_masks, train_pairs,
                                    args, device)
     val_ref = reference_logprobs(ref, val_tokens, val_masks, val_pairs, args,
                                  device, max_batches=50)
     del ref  # every reference number is in hand; the weights are dead weight now
-    print(f"  {len(train_ref)} train batches, {len(val_ref)} val batches cached")
+    dist.printr(f"  {len(train_ref)} train batches, {len(val_ref)} val batches cached")
 
     step = 0
     for epoch in range(args.epochs):
-        for i, batch in batches(train_tokens, train_masks, train_pairs, args, device):
+        for i, batch in batches(train_tokens, train_masks, train_pairs, args, device,
+                                rank=dist.rank(), world=dist.world_size()):
             factor = lr_factor(step, total_steps, warmup_steps=args.warmup_steps)
             for opt in optimizers:
                 for group in opt.param_groups:
@@ -272,25 +303,27 @@ def main():
             for opt in optimizers:
                 opt.zero_grad()
             loss.backward()
+            dist.average_grads(policy.parameters())
             torch.nn.utils.clip_grad_norm_(policy.parameters(), max_norm=1.0)
             for opt in optimizers:
                 opt.step()
 
             if step % args.printevery == 0:
-                print(f"epoch {epoch+1} | step {step}/{total_steps} | "
-                      f"loss {loss.item():.4f} | margin {margin:.4f} | acc {acc:.3f}")
+                dist.printr(f"epoch {epoch+1} | step {step}/{total_steps} | "
+                            f"loss {loss.item():.4f} | margin {margin:.4f} | acc {acc:.3f}")
             step += 1
             if args.save_every and step % args.save_every == 0:
                 path = os.path.join(save_dir, f'dpo_step{step}.pt')
                 save_checkpoint(policy, optimizers, step, path, config=cfg)
-                print(f"saved {path}")
+                dist.printr(f"saved {path}")
             if args.val_every and step % args.val_every == 0:
                 validate(policy, val_ref, val_tokens, val_masks, val_pairs, args, device)
 
     final = os.path.join(save_dir, 'dpo_final.pt')
     save_checkpoint(policy, optimizers, step, final, config=cfg)
     validate(policy, val_ref, val_tokens, val_masks, val_pairs, args, device)
-    print(f"saved final DPO checkpoint: {final}")
+    dist.printr(f"saved final DPO checkpoint: {final}")
+    dist.shutdown()
 
 
 if __name__ == '__main__':

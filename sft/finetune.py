@@ -18,6 +18,7 @@ import torch.nn.functional as F
 
 from core.chat_format import EOS_TOKEN
 from core.data import data_feeder_masked, load_bin, load_bin_u8
+from core import dist
 from core.model import (LOGIT_SOFTCAP, load_checkpoint, model_from_config,
                         nopeak_mask)
 from core.tokenizer import BPETokenizer
@@ -74,7 +75,8 @@ def validate(model, val, val_mask, opt, device, max_batches=100, eos_id=None):
     with torch.autocast(device_type=device.type, dtype=torch.bfloat16):
         for i, (x, y, m, *rest) in enumerate(
                 data_feeder_masked(val, val_mask, opt.batchsize, opt.seqlen, device,
-                                   eos_id=eos_id)):
+                                   eos_id=eos_id, rank=dist.rank(),
+                                   world=dist.world_size())):
             if i >= max_batches:
                 break
             seg = rest[0] if rest else None
@@ -83,8 +85,9 @@ def validate(model, val, val_mask, opt, device, max_batches=100, eos_id=None):
             total += loss.item()
             count += 1
     model.train()
-    avg = total / max(1, count)
-    print(f"SFT val loss = {avg:.4f} | pplx = {math.exp(avg):.2f}")
+    loss_sum, batches = dist.sum_across([total, count], device)
+    avg = loss_sum / max(1, batches)
+    dist.printr(f"SFT val loss = {avg:.4f} | pplx = {math.exp(avg):.2f}")
     return avg
 
 
@@ -112,7 +115,10 @@ def main():
     args = parser.parse_args()
 
     device = resolve_device(args.no_cuda)
-    print(f"device: {device}")
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+    dist.init(device)
+    dist.printr(f"device: {device} | world size: {dist.world_size()}")
 
     tokenizer = BPETokenizer()
     tokenizer.load(os.path.join(args.data_dir, 'tokenizer.json'))
@@ -123,8 +129,8 @@ def main():
         raise ValueError("checkpoint lacks config — retrain with current train.py")
     model = model_from_config(cfg, device)
     model.load_state_dict(ckpt['model'])
-    print(f"loaded {sum(p.numel() for p in model.parameters()):,} params "
-          f"from {args.checkpoint}")
+    dist.printr(f"loaded {sum(p.numel() for p in model.parameters()):,} params "
+                f"from {args.checkpoint}")
 
     train = load_bin(os.path.join(args.data_dir, 'sft_train.bin'))
     train_mask = load_bin_u8(os.path.join(args.data_dir, 'sft_train_mask.bin'))
@@ -133,17 +139,21 @@ def main():
     eos_id = None if args.no_doc_mask else tokenizer.special_tokens[EOS_TOKEN]
 
     optimizers = make_sft_optimizers(model, muon_lr=args.muon_lr, adamw_lr=args.lr)
-    batches_per_epoch = max(1, len(train) // (args.batchsize * args.seqlen))
+    batches_per_epoch = max(1, len(train)
+                            // (args.batchsize * args.seqlen * dist.world_size()))
     total_steps = max(1, args.epochs * batches_per_epoch)
 
     save_dir = os.path.join('saved', args.dir_name)
-    os.makedirs(save_dir, exist_ok=True)
+    if dist.is_main():
+        os.makedirs(save_dir, exist_ok=True)
 
     model.train()
     step = 0
     for epoch in range(args.epochs):
         for x, y, m, *rest in data_feeder_masked(train, train_mask, args.batchsize,
-                                                 args.seqlen, device, eos_id=eos_id):
+                                                 args.seqlen, device, eos_id=eos_id,
+                                                 rank=dist.rank(),
+                                                 world=dist.world_size()):
             seg = rest[0] if rest else None
             factor = lr_factor(step, total_steps, warmup_steps=args.warmup_steps)
             for opt in optimizers:
@@ -157,25 +167,27 @@ def main():
             for opt in optimizers:
                 opt.zero_grad()
             loss.backward()
+            dist.average_grads(model.parameters())
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             for opt in optimizers:
                 opt.step()
 
             if step % args.printevery == 0:
-                print(f"epoch {epoch+1} | step {step}/{total_steps} | "
-                      f"loss {loss.item():.4f} | pplx {math.exp(loss.item()):.2f}")
+                dist.printr(f"epoch {epoch+1} | step {step}/{total_steps} | "
+                            f"loss {loss.item():.4f} | pplx {math.exp(loss.item()):.2f}")
             step += 1
             if args.save_every and step % args.save_every == 0:
                 path = os.path.join(save_dir, f'sft_step{step}.pt')
                 save_checkpoint(model, optimizers, step, path, config=cfg)
-                print(f"saved {path}")
+                dist.printr(f"saved {path}")
             if args.val_every and step % args.val_every == 0:
                 validate(model, val, val_mask, args, device, eos_id=eos_id)
 
     final = os.path.join(save_dir, 'sft_final.pt')
     save_checkpoint(model, optimizers, step, final, config=cfg)
     validate(model, val, val_mask, args, device, eos_id=eos_id)
-    print(f"saved final SFT checkpoint: {final}")
+    dist.printr(f"saved final SFT checkpoint: {final}")
+    dist.shutdown()
 
 
 if __name__ == '__main__':

@@ -176,13 +176,11 @@ def test_pipeline_launches_training_under_torchrun_when_multi_gpu():
     assert '"${LAUNCH[@]}"' in line
 
 
-def test_only_gradient_averaged_stages_run_multi_rank():
-    """SFT and DPO have no all-reduce yet; launching them per-rank would let
-    every rank train on the same batches and drift apart."""
+def test_every_training_stage_runs_multi_rank():
     script = build_pipeline(pipeline_args())
-    for stage in ("sft.finetune", "dpo.dpo "):
+    for stage in ("pretrain.train", "sft.finetune", "dpo.dpo "):
         line = next(l for l in script.splitlines() if f"-m {stage}" in l)
-        assert line.strip().startswith('"$PY"'), f"{stage} must stay single-rank"
+        assert '"${LAUNCH[@]}"' in line, f"{stage} bypasses the launcher"
 
 
 def test_pipeline_counts_gpus_when_gpus_is_auto():
