@@ -106,13 +106,13 @@ def wait_ready(api, instance_id, ssh_private_key, timeout=20 * 60, kind=None):
     last = None
     while time.time() < deadline:
         info = api.request("GET", f"{kind.path}/{instance_id}")[kind.item]
-        status = (info.get("status"), info.get("power_status"), info.get("server_status"))
+        status = tuple(info.get(field) for field, _ in kind.ready)
         if status != last:
             print(f"  {kind.name} {instance_id}: "
                   f"{' / '.join(str(item) for item in status)}", flush=True)
             last = status
         ip = info.get("main_ip")
-        if status == ("active", "running", "ok") and ip and ip != "0.0.0.0":
+        if status == tuple(v for _, v in kind.ready) and ip and ip != "0.0.0.0":
             state = {"id": instance_id, "ssh_host": ip, "ssh_private_key": ssh_private_key}
             probe = subprocess.run(
                 ssh_prefix(state) + ["true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL

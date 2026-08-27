@@ -57,12 +57,18 @@ class Kind:
     items: str
     plans_path: str
     plans_key: str
+    # The status fields this kind reports, and the values that mean ready.
+    # Bare metal returns status alone -- no power_status or server_status.
+    ready: tuple
 
 
 INSTANCE = Kind("instance", "/instances", "instance", "instances",
-                "/plans?type=vcg&per_page=500", "plans")
+                "/plans?type=vcg&per_page=500", "plans",
+                (("status", "active"), ("power_status", "running"),
+                 ("server_status", "ok")))
 METAL = Kind("metal", "/bare-metals", "bare_metal", "bare_metals",
-             "/plans-metal?per_page=500", "plans_metal")
+             "/plans-metal?per_page=500", "plans_metal",
+             (("status", "active"),))
 KINDS = {kind.name: kind for kind in (INSTANCE, METAL)}
 
 

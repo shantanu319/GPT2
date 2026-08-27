@@ -2,6 +2,8 @@ import io
 import json
 import urllib.error
 
+from types import SimpleNamespace
+
 import pytest
 
 from vultr.api import VultrAPI, per_device_vram, select_compute_plan, select_live_plan, select_plan
@@ -164,3 +166,35 @@ def test_state_kind_defaults_to_instance_for_pre_metal_state_files():
     assert state_kind({"id": "x"}) is INSTANCE
     assert state_kind({"id": "x", "kind": "metal"}) is METAL
     assert state_kind(None) is INSTANCE
+
+
+def test_bare_metal_readiness_uses_only_the_field_it_reports():
+    """Bare metal has no power_status/server_status. Matching the instance
+    tuple against it would never succeed and wait_ready would hang."""
+    from vultr.api import INSTANCE, METAL
+    assert METAL.ready == (("status", "active"),)
+    assert dict(INSTANCE.ready)["power_status"] == "running"
+
+
+def test_wait_ready_accepts_a_bare_metal_that_reports_status_alone(monkeypatch):
+    from vultr import remote
+    from vultr.api import METAL
+    info = {"bare_metal": {"status": "active", "main_ip": "10.0.0.1"}}
+    monkeypatch.setattr(remote.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=0))
+    api = SimpleNamespace(request=lambda method, path: info)
+    state = remote.wait_ready(api, "metal-1", "key", timeout=5, kind=METAL)
+    assert state["ssh_host"] == "10.0.0.1"
+
+
+def test_wait_ready_still_requires_all_three_fields_for_an_instance(monkeypatch):
+    from vultr import remote
+    from vultr.api import INSTANCE
+    half_up = {"instance": {"status": "active", "power_status": "stopped",
+                            "server_status": "ok", "main_ip": "10.0.0.1"}}
+    monkeypatch.setattr(remote.subprocess, "run",
+                        lambda *a, **k: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(remote.time, "sleep", lambda _: None)
+    api = SimpleNamespace(request=lambda method, path: half_up)
+    with pytest.raises(RuntimeError, match="not SSH-ready"):
+        remote.wait_ready(api, "i-1", "key", timeout=1, kind=INSTANCE)

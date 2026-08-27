@@ -274,8 +274,8 @@ def status(args):
     info = api.request("GET", f"{kind.path}/{instance_id}")[kind.item]
     plan = (state or {}).get("plan", info.get("plan", "unknown plan"))
     rate = f" @ ${state['hourly_cost']:.3f}/hr" if state else ""
-    print(f"{kind.name} {instance_id}: {info['status']} / {info['power_status']} / "
-          f"{info['server_status']} | {plan}{rate}")
-    if info["status"] == "active" and state and state.get("ssh_host"):
+    reported = " / ".join(str(info.get(field)) for field, _ in kind.ready)
+    print(f"{kind.name} {instance_id}: {reported} | {plan}{rate}")
+    if info.get("status") == "active" and state and state.get("ssh_host"):
         run_remote(state, "cd /root/myowntransformer && tail -n 20 pipeline.log 2>/dev/null || true",
                    check=False)
