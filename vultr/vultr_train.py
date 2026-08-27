@@ -22,6 +22,9 @@ def add_instance_args(parser, min_vram=20):
     parser.add_argument("--min-vram", type=int, default=min_vram)
     parser.add_argument("--os-id", type=int, default=GPU_OS_ID)
     parser.add_argument("--label", default="myowntransformer")
+    parser.add_argument("--metal", action="store_true",
+                        help="deploy bare metal; the multi-GPU A100/H100/B200 "
+                             "boxes are only available there")
     parser.add_argument("--ssh-public-key", default=DEFAULT_PUBLIC_KEY)
     parser.add_argument("--ssh-private-key", default=DEFAULT_PRIVATE_KEY)
 

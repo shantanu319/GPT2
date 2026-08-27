@@ -3,6 +3,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from fractions import Fraction
 
 
@@ -47,6 +48,47 @@ def client_from_env(required=True):
     return VultrAPI(token)
 
 
+@dataclass(frozen=True)
+class Kind:
+    """Cloud GPU and bare metal differ only in endpoint and JSON key names."""
+    name: str
+    path: str
+    item: str
+    items: str
+    plans_path: str
+    plans_key: str
+
+
+INSTANCE = Kind("instance", "/instances", "instance", "instances",
+                "/plans?type=vcg&per_page=500", "plans")
+METAL = Kind("metal", "/bare-metals", "bare_metal", "bare_metals",
+             "/plans-metal?per_page=500", "plans_metal")
+KINDS = {kind.name: kind for kind in (INSTANCE, METAL)}
+
+
+def list_kind_plans(kind, client=None):
+    """The plan catalog for a resource kind. The A100 and H100 boxes live in
+    /plans-metal, which /plans?type=vcg does not return."""
+    client = client or client_from_env(required=False)
+    return client.request("GET", kind.plans_path, auth=False)[kind.plans_key]
+
+
+def deployable(plan):
+    return bool(plan.get("deploy_ondemand") or plan.get("deploy_preemptible"))
+
+
+def hourly_cost(plan):
+    """What the plan actually bills. The 8x A100 box is preemptible-only, so
+    its on-demand hourly_cost is a rate you cannot deploy at."""
+    if plan.get("deploy_ondemand"):
+        return plan["hourly_cost"]
+    return plan.get("hourly_cost_preemptible", plan["hourly_cost"])
+
+
+def is_preemptible_only(plan):
+    return not plan.get("deploy_ondemand") and bool(plan.get("deploy_preemptible"))
+
+
 def list_plans(plan_type, client=None):
     client = client or client_from_env(required=False)
     result = client.request("GET", f"/plans?type={plan_type}&per_page=500", auth=False)
@@ -78,7 +120,7 @@ def per_device_vram(plan):
 
 
 def select_plan(plans, min_vram=20, plan_id=None, region=None):
-    candidates = [plan for plan in plans if plan.get("deploy_ondemand")]
+    candidates = [plan for plan in plans if deployable(plan)]
     if plan_id:
         candidates = [plan for plan in candidates if plan["id"] == plan_id]
     else:
@@ -91,7 +133,7 @@ def select_plan(plans, min_vram=20, plan_id=None, region=None):
         target = plan_id or f">={min_vram} GB VRAM"
         where = f" in {region}" if region else ""
         raise RuntimeError(f"no on-demand Vultr GPU plan for {target}{where}")
-    plan = min(candidates, key=lambda item: (item["hourly_cost"], item["id"]))
+    plan = min(candidates, key=lambda item: (hourly_cost(item), item["id"]))
     return plan, region or plan["locations"][0]
 
 

@@ -99,14 +99,17 @@ def ensure_ssh_key(api, public_key_path):
     return result["ssh_key"]["id"], True
 
 
-def wait_ready(api, instance_id, ssh_private_key, timeout=20 * 60):
+def wait_ready(api, instance_id, ssh_private_key, timeout=20 * 60, kind=None):
+    from vultr.api import INSTANCE
+    kind = kind or INSTANCE
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
-        info = api.request("GET", f"/instances/{instance_id}")["instance"]
+        info = api.request("GET", f"{kind.path}/{instance_id}")[kind.item]
         status = (info.get("status"), info.get("power_status"), info.get("server_status"))
         if status != last:
-            print(f"  instance {instance_id}: {' / '.join(str(item) for item in status)}", flush=True)
+            print(f"  {kind.name} {instance_id}: "
+                  f"{' / '.join(str(item) for item in status)}", flush=True)
             last = status
         ip = info.get("main_ip")
         if status == ("active", "running", "ok") and ip and ip != "0.0.0.0":
@@ -117,4 +120,4 @@ def wait_ready(api, instance_id, ssh_private_key, timeout=20 * 60):
             if probe.returncode == 0:
                 return state
         time.sleep(10)
-    raise RuntimeError(f"instance {instance_id} not SSH-ready after {timeout // 60} minutes")
+    raise RuntimeError(f"{kind.name} {instance_id} not SSH-ready after {timeout // 60} minutes")

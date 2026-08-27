@@ -115,3 +115,52 @@ def test_request_normalizes_transport_errors_for_cleanup_retries(monkeypatch):
 def test_authenticated_request_requires_key():
     with pytest.raises(RuntimeError, match="VULTR_API_KEY"):
         VultrAPI().request("GET", "/instances")
+
+
+def test_plan_selection_accepts_a_preemptible_only_plan():
+    """The 8x A100 box has deploy_ondemand false; filtering on that alone
+    would hide the only multi-GPU plan Vultr actually rents."""
+    from vultr.api import hourly_cost, is_preemptible_only, select_plan
+    plan = {"id": "vbm-112c-2048gb-8-a100-gpu", "deploy_ondemand": False,
+            "deploy_preemptible": True, "hourly_cost": 22.4,
+            "hourly_cost_preemptible": 11.92, "gpu_count": 8,
+            "gpu_vram_gb": 640, "locations": ["fra"]}
+    chosen, region = select_plan([plan], min_vram=40)
+    assert chosen["id"] == plan["id"] and region == "fra"
+    assert hourly_cost(plan) == 11.92
+    assert is_preemptible_only(plan)
+
+
+def test_hourly_cost_prefers_the_on_demand_rate_when_deployable():
+    from vultr.api import hourly_cost
+    plan = {"deploy_ondemand": True, "hourly_cost": 1.671,
+            "hourly_cost_preemptible": 0.8}
+    assert hourly_cost(plan) == 1.671
+
+
+def test_cheapest_plan_is_ranked_by_the_rate_actually_billed():
+    from vultr.api import select_plan
+    cheap_preemptible = {"id": "metal", "deploy_ondemand": False,
+                         "deploy_preemptible": True, "hourly_cost": 22.4,
+                         "hourly_cost_preemptible": 11.92, "gpu_count": 8,
+                         "gpu_vram_gb": 640, "locations": ["fra"]}
+    dearer_ondemand = {"id": "cloud", "deploy_ondemand": True,
+                       "hourly_cost": 13.368, "gpu_count": 8,
+                       "gpu_vram_gb": 384, "locations": ["fra"]}
+    chosen, _ = select_plan([cheap_preemptible, dearer_ondemand], min_vram=40)
+    assert chosen["id"] == "metal"
+
+
+def test_metal_and_instance_kinds_use_distinct_endpoints():
+    from vultr.api import INSTANCE, KINDS, METAL
+    assert METAL.path == "/bare-metals" and METAL.item == "bare_metal"
+    assert INSTANCE.path == "/instances" and INSTANCE.item == "instance"
+    assert set(KINDS) == {"instance", "metal"}
+
+
+def test_state_kind_defaults_to_instance_for_pre_metal_state_files():
+    from vultr.api import INSTANCE, METAL
+    from vultr.lifecycle import state_kind
+    assert state_kind({"id": "x"}) is INSTANCE
+    assert state_kind({"id": "x", "kind": "metal"}) is METAL
+    assert state_kind(None) is INSTANCE

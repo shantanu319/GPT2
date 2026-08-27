@@ -38,7 +38,7 @@ def arrange(monkeypatch, api, wait_result=None):
     monkeypatch.setattr(lifecycle, "list_gpu_plans", lambda client: [PLAN])
     monkeypatch.setattr(lifecycle, "ensure_ssh_key", lambda *unused: ("key-1", True))
     monkeypatch.setattr(lifecycle, "claim_state", lambda: None)
-    monkeypatch.setattr(lifecycle, "wait_ready", lambda *unused: wait_result or {
+    monkeypatch.setattr(lifecycle, "wait_ready", lambda *unused, **kw: wait_result or {
         "id": "instance-1", "ssh_host": "192.0.2.1", "ssh_private_key": "key-path",
     })
     monkeypatch.setattr(lifecycle, "save_state", lambda state: None)
@@ -71,7 +71,7 @@ def test_provision_cleans_up_instance_and_key_when_readiness_fails(monkeypatch):
     api = API()
     arrange(monkeypatch, api)
     monkeypatch.setattr(
-        lifecycle, "wait_ready", lambda *unused: (_ for _ in ()).throw(RuntimeError("timeout"))
+        lifecycle, "wait_ready", lambda *unused, **kw: (_ for _ in ()).throw(RuntimeError("timeout"))
     )
 
     with pytest.raises(RuntimeError, match="timeout"):
