@@ -151,10 +151,10 @@ Piecemeal invocations:
     python vast/vast_train.py pull                         # rsync saved/ + tokenizer.json into ./vast_out
     python vast/vast_train.py destroy                      # stop billing
 
-Running on a Vultr Cloud GPU:
+Running on Vultr (Cloud GPU or bare metal):
 
 `vultr_train.py` runs the same resumable prepare -> pretrain -> SFT -> DPO chain on
-Vultr's on-demand Cloud GPU instances. It uses the public plan catalog for live
+Vultr's Cloud GPU instances and on its bare-metal GPU boxes. It uses the public plan catalog for live
 price/capacity discovery, provisions Ubuntu 24.04's GPU-enabled image, installs an
 ephemeral SSH key when needed, and bootstraps a Python 3 virtual environment.
 
@@ -178,6 +178,14 @@ The CPU path validates provisioning, SSH, training, pull, and teardown, but not 
     python3 vultr/vultr_train.py plans
     python3 vultr/vultr_train.py smoke
 
+`smoke` also exercises the multi-rank path — `--ranks` (default 2) launches
+training under `torch.distributed.run` and writes its synthetic train set as two
+numbered shards, so sharded reads, per-rank feeding, the gradient all-reduce and
+rank-0 checkpointing are all covered before a cluster bills for them. NCCL needs
+a GPU per rank (rank N takes `cuda:N`), so a box with fewer GPUs than ranks runs
+the check on CPU over gloo; `--plan vcg-a16-12c-128g-32vram --ranks 2` buys a
+real NCCL check for $0.94.
+
 As of August 2026 the cheapest plan is `vcg-a16-2c-8g-2vram`: a fractional
 2 GB NVIDIA A16 at $0.059/hour. Vultr has a one-hour minimum charge, so even a
 short GPU smoke costs $0.059. The CPU fallback uses `vc2-1c-1gb` at $0.007/hour;
@@ -189,12 +197,47 @@ For a real run, the CLI selects the cheapest currently available plan with at le
 
     python3 vultr/vultr_train.py create
     python3 vultr/vultr_train.py push
-    python3 vultr/vultr_train.py pipeline
+    python3 vultr/vultr_train.py pipeline    # --gpus auto counts the box's GPUs
     PROVIDER=vultr ./scripts/watch_pipeline.sh
     python3 vultr/vultr_train.py status
     python3 vultr/vultr_train.py pull       # checkpoints and logs -> vultr_out/
     python3 vultr/vultr_train.py destroy    # also removes a pipeline-owned SSH key
     python3 vultr/vultr_train.py destroy --id INSTANCE_ID  # recovery without local state
+
+Multi-GPU boxes are bare metal, not Cloud GPU: `/plans?type=vcg` tops out at
+A16/A40/L40S, while every 8-GPU A100, H100 and B200 sits in `/plans-metal`.
+`plans` lists both and `create --metal` (or any `vbm-` `--plan`) deploys there;
+bare metal gets a 45-minute readiness timeout since it racks real hardware. Those
+boxes are also mostly preemptible-only — `vbm-112c-2048gb-8-a100-gpu` is 8x A100
+SXM 80GB, 112 cores, 2 TB RAM and 960 GB NVMe at $11.92/hr preemptible, and its
+`hourly_cost` field advertises an on-demand $22.40 you cannot actually deploy at.
+`plans` marks preemptible-only plans with `*` and prices them at the rate billed.
+Vultr can reclaim a preemptible box at any time, so `--save-every` sets how much
+work a preemption costs.
+
+Pretraining, SFT and DPO all run across every GPU on the box. torchrun sets
+RANK/WORLD_SIZE/LOCAL_RANK, each rank takes every world_size'th batch, and
+gradients are averaged once per optimizer step — not per grad-accum micro-step —
+so every rank applies the same update and stays bitwise in lockstep. There is no
+DDP wrapper: `batch_loss` calls `model.decoder` directly and computes the loss
+against the tied output head outside the module, which DDP's reducer never sees,
+and the decoder is `torch.compile`d. At 101M params the flat all-reduce moves
+~707 MB (~4 ms on NVLink) against ~600 ms/step of compute, so overlapping it
+would buy under 1%. `--batchsize` is per GPU; the pipeline prints tokens/step.
+
+The `pipeline` command forwards all 37 of pretrain/config.py's knobs — declared
+once in `TRAIN_FLAGS`, which generates both the subparser and the remote command
+line. Its defaults turn on the architecture opt-ins with papers and equivalence
+tests behind them (`-kda 4`, `-swa 1024`, `-muon_per_head 1`); `-attn_res` and
+`-loops` stay off.
+
+At cluster scale `train.bin` runs 200-400 GB, so prepare writes numbered shards
+(`train_00000.bin`, ...), each sealed atomically and recorded in a manifest with
+the doc count and val/test byte lengths that accompanied it. A restart drops the
+in-flight shard, truncates val/test back, and skips the docs it already
+tokenized. `ShardedArray` chains the shards back into one indexable array, so the
+feeders never materialize more than a window. That matters most on a preemptible
+box, where a kill mid-tokenize used to throw away the whole pass.
 
 The current instance lives in ignored `.vultr_instance.json`. The pipeline uses the
 same 101M shape as Vast but a safer 1M-document default cap; the 8M-document H200
@@ -205,7 +248,7 @@ same `MAX_HOURS` and `DESTROY_ON_TIMEOUT` controls. See Vultr's
 [GPU provisioning guide](https://docs.vultr.com/products/compute/instances/cloud-gpu/provisioning)
 and [billing rules](https://docs.vultr.com/support/platform/billing/how-am-i-billed-for-my-servers).
 
-Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping at ±15, GQA (`-kv_heads`, default 2 of 8 heads on vast.ai — saves params + shrinks the KV cache), partial RoPE (rotate half the head dims), value residual learning (layer-1 V mixed into later layers via per-layer learnable scalars), U-net skip connections + an embedding shortcut with learnable scalar gates, opt-in block Attention Residuals (`-attn_res B` — softmax attention over previous block outputs replaces uniform residual accumulation, arXiv:2603.15031), opt-in Kimi Delta Attention layers (`-kda N` — every layer but each Nth runs per-channel gated delta-rule linear attention against a constant-size recurrent state instead of a KV cache, Kimi Linear arXiv:2510.26692), opt-in sliding-window attention (`-swa W` — the layers that keep full attention see only the last W tokens, so a `-kda` hybrid has no O(T²) term left anywhere in the stack, Samba arXiv:2406.07522), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds the local Polar-Express Muon as default (`-muon_impl local`), with opt-in per-head orthogonalization (`-muon_per_head` — attention projection updates are Newton-Schulz'd per head, in the style of Kimi K3's Per-Head Muon), a WSD schedule (`-schedule wsd`), Muon weight decay, torch.compile + fused chunked cross-entropy, shuffled pinned-prefetch data feeding (`-shuffle`), opt-in activation checkpointing (`-grad_ckpt`), gradient accumulation (`-grad_accum`), and capped mid-epoch validation (`-val_every`).
+Architecture upgrades (frontier small-model tricks, mostly from the nanoGPT speedrun and OpenAI's parameter-golf challenge): QK-norm on per-head q/k, zero-initialized residual out-projections, tanh logit soft-capping at ±15, GQA (`-kv_heads`, default 2 of 8 heads on vast.ai — saves params + shrinks the KV cache), partial RoPE (rotate half the head dims), value residual learning (layer-1 V mixed into later layers via per-layer learnable scalars), U-net skip connections + an embedding shortcut with learnable scalar gates, opt-in block Attention Residuals (`-attn_res B` — softmax attention over previous block outputs replaces uniform residual accumulation, arXiv:2603.15031), opt-in Kimi Delta Attention layers (`-kda N` — every layer but each Nth runs per-channel gated delta-rule linear attention against a constant-size recurrent state instead of a KV cache, Kimi Linear arXiv:2510.26692), opt-in sliding-window attention (`-swa W` — the layers that keep full attention see only the last W tokens, so a `-kda` hybrid has no O(T²) term left anywhere in the stack, Samba arXiv:2406.07522), and opt-in depth recurrence (`-loops N` runs the layer stack N times for N×depth at 1× params — parameter-golf's best capacity trick). Training adds the local Polar-Express Muon as default (`-muon_impl local`), with opt-in per-head orthogonalization (`-muon_per_head` — attention projection updates are Newton-Schulz'd per head, in the style of Kimi K3's Per-Head Muon), a WSD schedule (`-schedule wsd`), Muon weight decay, torch.compile + fused chunked cross-entropy, shuffled pinned-prefetch data feeding (`-shuffle`), opt-in activation checkpointing (`-grad_ckpt`), gradient accumulation (`-grad_accum`), capped mid-epoch validation (`-val_every`), and single-node multi-GPU by gradient averaging (core/dist.py; launch under `torch.distributed.run`, `-batchsize` is per rank).
 
 Posttraining (SFT + DPO, target: chat-able under 100M params):
     prepare.py now reserves <|im_start|>/<|im_end|> chat specials in the vocab (rebuild with --force-prepare once),

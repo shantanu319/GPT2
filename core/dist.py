@@ -58,7 +58,8 @@ def average_grads(params):
     """Average gradients across ranks in place, as one flat all-reduce.
 
     One call beats per-parameter reduces: the model's ~200 gradient tensors
-    would otherwise cost more in NCCL launch latency than in transfer.
+    would otherwise cost more in NCCL launch latency than in transfer, and
+    the scatter back is one multi-tensor kernel rather than ~200 copies.
     """
     if not is_distributed():
         return
@@ -68,10 +69,11 @@ def average_grads(params):
     flat = torch.cat([g.reshape(-1) for g in grads])
     dist.all_reduce(flat, op=dist.ReduceOp.SUM)
     flat /= world_size()
-    offset = 0
+    views, offset = [], 0
     for g in grads:
-        g.copy_(flat[offset:offset + g.numel()].view_as(g))
+        views.append(flat[offset:offset + g.numel()].view_as(g))
         offset += g.numel()
+    torch._foreach_copy_(grads, views)
 
 
 def sum_across(values, device):
