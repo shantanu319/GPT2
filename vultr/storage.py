@@ -177,18 +177,23 @@ def subscription_from_env():
             "s3_secret_key": os.environ["VULTR_S3_SECRET_KEY"]}
 
 
+def _subscription(args):
+    """--from-env is how a throwaway box works: it holds the S3 keys, never the
+    account API key that could provision or destroy anything."""
+    return (subscription_from_env() if args.from_env
+            else ensure_subscription(client_from_env(), args.label, args.region))
+
+
 def up(args):
-    subscription = ensure_subscription(client_from_env(), args.label, args.region)
+    subscription = _subscription(args)
     upload_dir(client_for(subscription), args.data_dir, args.prefix,
                workers=args.workers)
-    print(f"endpoint {subscription['s3_hostname']} (keys in the Vultr console)")
+    print(f"endpoint {subscription['s3_hostname']}")
 
 
 def down(args):
     """Pull on the training box from env creds, or locally from the account."""
-    subscription = (subscription_from_env() if args.from_env
-                    else ensure_subscription(client_from_env(), args.label, args.region))
-    download_dir(client_for(subscription), args.prefix, args.data_dir,
+    download_dir(client_for(_subscription(args)), args.prefix, args.data_dir,
                  workers=args.workers)
 
 

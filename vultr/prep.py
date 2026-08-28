@@ -17,7 +17,7 @@ from vultr.storage import ensure_subscription
 # Measured on this corpus: ~3.3 characters per token, and bins are uint16.
 BYTES_PER_TOKEN_CACHED = 3.3
 BYTES_PER_TOKEN_BIN = 2
-TOKENS_PER_DOC = 1000
+TOKENS_PER_DOC = 1290   # measured: 25.8M tokens from 20k docs
 
 
 def required_disk_gb(max_train_docs, headroom=1.4):

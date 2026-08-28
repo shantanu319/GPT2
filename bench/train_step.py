@@ -172,7 +172,7 @@ def main():
     bench.add_argument('--warmup', type=int, default=5, help='steps before the clock starts')
     bench.add_argument('--hours', type=float, default=0, help='budget to size a corpus for')
     bench.add_argument('--vocab-size', type=int, default=32000)
-    bench.add_argument('--tokens-per-doc', type=int, default=1000,
+    bench.add_argument('--tokens-per-doc', type=int, default=1290,
                        help='estimate for converting tokens into --max-train-docs')
     bench.add_argument('--sweep', action='store_true', help='walk --sweep-batch x grad_ckpt')
     bench.add_argument('--sweep-batch', default='32,64,128')

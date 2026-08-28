@@ -233,3 +233,37 @@ def test_prep_bootstrap_installs_zstandard():
     import inspect
     from vultr import prep
     assert "zstandard" in inspect.getsource(prep._bootstrap)
+
+
+def _env_args(**kw):
+    values = {"from_env": True, "label": "mot", "region": None, "workers": 2,
+              "data_dir": ".", "prefix": "corpus"}
+    values.update(kw)
+    return SimpleNamespace(**values)
+
+
+def test_upload_from_env_never_needs_the_account_api_key(monkeypatch, tmp_path):
+    """The prep box holds only the S3 keys — asking for VULTR_API_KEY there is
+    both a failure and a key we deliberately do not ship to a throwaway box."""
+    monkeypatch.setattr(storage, "client_from_env",
+                        lambda: pytest.fail("up must not reach for the account API"))
+    monkeypatch.setenv("VULTR_S3_HOSTNAME", "ams1.vultrobjects.com")
+    monkeypatch.setenv("VULTR_S3_ACCESS_KEY", "AK")
+    monkeypatch.setenv("VULTR_S3_SECRET_KEY", "SK")
+    client = FakeS3()
+    monkeypatch.setattr(storage, "client_for", lambda sub: client)
+    _corpus(tmp_path, {"train_00000.bin": 12})
+    storage.up(_env_args(data_dir=str(tmp_path)))
+    assert client.uploaded == ["corpus/train_00000.bin"]
+
+
+def test_download_from_env_never_needs_the_account_api_key(monkeypatch, tmp_path):
+    monkeypatch.setattr(storage, "client_from_env",
+                        lambda: pytest.fail("down must not reach for the account API"))
+    for name, value in (("VULTR_S3_HOSTNAME", "h"), ("VULTR_S3_ACCESS_KEY", "AK"),
+                        ("VULTR_S3_SECRET_KEY", "SK")):
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(storage, "client_for",
+                        lambda sub: FakeS3({"corpus/train_00000.bin": 5}))
+    storage.down(_env_args(data_dir=str(tmp_path / "out")))
+    assert (tmp_path / "out" / "train_00000.bin").stat().st_size == 5
