@@ -32,8 +32,7 @@ def select_cluster(clusters, region=None):
 
 def ensure_subscription(api, label="myowntransformer", region=None, timeout=300):
     """Find or create the subscription and return it once its keys exist."""
-    existing = api.request("GET", "/object-storage?per_page=500").get("object_storages", [])
-    match = next((s for s in existing if s.get("label") == label), None)
+    match = find_subscription(api, label)
     if match is None:
         cluster = select_cluster(
             api.request("GET", "/object-storage/clusters?per_page=100")["clusters"], region)
@@ -48,6 +47,12 @@ def ensure_subscription(api, label="myowntransformer", region=None, timeout=300)
         time.sleep(5)
         match = api.request("GET", f"/object-storage/{match['id']}")["object_storage"]
     return match
+
+
+def find_subscription(api, label="myowntransformer"):
+    """Look up without creating — destroy must never provision to delete."""
+    existing = api.request("GET", "/object-storage?per_page=500").get("object_storages", [])
+    return next((s for s in existing if s.get("label") == label), None)
 
 
 def destroy_subscription(api, subscription):
@@ -89,13 +94,24 @@ def _transfer(jobs, workers, action):
     return len(jobs)
 
 
+def ensure_bucket(client, bucket=BUCKET):
+    """create_bucket errors once the bucket exists, which every upload after
+    the first would hit."""
+    try:
+        client.create_bucket(Bucket=bucket)
+    except Exception as error:
+        if not any(code in str(error) for code in
+                   ("BucketAlreadyOwnedByYou", "BucketAlreadyExists")):
+            raise
+
+
 def upload_dir(client, local_dir, prefix, bucket=BUCKET, workers=8):
     """Upload local_dir under prefix, skipping objects already the same size.
 
     Size is enough: shards are sealed atomically and never rewritten, so a
     matching size means a matching object.
     """
-    client.create_bucket(Bucket=bucket)
+    ensure_bucket(client, bucket)
     present = remote_sizes(client, prefix, bucket)
     jobs = []
     for name in sorted(os.listdir(local_dir)):
@@ -155,8 +171,12 @@ def down(args):
 
 
 def destroy(args):
-    destroy_subscription(client_from_env(),
-                         ensure_subscription(client_from_env(), args.label, args.region))
+    api = client_from_env()
+    subscription = find_subscription(api, args.label)
+    if subscription is None:
+        print(f"no object storage labelled {args.label}")
+        return
+    destroy_subscription(api, subscription)
 
 
 def add_arguments(parser, default_prefix="corpus"):

@@ -142,3 +142,48 @@ def test_env_credentials_name_what_is_missing(monkeypatch):
         storage.subscription_from_env()
     monkeypatch.setenv("VULTR_S3_SECRET_KEY", "SK")
     assert storage.subscription_from_env()["s3_access_key"] == "AK"
+
+
+class ExistingBucket(FakeS3):
+    def create_bucket(self, Bucket):
+        raise Exception("An error occurred (BucketAlreadyOwnedByYou) when calling "
+                        "the CreateBucket operation")
+
+
+class BrokenBucket(FakeS3):
+    def create_bucket(self, Bucket):
+        raise Exception("An error occurred (AccessDenied) when calling CreateBucket")
+
+
+def test_upload_tolerates_a_bucket_that_already_exists(tmp_path):
+    """Every upload after the first hits this; it must not be fatal."""
+    local = _corpus(tmp_path, {'train_00000.bin': 10})
+    client = ExistingBucket()
+    assert storage.upload_dir(client, local, 'run') == 1
+
+
+def test_upload_still_raises_on_a_real_bucket_failure(tmp_path):
+    local = _corpus(tmp_path, {'train_00000.bin': 10})
+    with pytest.raises(Exception, match="AccessDenied"):
+        storage.upload_dir(BrokenBucket(), local, 'run')
+
+
+def test_destroy_never_creates_a_subscription_in_order_to_delete_it(monkeypatch):
+    """Going through ensure_subscription would provision one when absent."""
+    calls = []
+
+    def request(method, path, payload=None, auth=True):
+        calls.append((method, path))
+        return {"object_storages": []}
+
+    monkeypatch.setattr(storage, "client_from_env",
+                        lambda: SimpleNamespace(request=request))
+    storage.destroy(SimpleNamespace(label="mot", region=None))
+    assert not any(method == "POST" for method, _ in calls)
+
+
+def test_find_subscription_returns_none_when_absent():
+    api = SimpleNamespace(request=lambda *a, **k: {"object_storages": [
+        {"id": "sub-1", "label": "other"}]})
+    assert storage.find_subscription(api, "mot") is None
+    assert storage.find_subscription(api, "other")["id"] == "sub-1"
