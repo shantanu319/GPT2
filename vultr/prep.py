@@ -15,9 +15,9 @@ from vultr.pipeline import PYTHON, S3_VARS
 from vultr.remote import REMOTE_ROOT, rsync, run_remote
 from vultr.storage import ensure_subscription
 
-# Measured mid-run at 31M docs: 6.9 KB of cached text per doc, i.e. 5.4 bytes
-# per token, not the 3.3 the 20k sample suggested. Bins are uint16.
-BYTES_PER_TOKEN_CACHED = 5.4
+# Measured over all five sources at 32.6M docs: 5.4 KB of cached text per doc,
+# i.e. 4.1 bytes per token. Bins are uint16.
+BYTES_PER_TOKEN_CACHED = 4.1
 BYTES_PER_TOKEN_BIN = 2
 TOKENS_PER_DOC = 1313   # measured: 3.0B tokens from 2.28M docs
 # 500M-token shards sealed every 24.5s on 32 cores. The 20k-doc sample said

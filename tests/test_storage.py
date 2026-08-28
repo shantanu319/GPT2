@@ -321,4 +321,4 @@ def test_prep_passes_a_core_floor_to_provisioning(monkeypatch):
                            region=None, label_storage="mot", prefix="c")
     with pytest.raises(RuntimeError, match="stop here"):
         prep_mod.prep(args)
-    assert seen == {"min_vcpu": 18, "min_disk": 421}
+    assert seen == {"min_vcpu": 18, "min_disk": 347}
