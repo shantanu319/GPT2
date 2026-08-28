@@ -68,3 +68,28 @@ def test_two_rank_gloo(fn, name, tmp_path):
         b = torch.load(tmp_path / "rank1.pt")
         for k in a:
             torch.testing.assert_close(a[k], b[k], rtol=0, atol=0)
+
+
+def _agreed_all_ok(rank, world, device, tmpdir):
+    from bench.train_step import agreed
+    assert agreed(True, device) is True
+
+
+def _agreed_one_fails(rank, world, device, tmpdir):
+    """One rank OOMing must make every rank treat the config as failed, or the
+    sweep desyncs and the next all-reduce deadlocks."""
+    from bench.train_step import agreed
+    assert agreed(rank != 0, device) is False
+
+
+@pytest.mark.parametrize("fn,name", [(_agreed_all_ok, "allok"),
+                                     (_agreed_one_fails, "onefails")])
+def test_oom_agreement_is_unanimous(fn, name, tmp_path):
+    port = 29500 + abs(hash("agreed" + name)) % 1000
+    mp.spawn(_run, args=(2, port, str(tmp_path), fn), nprocs=2, join=True)
+
+
+def test_agreed_is_a_passthrough_without_a_process_group():
+    from bench.train_step import agreed
+    assert agreed(True, torch.device('cpu')) is True
+    assert agreed(False, torch.device('cpu')) is False
