@@ -140,6 +140,9 @@ def report(opt, result, args):
 def sweep(opt, args):
     """Smallest-first, so an OOM ends the sweep with every earlier row kept."""
     rows = []
+    if not opt.no_compile:
+        dist.printr("note: each row rebuilds the model, so torch.compile pays a "
+                    "fresh compile per config — add -no_compile to sweep faster")
     for batchsize in [int(b) for b in args.sweep_batch.split(',')]:
         for ckpt in (0, 1):
             opt.batchsize, opt.grad_ckpt = batchsize, ckpt
