@@ -299,8 +299,8 @@ def test_prep_sizes_the_box_by_how_long_the_job_is():
     32-core plan costs the same total and finishes in 2.7h."""
     from vultr.prep import required_vcpu
     assert required_vcpu(20_000) == 1            # the smoke box is unchanged
-    assert required_vcpu(31_000_000) == 29       # -> cheapest >=29-core plan
-    assert required_vcpu(31_000_000, target_hours=6) == 15
+    assert required_vcpu(31_000_000) == 18       # -> cheapest >=18-core plan
+    assert required_vcpu(31_000_000, target_hours=2) == 9
 
 
 def test_prep_passes_a_core_floor_to_provisioning(monkeypatch):
@@ -321,4 +321,4 @@ def test_prep_passes_a_core_floor_to_provisioning(monkeypatch):
                            region=None, label_storage="mot", prefix="c")
     with pytest.raises(RuntimeError, match="stop here"):
         prep_mod.prep(args)
-    assert seen == {"min_vcpu": 29, "min_disk": 296}
+    assert seen == {"min_vcpu": 18, "min_disk": 421}

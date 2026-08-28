@@ -15,11 +15,15 @@ from vultr.pipeline import PYTHON, S3_VARS
 from vultr.remote import REMOTE_ROOT, rsync, run_remote
 from vultr.storage import ensure_subscription
 
-# Measured on this corpus: ~3.3 characters per token, and bins are uint16.
-BYTES_PER_TOKEN_CACHED = 3.3
+# Measured mid-run at 31M docs: 6.9 KB of cached text per doc, i.e. 5.4 bytes
+# per token, not the 3.3 the 20k sample suggested. Bins are uint16.
+BYTES_PER_TOKEN_CACHED = 5.4
 BYTES_PER_TOKEN_BIN = 2
-TOKENS_PER_DOC = 1290   # measured: 25.8M tokens from 20k docs
-TOKENS_PER_CORE_SEC = 128_000   # measured: 25.8M tokens in 202s on one vCPU
+TOKENS_PER_DOC = 1313   # measured: 3.0B tokens from 2.28M docs
+# 500M-token shards sealed every 24.5s on 32 cores. The 20k-doc sample said
+# 128k, but that run was short enough to be dominated by HuggingFace metadata
+# and cold parquet opens rather than by tokenizing.
+TOKENS_PER_CORE_SEC = 638_000
 
 
 def required_disk_gb(max_train_docs, headroom=1.4):
@@ -31,12 +35,15 @@ def required_disk_gb(max_train_docs, headroom=1.4):
     return max(30, int(total / 1e9 * headroom))
 
 
-def required_vcpu(max_train_docs, target_hours=3):
-    """Cores needed to finish in target_hours.
+def required_vcpu(max_train_docs, target_hours=1):
+    """Cores needed to tokenize in target_hours.
 
-    Prep is core-hours bound, but the selector minimises $/hr with floors only
-    on RAM and disk — which alone picks the slowest box that fits, and Vultr
-    prices these linearly per core, so the wall-clock saving is free.
+    The selector minimises $/hr with floors only on RAM and disk, which alone
+    picks the slowest box that fits. Vultr prices these flat per core up to 32,
+    so a shorter wall-clock is free and the target should be aggressive.
+
+    This sizes tokenizing only. Fetch is capped at one worker per source, so
+    it does not shrink with cores and sets the floor on total runtime.
     """
     core_seconds = max_train_docs * TOKENS_PER_DOC / TOKENS_PER_CORE_SEC
     return max(1, math.ceil(core_seconds / (target_hours * 3600)))
