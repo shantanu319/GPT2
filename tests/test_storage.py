@@ -385,7 +385,8 @@ def test_post_stage_asks_for_a_small_box():
     seen = {}
 
     def fake_provision(args, bootstrap_instance=False):
-        seen.update(min_vcpu=args.min_vcpu, min_disk=args.min_disk)
+        seen.update(min_vcpu=args.min_vcpu, min_disk=args.min_disk,
+                    min_ram=args.min_ram)
         raise RuntimeError("stop here")
 
     import pytest as _pytest
@@ -401,7 +402,7 @@ def test_post_stage_asks_for_a_small_box():
     with _pytest.raises(RuntimeError, match="stop here"):
         prep_mod.prep(args)
     monkey.undo()
-    assert seen == {"min_vcpu": 2, "min_disk": 40}
+    assert seen == {"min_vcpu": 2, "min_disk": 40, "min_ram": 4096}
 
 
 def test_sft_and_dpo_artifacts_survive_the_shard_cap():

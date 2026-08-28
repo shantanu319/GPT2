@@ -63,8 +63,10 @@ def _bootstrap(state):
 
 
 # sft_prepare and dpo_prepare are single-threaded and independent of each
-# other, so two cores run both at once; their outputs are ~2 GB.
-POST_VCPU, POST_DISK_GB = 2, 40
+# other, so two cores run both at once; their outputs are ~2 GB. Both import
+# torch for ~300 MB of RSS each before streaming, which a 2 GB box does not
+# comfortably hold alongside the datasets buffers.
+POST_VCPU, POST_DISK_GB, POST_RAM_MB = 2, 40, 4096
 
 
 def _pretrain_body(args, quote):
@@ -177,7 +179,8 @@ def prep(args):
     # provision does the selecting; it just needs the floors this job requires.
     args.region, args.compute, args.metal = region, True, False
     cores = args.vcpu or (POST_VCPU if post else required_vcpu(args.max_train_docs))
-    args.min_ram, args.min_disk, args.label = 2048, disk, "mot-prep"
+    args.min_ram = POST_RAM_MB if post else 2048
+    args.min_disk, args.label = disk, "mot-prep"
     args.min_vcpu = cores
     started = time.time()
     state = None
