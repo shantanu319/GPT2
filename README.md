@@ -242,6 +242,9 @@ line. Its defaults turn on the architecture opt-ins with papers and equivalence
 tests behind them (`-kda 4`, `-swa 1024`, `-muon_per_head 1`); `-attn_res` and
 `-loops` stay off.
 
+    python3 vultr/vultr_train.py prep --max-train-docs 40000000 --prefix corpus-40b
+    python3 vultr/vultr_train.py pipeline --corpus-prefix corpus-40b
+
 Prep belongs somewhere cheaper than the cluster. Tokenizing is fast — 1.5M
 tokens/s per core, so ~4 minutes for 40B tokens on 112 cores — but fetching the
 ~130 GB of text behind those tokens is not, and doing it on a preemptible
@@ -251,8 +254,14 @@ parks a prepared corpus in Vultr Object Storage from a cheap CPU box, and
 `pipeline --corpus-prefix NAME` has the GPU box pull it before it considers
 tokenizing anything; if the fetch finds nothing, prepare still runs. Both
 directions skip files already present at the same size, so an interrupted
-80 GB transfer resumes. There is no fra object-storage cluster and the 8x A100
-plan deploys in fra, so cluster choice falls back to Amsterdam.
+80 GB transfer resumes. `prep` provisions the box in the bucket's own region,
+sizes its disk from the doc count (a capped run holds the raw fetch cache and
+the bins at once), reuses the repo's tokenizer rather than training a fresh
+vocab that would invalidate every existing checkpoint, and destroys the box in
+a `finally`. Placement picks cluster and tier together by price, not region
+alone: Amsterdam carries Standard at $0.018/GB/mo on ams1 and only Performance
+at $0.05 on ams2, and there is no fra cluster at all even though the 8x A100
+plan deploys there.
 
 At cluster scale `train.bin` runs 200-400 GB, so prepare writes numbered shards
 (`train_00000.bin`, ...), each sealed atomically and recorded in a manifest with
