@@ -231,3 +231,21 @@ def test_bootstrap_installs_drivers_only_when_nvidia_smi_is_missing(monkeypatch)
     assert "ubuntu-drivers install --gpgpu" in command
     # the driver step must precede the CUDA assertion it exists to satisfy
     assert command.index("ubuntu-drivers") < command.index("torch.cuda.is_available")
+
+
+def test_provision_explains_how_to_unlock_gpu_access(monkeypatch):
+    """Every GPU product is gated behind a Vultr ticket — vcg- Cloud GPU and
+    vbm-*-gpu bare metal alike — so the raw 400 needs a next step attached."""
+    class Gated(API):
+        def request(self, method, path, payload=None, auth=True):
+            if method == "POST" and path.endswith("s"):
+                raise RuntimeError(
+                    f"Vultr API POST {path}: HTTP 400: " '{"error":"Server add '
+                    'failed: Please open a support request for access to this '
+                    'product."}')
+            return super().request(method, path, payload, auth)
+
+    arrange(monkeypatch, Gated())
+    monkeypatch.setattr(lifecycle, "_delete_resource", lambda *a, **k: None)
+    with pytest.raises(RuntimeError, match="my.vultr.com/support"):
+        lifecycle.provision(args())

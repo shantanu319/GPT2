@@ -113,6 +113,16 @@ def _resolved_state(provisional, instance):
     return state
 
 
+# Vultr gates every GPU product behind a ticket -- Cloud GPU and bare-metal GPU
+# alike -- while non-GPU bare metal deploys freely.
+GPU_ACCESS_ERROR = "support request for access to this product"
+GPU_ACCESS_HINT = (
+    "Vultr has not enabled GPU products on this account. Open a request at "
+    "https://my.vultr.com/support/ asking for Cloud GPU and Bare Metal GPU "
+    "access; non-GPU plans keep working meanwhile."
+)
+
+
 def _definitive_rejection(error):
     return any(f"HTTP {code}" in str(error) for code in (400, 401, 403, 404, 405, 409, 422))
 
@@ -224,6 +234,8 @@ def provision(args, bootstrap_instance=True):
         except Exception as cleanup_error:
             resource = state["id"] if state else key_id
             print(f"WARNING: cleanup incomplete for {resource}: {cleanup_error}", file=sys.stderr)
+        if GPU_ACCESS_ERROR in str(provision_error):
+            raise RuntimeError(f"{provision_error}\n\n{GPU_ACCESS_HINT}") from provision_error
         raise
 
 
