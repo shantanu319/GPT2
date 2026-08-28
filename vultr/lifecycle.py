@@ -61,7 +61,7 @@ def bootstrap(state):
         + ENSURE_DRIVERS +
         "python3 -m venv /opt/myowntransformer && "
         "/opt/myowntransformer/bin/pip install -q --upgrade pip && "
-        "/opt/myowntransformer/bin/pip install -q torch==2.11.0 datasets matplotlib boto3 && "
+        "/opt/myowntransformer/bin/pip install -q torch==2.11.0 datasets zstandard matplotlib boto3 && "
         "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader && "
         "/opt/myowntransformer/bin/python -c \"import torch; assert torch.cuda.is_available(); "
         "print('torch', torch.__version__, 'CUDA ready')\"",

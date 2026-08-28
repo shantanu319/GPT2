@@ -227,3 +227,9 @@ def test_find_subscription_returns_none_when_absent():
         {"id": "sub-1", "label": "other"}]})
     assert storage.find_subscription(api, "mot") is None
     assert storage.find_subscription(api, "other")["id"] == "sub-1"
+
+
+def test_prep_bootstrap_installs_zstandard():
+    import inspect
+    from vultr import prep
+    assert "zstandard" in inspect.getsource(prep._bootstrap)

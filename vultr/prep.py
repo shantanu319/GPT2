@@ -38,7 +38,7 @@ def _bootstrap(state):
         f"{PYTHON} -m pip install -q --upgrade pip && "
         f"{PYTHON} -m pip install -q --index-url https://download.pytorch.org/whl/cpu "
         "torch==2.11.0 && "
-        f"{PYTHON} -m pip install -q datasets boto3",
+        f"{PYTHON} -m pip install -q datasets zstandard boto3",
     )
 
 

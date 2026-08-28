@@ -296,3 +296,13 @@ def test_compute_selection_searches_beyond_vc2(monkeypatch):
     """vc2 alone offers no plan with real disk."""
     with pytest.raises(RuntimeError, match="no on-demand"):
         _compute_select(monkeypatch, _compute_args(min_disk=9999))
+
+
+def test_bootstrap_installs_zstandard_for_the_dclm_source(monkeypatch):
+    """DCLM-baseline is 28% of the mixture and ships zstd-compressed; without
+    this, datasets raises "Compression type zstd not supported" mid-fetch."""
+    captured = []
+    monkeypatch.setattr(lifecycle, "run_remote",
+                        lambda state, command: captured.append(command))
+    lifecycle.bootstrap({"ssh_host": "h", "ssh_private_key": "k"})
+    assert "zstandard" in captured[0]
