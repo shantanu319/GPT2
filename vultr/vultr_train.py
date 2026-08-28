@@ -52,6 +52,9 @@ def main():
     command.add_argument("--sft-dir-name", default="vultr_run_sft")
     command.add_argument("--dpo-dir-name", default="vultr_run_dpo")
     command.add_argument("--max-train-docs", type=int, default=1_000_000)
+    command.add_argument("--corpus-prefix", default="",
+                         help="pull a prepared corpus from object storage before "
+                              "falling back to tokenizing it here")
     command.add_argument("--gpus", default="auto",
                          help="ranks to launch; 'auto' counts the box's GPUs")
     command.add_argument("--sft-epochs", type=int, default=1)

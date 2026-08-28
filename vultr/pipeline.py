@@ -6,6 +6,7 @@ from vultr.remote import REMOTE_ROOT
 
 PYTHON = "/opt/myowntransformer/bin/python"
 DATA_DIR = "data_cache/cosmopedia"
+S3_VARS = ("VULTR_S3_HOSTNAME", "VULTR_S3_ACCESS_KEY", "VULTR_S3_SECRET_KEY")
 
 # Every pretrain.train knob the pipeline forwards, as (flag, type, default).
 # Defaults track pretrain/config.py except where a cluster run differs: the
@@ -76,6 +77,19 @@ def build_pipeline(args):
     quote = shlex.quote
     hf_token = os.environ.get("HF_TOKEN", "")
     hf_export = f"export HF_TOKEN={quote(hf_token)}" if hf_token else ""
+    # Pulling a prepared corpus beats rebuilding it: prep is download-bound,
+    # and this box bills by the hour. Falls through to prepare if nothing lands.
+    prefix = getattr(args, "corpus_prefix", "") or ""
+    fetch = ""
+    if prefix:
+        exports = "\n".join(f"export {name}={quote(os.environ.get(name, ''))}"
+                             for name in S3_VARS)
+        fetch = f'''{exports}
+if ! prepared; then
+  step "fetch corpus from object storage"
+  "$PY" -m vultr.storage down --from-env --prefix {quote(prefix)} \\
+    --data-dir "$DATA" || step "no corpus in storage; will tokenize instead"
+fi'''
     prepare_args = f"--max-train-docs {args.max_train_docs}" if args.max_train_docs else ""
     train_args = train_flag_string(args)
     gpus = str(getattr(args, "gpus", "auto"))
@@ -104,6 +118,7 @@ fi
 step "launching on $GPUS GPU(s)"
 
 prepared() {{ "$PY" -c "import json,sys;sys.exit(0 if json.load(open('$DATA/train_manifest.json')).get('complete') else 1)" 2>/dev/null; }}
+{fetch}
 if ! prepared; then
   step prepare
   "$PY" -m pretrain.prepare --output-dir "$DATA" {prepare_args}

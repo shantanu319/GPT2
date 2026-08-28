@@ -253,3 +253,32 @@ def test_gpu_fallback_cannot_escalate_to_a_bare_metal_gpu_box(monkeypatch, tmp_p
         smoke_module.smoke(args)
     assert seen[0]["metal"] is True
     assert seen[1] == {"metal": False, "compute": True, "plan": None}
+
+
+def test_pipeline_does_not_touch_object_storage_without_a_prefix():
+    assert "vultr.storage" not in build_pipeline(pipeline_args())
+
+
+def test_pipeline_fetches_a_prepared_corpus_before_deciding_to_tokenize():
+    script = build_pipeline(pipeline_args(corpus_prefix="corpus-40b"))
+    fetch = script.index("vultr.storage down")
+    prepare = script.index("step prepare")
+    assert fetch < prepare, "the fetch must run before prepare is considered"
+    # and prepare is still gated, so a successful fetch skips tokenizing
+    assert script.count("if ! prepared; then") == 2
+
+
+def test_corpus_fetch_falls_through_to_tokenizing_when_storage_is_empty():
+    """A missing corpus must not abort the run — the script is set -e."""
+    script = build_pipeline(pipeline_args(corpus_prefix="corpus-40b"))
+    line = next(l for l in script.splitlines() if "no corpus in storage" in l)
+    assert line.strip().startswith("--data-dir") or "||" in line
+
+
+def test_corpus_fetch_carries_the_s3_credentials(monkeypatch):
+    from vultr.pipeline import S3_VARS
+    for name in S3_VARS:
+        monkeypatch.setenv(name, f"value-for-{name}")
+    script = build_pipeline(pipeline_args(corpus_prefix="corpus-40b"))
+    for name in S3_VARS:
+        assert f"export {name}=value-for-{name}" in script

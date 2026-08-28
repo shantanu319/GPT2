@@ -242,6 +242,18 @@ line. Its defaults turn on the architecture opt-ins with papers and equivalence
 tests behind them (`-kda 4`, `-swa 1024`, `-muon_per_head 1`); `-attn_res` and
 `-loops` stay off.
 
+Prep belongs somewhere cheaper than the cluster. Tokenizing is fast — 1.5M
+tokens/s per core, so ~4 minutes for 40B tokens on 112 cores — but fetching the
+~130 GB of text behind those tokens is not, and doing it on a preemptible
+$11.92/hr box means paying GPU rates to wait on HuggingFace, then paying again
+after a reclaim. `python -m vultr.storage up --data-dir DIR --prefix NAME`
+parks a prepared corpus in Vultr Object Storage from a cheap CPU box, and
+`pipeline --corpus-prefix NAME` has the GPU box pull it before it considers
+tokenizing anything; if the fetch finds nothing, prepare still runs. Both
+directions skip files already present at the same size, so an interrupted
+80 GB transfer resumes. There is no fra object-storage cluster and the 8x A100
+plan deploys in fra, so cluster choice falls back to Amsterdam.
+
 At cluster scale `train.bin` runs 200-400 GB, so prepare writes numbered shards
 (`train_00000.bin`, ...), each sealed atomically and recorded in a manifest with
 the doc count and val/test byte lengths that accompanied it. A restart drops the
