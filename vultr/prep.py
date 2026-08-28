@@ -79,6 +79,36 @@ echo "PREP COMPLETE"
 """
 
 
+def _run_detached(state, poll=60):
+    """Run prep.sh under nohup and poll its log.
+
+    A three-hour foreground ssh loses the run and, via the finally, the box
+    and its work to one dropped connection. Detached, a drop costs a retry.
+    """
+    log = f"{REMOTE_ROOT}/prep.log"
+    run_remote(state, f"cd {REMOTE_ROOT} && rm -f prep.log && "
+                      "setsid nohup ./prep.sh > prep.log 2>&1 < /dev/null & sleep 1")
+    last = None
+    while True:
+        time.sleep(poll)
+        result = run_remote(
+            state,
+            f"tail -n 1 {log}; pgrep -f '[p]rep[.]sh' > /dev/null && echo __RUNNING__",
+            check=False, capture_output=True)
+        if result.returncode != 0:
+            print("[prep] ssh unreachable; retrying")
+            continue
+        output = result.stdout.decode(errors="replace")
+        line = output.replace("__RUNNING__", "").strip()
+        if line and line != last:
+            print(f"[prep] {line}")
+            last = line
+        if "__RUNNING__" not in output:
+            done = run_remote(state, f"grep -q '^PREP COMPLETE' {log} && echo YES || echo NO",
+                              capture_output=True).stdout
+            return b"YES" in done
+
+
 def prep(args):
     api = client_from_env()
     subscription = ensure_subscription(api, args.label_storage, args.region)
@@ -108,7 +138,9 @@ def prep(args):
         script = build_script(args, subscription)
         run_remote(state, f"cat > {REMOTE_ROOT}/prep.sh && chmod 700 {REMOTE_ROOT}/prep.sh",
                    input=script.encode())
-        run_remote(state, f"cd {REMOTE_ROOT} && ./prep.sh")
+        if not _run_detached(state):
+            run_remote(state, f"tail -n 40 {REMOTE_ROOT}/prep.log", check=False)
+            raise RuntimeError("prep did not reach PREP COMPLETE; see log above")
         print(f"[prep] done in {(time.time() - started) / 60:.1f} min; "
               f"corpus is at prefix {args.prefix}")
     finally:
