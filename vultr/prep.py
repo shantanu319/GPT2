@@ -81,6 +81,11 @@ export PYTHONUNBUFFERED=1
 step() {{ echo "[prep $(date +%H:%M:%S)] $*"; }}
 DATA={quote(data)}
 
+step "uploading sealed shards as they land"
+{PYTHON} -m vultr.storage up --from-env --follow --data-dir "$DATA" \
+  --prefix {quote(args.prefix)} --workers {args.workers} &
+UPLOADER=$!
+
 step "tokenizing up to {args.max_train_docs} docs"
 {PYTHON} -m pretrain.prepare --output-dir "$DATA" \
   --max-train-docs {args.max_train_docs} --shard-tokens {args.shard_tokens}
@@ -89,12 +94,11 @@ step "shards on disk"
 ls -la "$DATA"/*.bin "$DATA"/*.json | tail -20
 du -sh "$DATA"
 
-step "dropping the fetch cache before the upload"
-rm -rf "$DATA/fetch_cache"
+step "waiting for the upload to drain"
+wait $UPLOADER
 
-step "uploading to object storage"
-{PYTHON} -m vultr.storage up --from-env --data-dir "$DATA" \
-  --prefix {quote(args.prefix)} --workers {args.workers}
+step "dropping the fetch cache"
+rm -rf "$DATA/fetch_cache"
 echo "PREP COMPLETE"
 """
 

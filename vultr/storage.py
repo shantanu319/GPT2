@@ -6,6 +6,7 @@ HuggingFace. Shards live here in between, which also means a reclaimed box
 re-downloads a corpus in minutes instead of rebuilding it from scratch.
 """
 import argparse
+import json
 import os
 import re
 import time
@@ -184,6 +185,38 @@ def download_dir(client, prefix, local_dir, bucket=BUCKET, workers=8, max_shards
     return got
 
 
+def follow_shards(client, data_dir, prefix, bucket=BUCKET, workers=8, poll=30):
+    """Ship sealed shards while prepare is still running, then everything else.
+
+    Tokenizing then uploading means a box lost at 90% loses all of it, and the
+    upload is network-bound while tokenizing is CPU-bound, so there is nothing
+    to gain by serialising them. Shards are os.replace'd into place, so any
+    train_NNNNN.bin is final; val/test are still being appended and the
+    manifest still reads complete:false, so both wait for the final pass.
+    """
+    ensure_bucket(client, bucket)
+    manifest = os.path.join(data_dir, "train_manifest.json")
+    sent = 0
+    while True:
+        present = remote_sizes(client, prefix, bucket)
+        jobs = []
+        for name in sorted(os.listdir(data_dir)):
+            path = os.path.join(data_dir, name)
+            if not SHARD.search(name) or not os.path.isfile(path):
+                continue
+            if present.get(f"{prefix}/{name}") == os.path.getsize(path):
+                continue
+            jobs.append((path, f"{prefix}/{name}"))
+        sent += _transfer(jobs, workers,
+                          lambda job: client.upload_file(job[0], bucket, job[1]))
+        if os.path.exists(manifest):
+            with open(manifest) as handle:
+                if json.load(handle).get("complete"):
+                    print(f"{sent} shard(s) shipped before prepare finished")
+                    return upload_dir(client, data_dir, prefix, bucket, workers)
+        time.sleep(poll)
+
+
 def subscription_from_env():
     """Creds the training box gets by env, the way HF_TOKEN already travels."""
     missing = [name for name in ("VULTR_S3_HOSTNAME", "VULTR_S3_ACCESS_KEY",
@@ -204,8 +237,11 @@ def _subscription(args):
 
 def up(args):
     subscription = _subscription(args)
-    upload_dir(client_for(subscription), args.data_dir, args.prefix,
-               workers=args.workers)
+    client = client_for(subscription)
+    if getattr(args, "follow", False):
+        follow_shards(client, args.data_dir, args.prefix, workers=args.workers)
+    else:
+        upload_dir(client, args.data_dir, args.prefix, workers=args.workers)
     print(f"endpoint {subscription['s3_hostname']}")
 
 
@@ -233,6 +269,8 @@ def add_arguments(parser, default_prefix="corpus"):
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--max-shards", type=int, default=0,
                         help="pull only the first N train shards (0 = all)")
+    parser.add_argument("--follow", action="store_true",
+                        help="upload sealed shards while prepare still runs")
 
 
 def main():

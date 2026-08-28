@@ -322,3 +322,39 @@ def test_prep_passes_a_core_floor_to_provisioning(monkeypatch):
     with pytest.raises(RuntimeError, match="stop here"):
         prep_mod.prep(args)
     assert seen == {"min_vcpu": 18, "min_disk": 347}
+
+
+def test_follow_shards_ships_sealed_shards_before_prepare_finishes(monkeypatch, tmp_path):
+    """Serialising tokenize then upload loses everything if the box dies at
+    90%. Shards are os.replace'd into place, so they can go early; val and the
+    manifest are still being written and must wait."""
+    import json as _json
+    (tmp_path / "train_00000.bin").write_bytes(b"x" * 10)
+    (tmp_path / "val.bin").write_bytes(b"y" * 4)
+    (tmp_path / "train_manifest.json").write_text(_json.dumps({"complete": False}))
+    client = FakeS3({})
+
+    def finish(_seconds):
+        (tmp_path / "train_00001.bin").write_bytes(b"z" * 10)
+        (tmp_path / "train_manifest.json").write_text(_json.dumps({"complete": True}))
+
+    monkeypatch.setattr(storage.time, "sleep", finish)
+    storage.follow_shards(client, str(tmp_path), "c", poll=0)
+    assert client.uploaded[0] == "c/train_00000.bin", "the sealed shard goes first"
+    assert "c/val.bin" not in client.uploaded[:1], "val is still being appended"
+    assert set(client.uploaded) == {"c/train_00000.bin", "c/train_00001.bin",
+                                    "c/val.bin", "c/train_manifest.json"}
+
+
+def test_prep_overlaps_the_upload_with_tokenizing():
+    from types import SimpleNamespace as NS
+    from vultr.prep import build_script
+    script = build_script(
+        NS(prefix="corpus-40b", max_train_docs=31_000_000, shard_tokens=500_000_000,
+           workers=8),
+        {"s3_hostname": "h", "s3_access_key": "AK", "s3_secret_key": "SK"})
+    up = script.index("storage up --from-env --follow")
+    tok = script.index("pretrain.prepare")
+    assert up < tok, "the uploader must start before tokenizing, not after"
+    assert "wait $UPLOADER" in script
+    assert script.index("wait $UPLOADER") > tok
