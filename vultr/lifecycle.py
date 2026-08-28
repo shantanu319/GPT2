@@ -155,13 +155,14 @@ def _select(args):
     if getattr(args, "compute", False):
         # Search every shared/dedicated family, not just vc2: a caller asking
         # for real disk (prep) needs plans vc2 alone does not offer.
-        catalog = [plan for family in ("vc2", "vhf", "vhp")
+        catalog = [plan for family in ("vc2", "vhf", "vhp", "voc")
                    for plan in list_plans(family, api)]
         plan, region = select_live_plan(
             api, catalog, None,
             lambda plans: select_compute_plan(
                 plans, min_ram=getattr(args, "min_ram", 1024), region=args.region,
-                min_disk=getattr(args, "min_disk", 0), plan_id=args.plan),
+                min_disk=getattr(args, "min_disk", 0),
+                min_vcpu=getattr(args, "min_vcpu", 0), plan_id=args.plan),
         )
         return api, INSTANCE, plan, region
     plan, region = select_live_plan(

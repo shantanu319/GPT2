@@ -252,11 +252,13 @@ def test_provision_explains_how_to_unlock_gpu_access(monkeypatch):
 
 
 COMPUTE_CATALOG = {
-    "vc2": [{"id": "vc2-1c-1gb", "deploy_ondemand": True, "ram": 1024, "disk": 25,
+    "vc2": [{"id": "vc2-1c-1gb", "deploy_ondemand": True, "vcpu_count": 1, "ram": 1024, "disk": 25,
              "locations": ["ams"], "hourly_cost": 0.007}],
-    "vhf": [{"id": "vhf-3c-8gb", "deploy_ondemand": True, "ram": 8192, "disk": 256,
+    "vhf": [{"id": "vhf-3c-8gb", "deploy_ondemand": True, "vcpu_count": 3, "ram": 8192, "disk": 256,
              "locations": ["ams"], "hourly_cost": 0.066}],
     "vhp": [],
+    "voc": [{"id": "voc-c-32c-64gb-500s-amd", "deploy_ondemand": True, "vcpu_count": 32, "ram": 65536,
+             "disk": 500, "locations": ["ams"], "hourly_cost": 0.877}],
 }
 
 
@@ -296,6 +298,21 @@ def test_compute_selection_searches_beyond_vc2(monkeypatch):
     """vc2 alone offers no plan with real disk."""
     with pytest.raises(RuntimeError, match="no on-demand"):
         _compute_select(monkeypatch, _compute_args(min_disk=9999))
+
+
+def test_compute_selection_reaches_the_optimized_cloud_family(monkeypatch):
+    """A 40B-token prep needs ~300 GB and every core it can get; the widest
+    plans live in voc, which the family list used to omit."""
+    plan = _compute_select(monkeypatch, _compute_args(min_ram=2048, min_disk=400))
+    assert plan["id"] == "voc-c-32c-64gb-500s-amd"
+
+
+def test_compute_selection_can_floor_on_cores(monkeypatch):
+    """Cheapest-per-hour picks a 1-core box; prep is core-hours bound, so
+    without a vCPU floor the auto path silently chooses the slowest machine."""
+    assert _compute_select(monkeypatch, _compute_args())["id"] == "vc2-1c-1gb"
+    plan = _compute_select(monkeypatch, _compute_args(min_vcpu=8))
+    assert plan["id"] == "voc-c-32c-64gb-500s-amd"
 
 
 def test_bootstrap_installs_zstandard_for_the_dclm_source(monkeypatch):
