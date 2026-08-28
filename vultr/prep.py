@@ -8,7 +8,7 @@ uploads the shards, and destroys the box in a finally.
 import os
 import time
 
-from vultr.api import client_from_env, list_plans, select_compute_plan, select_live_plan
+from vultr.api import client_from_env
 from vultr.lifecycle import destroy_state, provision
 from vultr.pipeline import PYTHON, S3_VARS
 from vultr.remote import REMOTE_ROOT, rsync, run_remote
@@ -86,19 +86,14 @@ def prep(args):
     disk = args.disk or required_disk_gb(args.max_train_docs)
     print(f"corpus needs ~{disk} GB; placing prep in {region} next to the bucket")
 
-    candidates = list_plans("vc2", api) + list_plans("vhf", api) + list_plans("vhp", api)
-    plan, chosen = select_live_plan(
-        api, candidates, None,
-        lambda plans: select_compute_plan(plans, min_ram=2048, region=region,
-                                          min_disk=disk),
-    )
-    args.plan, args.region, args.compute, args.metal = plan["id"], chosen, True, False
-    args.label = "mot-prep"
+    # provision does the selecting; it just needs the floors this job requires.
+    args.region, args.compute, args.metal = region, True, False
+    args.min_ram, args.min_disk, args.label = 2048, disk, "mot-prep"
     started = time.time()
     state = None
     try:
         api, state = provision(args, bootstrap_instance=False)
-        print(f"[prep] {plan['id']} up at {state['ssh_host']}; installing runtime...")
+        print(f"[prep] {state['plan']} up at {state['ssh_host']}; installing runtime...")
         _bootstrap(state)
         run_remote(state, f"mkdir -p {REMOTE_ROOT}")
         rsync(state, "./", f"root@{state['ssh_host']}:{REMOTE_ROOT}/")

@@ -249,3 +249,50 @@ def test_provision_explains_how_to_unlock_gpu_access(monkeypatch):
     monkeypatch.setattr(lifecycle, "_delete_resource", lambda *a, **k: None)
     with pytest.raises(RuntimeError, match="my.vultr.com/support"):
         lifecycle.provision(args())
+
+
+COMPUTE_CATALOG = {
+    "vc2": [{"id": "vc2-1c-1gb", "deploy_ondemand": True, "ram": 1024, "disk": 25,
+             "locations": ["ams"], "hourly_cost": 0.007}],
+    "vhf": [{"id": "vhf-3c-8gb", "deploy_ondemand": True, "ram": 8192, "disk": 256,
+             "locations": ["ams"], "hourly_cost": 0.066}],
+    "vhp": [],
+}
+
+
+def _compute_args(**overrides):
+    values = {"compute": True, "metal": False, "plan": None, "region": "ams",
+              "min_vram": 0}
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _compute_select(monkeypatch, args):
+    monkeypatch.setattr(lifecycle, "client_from_env", lambda: None)
+    monkeypatch.setattr(lifecycle, "list_plans",
+                        lambda family, client=None: COMPUTE_CATALOG[family])
+    monkeypatch.setattr(lifecycle, "select_live_plan",
+                        lambda api, plans, kind, selector: selector(plans))
+    return lifecycle._select(args)[2]
+
+
+def test_compute_selection_respects_a_disk_floor(monkeypatch):
+    """prep asked for 30 GB and got a 25 GB box, because the compute branch
+    re-selected the cheapest plan and ignored the floors it was given."""
+    plan = _compute_select(monkeypatch, _compute_args(min_ram=2048, min_disk=30))
+    assert plan["id"] == "vhf-3c-8gb"
+
+
+def test_compute_selection_still_defaults_to_the_cheapest(monkeypatch):
+    assert _compute_select(monkeypatch, _compute_args())["id"] == "vc2-1c-1gb"
+
+
+def test_compute_selection_honours_an_explicit_plan(monkeypatch):
+    plan = _compute_select(monkeypatch, _compute_args(plan="vhf-3c-8gb"))
+    assert plan["id"] == "vhf-3c-8gb"
+
+
+def test_compute_selection_searches_beyond_vc2(monkeypatch):
+    """vc2 alone offers no plan with real disk."""
+    with pytest.raises(RuntimeError, match="no on-demand"):
+        _compute_select(monkeypatch, _compute_args(min_disk=9999))

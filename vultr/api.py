@@ -150,17 +150,18 @@ def select_plan(plans, min_vram=20, plan_id=None, region=None):
     return plan, region or plan["locations"][0]
 
 
-def select_compute_plan(plans, min_ram=1024, region=None, min_disk=0):
+def select_compute_plan(plans, min_ram=1024, region=None, min_disk=0, plan_id=None):
     candidates = [
         plan for plan in plans
-        if plan.get("deploy_ondemand") and plan.get("ram", 0) >= min_ram
-        and plan.get("disk", 0) >= min_disk
+        if plan.get("deploy_ondemand")
         and plan.get("locations") and (not region or region in plan["locations"])
+        and (plan["id"] == plan_id if plan_id else
+             plan.get("ram", 0) >= min_ram and plan.get("disk", 0) >= min_disk)
     ]
     if not candidates:
         where = f" in {region}" if region else ""
         disk = f" and >={min_disk} GB disk" if min_disk else ""
-        raise RuntimeError(
-            f"no on-demand Vultr compute plan with >={min_ram} MB RAM{disk}{where}")
+        target = plan_id or f">={min_ram} MB RAM{disk}"
+        raise RuntimeError(f"no on-demand Vultr compute plan for {target}{where}")
     plan = min(candidates, key=lambda item: (item["hourly_cost"], item["id"]))
     return plan, region or plan["locations"][0]
