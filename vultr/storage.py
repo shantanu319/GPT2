@@ -7,6 +7,7 @@ re-downloads a corpus in minutes instead of rebuilding it from scratch.
 """
 import argparse
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -16,6 +17,7 @@ BUCKET = "myowntransformer"
 # Object storage has no fra cluster and the 8x A100 plan deploys there, so
 # Amsterdam is the shortest hop for the corpus the GPU box has to pull.
 DEFAULT_REGION = "ams"
+SHARD = re.compile(r"train_\d+\.bin$")
 
 
 def candidate_clusters(clusters, region=None):
@@ -151,11 +153,27 @@ def upload_dir(client, local_dir, prefix, bucket=BUCKET, workers=8):
     return sent
 
 
-def download_dir(client, prefix, local_dir, bucket=BUCKET, workers=8):
+def keep_shards(keys, limit):
+    """The first `limit` train shards, plus every non-shard object.
+
+    The corpus is sized for the longest run we might do; a shorter one wants
+    a prefix of it. load_bin concatenates whatever shards are on disk and the
+    LR schedule anneals to that, so pulling fewer is a smaller corpus, not a
+    broken one.
+    """
+    if not limit:
+        return keys
+    keep = set(sorted(key for key in keys if SHARD.search(key))[:limit])
+    return [key for key in keys if not SHARD.search(key) or key in keep]
+
+
+def download_dir(client, prefix, local_dir, bucket=BUCKET, workers=8, max_shards=0):
     """Pull prefix into local_dir, skipping local files already the same size."""
     os.makedirs(local_dir, exist_ok=True)
+    sizes = remote_sizes(client, prefix, bucket)
     jobs = []
-    for key, size in sorted(remote_sizes(client, prefix, bucket).items()):
+    for key in keep_shards(sorted(sizes), max_shards):
+        size = sizes[key]
         path = os.path.join(local_dir, os.path.basename(key))
         if os.path.exists(path) and os.path.getsize(path) == size:
             continue
@@ -194,7 +212,7 @@ def up(args):
 def down(args):
     """Pull on the training box from env creds, or locally from the account."""
     download_dir(client_for(_subscription(args)), args.prefix, args.data_dir,
-                 workers=args.workers)
+                 workers=args.workers, max_shards=args.max_shards)
 
 
 def destroy(args):
@@ -213,6 +231,8 @@ def add_arguments(parser, default_prefix="corpus"):
     parser.add_argument("--region", default=None,
                         help="object-storage region; defaults to the nearest to fra")
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--max-shards", type=int, default=0,
+                        help="pull only the first N train shards (0 = all)")
 
 
 def main():

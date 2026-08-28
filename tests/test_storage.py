@@ -237,7 +237,7 @@ def test_prep_bootstrap_installs_zstandard():
 
 def _env_args(**kw):
     values = {"from_env": True, "label": "mot", "region": None, "workers": 2,
-              "data_dir": ".", "prefix": "corpus"}
+              "data_dir": ".", "prefix": "corpus", "max_shards": 0}
     values.update(kw)
     return SimpleNamespace(**values)
 
@@ -267,3 +267,28 @@ def test_download_from_env_never_needs_the_account_api_key(monkeypatch, tmp_path
                         lambda sub: FakeS3({"corpus/train_00000.bin": 5}))
     storage.down(_env_args(data_dir=str(tmp_path / "out")))
     assert (tmp_path / "out" / "train_00000.bin").stat().st_size == 5
+
+
+def test_keep_shards_caps_train_shards_but_keeps_everything_else():
+    """A 40B corpus is 80 shards; a run sized for 25B wants the first 50 and
+    still needs the tokenizer, the holdouts, and the manifest."""
+    keys = ["c/test.bin", "c/tokenizer.json", "c/train_00000.bin",
+            "c/train_00001.bin", "c/train_00002.bin", "c/train_manifest.json",
+            "c/val.bin"]
+    assert storage.keep_shards(keys, 0) == keys
+    kept = storage.keep_shards(keys, 2)
+    assert "c/train_00002.bin" not in kept
+    assert kept == ["c/test.bin", "c/tokenizer.json", "c/train_00000.bin",
+                    "c/train_00001.bin", "c/train_manifest.json", "c/val.bin"]
+
+
+def test_download_honours_the_shard_cap(monkeypatch, tmp_path):
+    for name, value in (("VULTR_S3_HOSTNAME", "h"), ("VULTR_S3_ACCESS_KEY", "AK"),
+                        ("VULTR_S3_SECRET_KEY", "SK")):
+        monkeypatch.setenv(name, value)
+    client = FakeS3({"corpus/train_00000.bin": 5, "corpus/train_00001.bin": 5,
+                     "corpus/train_00002.bin": 5, "corpus/tokenizer.json": 5})
+    monkeypatch.setattr(storage, "client_for", lambda sub: client)
+    storage.down(_env_args(data_dir=str(tmp_path / "out"), max_shards=2))
+    got = sorted(os.path.basename(p) for p in os.listdir(tmp_path / "out"))
+    assert got == ["tokenizer.json", "train_00000.bin", "train_00001.bin"]

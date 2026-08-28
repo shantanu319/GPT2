@@ -56,6 +56,9 @@ def main():
     command.add_argument("--corpus-prefix", default="",
                          help="pull a prepared corpus from object storage before "
                               "falling back to tokenizing it here")
+    command.add_argument("--corpus-shards", type=int, default=0,
+                         help="pull only the first N train shards; the LR schedule "
+                              "anneals to whatever lands (0 = the whole corpus)")
     command.add_argument("--gpus", default="auto",
                          help="ranks to launch; 'auto' counts the box's GPUs")
     command.add_argument("--sft-epochs", type=int, default=1)

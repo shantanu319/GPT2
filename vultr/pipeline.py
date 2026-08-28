@@ -84,10 +84,12 @@ def build_pipeline(args):
     if prefix:
         exports = "\n".join(f"export {name}={quote(os.environ.get(name, ''))}"
                              for name in S3_VARS)
+        cap = getattr(args, "corpus_shards", 0)
         fetch = f'''{exports}
 if ! prepared; then
   step "fetch corpus from object storage"
   "$PY" -m vultr.storage down --from-env --prefix {quote(prefix)} \\
+    --max-shards {cap} \\
     --data-dir "$DATA" || step "no corpus in storage; will tokenize instead"
 fi'''
     prepare_args = f"--max-train-docs {args.max_train_docs}" if args.max_train_docs else ""

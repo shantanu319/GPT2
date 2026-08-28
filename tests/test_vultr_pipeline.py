@@ -282,3 +282,11 @@ def test_corpus_fetch_carries_the_s3_credentials(monkeypatch):
     script = build_pipeline(pipeline_args(corpus_prefix="corpus-40b"))
     for name in S3_VARS:
         assert f"export {name}=value-for-{name}" in script
+
+
+def test_corpus_fetch_passes_the_shard_cap():
+    """A 40B corpus outlives any one run; a 12h budget wants a prefix of it."""
+    script = build_pipeline(pipeline_args(corpus_prefix="corpus-40b",
+                                          corpus_shards=50))
+    assert "--max-shards 50" in script
+    assert "--max-shards 0" in build_pipeline(pipeline_args(corpus_prefix="c"))
