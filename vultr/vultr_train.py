@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 
 from vultr.jobs import PULL_DIR, pipeline, pull, push, ssh
 from vultr.pipeline import add_train_args
+from vultr.prep import prep
 from vultr.lifecycle import (
     DEFAULT_PRIVATE_KEY, DEFAULT_PUBLIC_KEY, GPU_OS_ID, destroy, print_plans, provision, status,
 )
@@ -73,6 +74,22 @@ def main():
     command = commands.add_parser("destroy", help="destroy the instance and stop billing")
     command.add_argument("--id", help="instance ID for recovery without a state file")
     command.set_defaults(func=destroy)
+
+    command = commands.add_parser(
+        "prep", help="tokenize the corpus on a cheap CPU box and upload it")
+    add_instance_args(command, min_vram=0)
+    command.add_argument("--max-train-docs", type=int, default=200_000)
+    command.add_argument("--prefix", default="corpus")
+    command.add_argument("--label-storage", default="myowntransformer")
+    command.add_argument("--shard-tokens", type=int, default=500_000_000)
+    command.add_argument("--disk", type=int, default=0,
+                         help="GB floor for the prep box; derived from doc count by default")
+    command.add_argument("--workers", type=int, default=8)
+    command.add_argument("--tokenizer", default="data_cache/cosmopedia/tokenizer.json",
+                         help="reuse this tokenizer; pass '' to train a fresh one "
+                              "(slow, and invalidates existing checkpoints)")
+    command.add_argument("--keep", action="store_true")
+    command.set_defaults(func=prep)
 
     command = commands.add_parser(
         "smoke", help="run tiny training on the cheapest GPU/compute, then destroy it"

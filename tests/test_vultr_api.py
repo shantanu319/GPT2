@@ -198,3 +198,41 @@ def test_wait_ready_still_requires_all_three_fields_for_an_instance(monkeypatch)
     api = SimpleNamespace(request=lambda method, path: half_up)
     with pytest.raises(RuntimeError, match="not SSH-ready"):
         remote.wait_ready(api, "i-1", "key", timeout=1, kind=INSTANCE)
+
+
+def test_plan_type_is_derived_from_the_plan_id():
+    from vultr.api import plan_type_of
+    assert plan_type_of("vc2-6c-16gb") == "vc2"
+    assert plan_type_of("vhf-3c-8gb") == "vhf"
+    assert plan_type_of("vhp-4c-12gb-amd") == "vhp"
+
+
+def test_live_plan_probe_asks_under_each_plans_own_type():
+    """A mixed candidate list queried under one hardcoded type would never see
+    the other families as available, and the search would spin."""
+    from vultr.api import select_live_plan
+    asked = []
+
+    class Probe:
+        def request(self, method, path, auth=True):
+            asked.append(path)
+            return {"available_plans": ["vhf-3c-8gb"]}
+
+    plans = [{"id": "vhf-3c-8gb", "locations": ["ams"], "hourly_cost": 0.066}]
+    plan, region = select_live_plan(Probe(), plans, None, lambda p: (p[0], "ams"))
+    assert plan["id"] == "vhf-3c-8gb" and region == "ams"
+    assert "type=vhf" in asked[0]
+
+
+def test_compute_plan_selection_honours_a_disk_floor():
+    from vultr.api import select_compute_plan
+    plans = [
+        {"id": "small", "deploy_ondemand": True, "ram": 8192, "disk": 128,
+         "locations": ["ams"], "hourly_cost": 0.03},
+        {"id": "roomy", "deploy_ondemand": True, "ram": 8192, "disk": 320,
+         "locations": ["ams"], "hourly_cost": 0.11},
+    ]
+    assert select_compute_plan(plans, region="ams")[0]["id"] == "small"
+    assert select_compute_plan(plans, region="ams", min_disk=250)[0]["id"] == "roomy"
+    with pytest.raises(RuntimeError, match="500 GB disk"):
+        select_compute_plan(plans, region="ams", min_disk=500)

@@ -105,11 +105,18 @@ def list_gpu_plans(client=None):
     return list_plans("vcg", client)
 
 
+def plan_type_of(plan_id):
+    """vc2-6c-16gb -> vc2. The availability endpoint is queried per type, so a
+    mixed candidate list has to ask about each plan under its own type."""
+    return plan_id.split("-")[0]
+
+
 def select_live_plan(client, plans, plan_type, selector):
     remaining = [{**plan, "locations": list(plan.get("locations", []))} for plan in plans]
     while True:
         plan, region = selector(remaining)
-        path = f"/regions/{urllib.parse.quote(region)}/availability?type={plan_type}"
+        kind = plan_type or plan_type_of(plan["id"])
+        path = f"/regions/{urllib.parse.quote(region)}/availability?type={kind}"
         available = client.request("GET", path, auth=False).get("available_plans", [])
         if plan["id"] in available:
             return plan, region
@@ -143,14 +150,17 @@ def select_plan(plans, min_vram=20, plan_id=None, region=None):
     return plan, region or plan["locations"][0]
 
 
-def select_compute_plan(plans, min_ram=1024, region=None):
+def select_compute_plan(plans, min_ram=1024, region=None, min_disk=0):
     candidates = [
         plan for plan in plans
         if plan.get("deploy_ondemand") and plan.get("ram", 0) >= min_ram
+        and plan.get("disk", 0) >= min_disk
         and plan.get("locations") and (not region or region in plan["locations"])
     ]
     if not candidates:
         where = f" in {region}" if region else ""
-        raise RuntimeError(f"no on-demand Vultr compute plan with >={min_ram} MB RAM{where}")
+        disk = f" and >={min_disk} GB disk" if min_disk else ""
+        raise RuntimeError(
+            f"no on-demand Vultr compute plan with >={min_ram} MB RAM{disk}{where}")
     plan = min(candidates, key=lambda item: (item["hourly_cost"], item["id"]))
     return plan, region or plan["locations"][0]
