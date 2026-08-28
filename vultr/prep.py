@@ -69,12 +69,12 @@ step "shards on disk"
 ls -la "$DATA"/*.bin "$DATA"/*.json | tail -20
 du -sh "$DATA"
 
+step "dropping the fetch cache before the upload"
+rm -rf "$DATA/fetch_cache"
+
 step "uploading to object storage"
 {PYTHON} -m vultr.storage up --from-env --data-dir "$DATA" \
   --prefix {quote(args.prefix)} --workers {args.workers}
-
-step "removing the fetch cache so it is not re-uploaded"
-rm -rf "$DATA/fetch_cache"
 echo "PREP COMPLETE"
 """
 
