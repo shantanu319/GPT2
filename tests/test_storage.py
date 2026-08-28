@@ -358,3 +358,59 @@ def test_prep_overlaps_the_upload_with_tokenizing():
     assert up < tok, "the uploader must start before tokenizing, not after"
     assert "wait $UPLOADER" in script
     assert script.index("wait $UPLOADER") > tok
+
+
+def test_post_stage_builds_sft_and_dpo_instead_of_the_corpus():
+    """Without this the A100 box at $11.92/hr streams smol-smoltalk and
+    ultrafeedback from HuggingFace itself."""
+    from types import SimpleNamespace as NS
+    from vultr.prep import build_script
+    sub = {"s3_hostname": "h", "s3_access_key": "AK", "s3_secret_key": "SK"}
+    args = NS(prefix="corpus-40b", max_train_docs=31_000_000,
+              shard_tokens=500_000_000, workers=8, stage="post")
+    script = build_script(args, sub)
+    assert "sft.sft_prepare" in script and "dpo.dpo_prepare" in script
+    assert "pretrain.prepare" not in script, "post must not re-tokenize the corpus"
+    # they only share tokenizer.json, so neither blocks the other
+    assert script.index("sft.sft_prepare") < script.index("wait $SFT")
+    assert script.index("dpo.dpo_prepare") < script.index("wait $SFT")
+    assert script.index("storage up") > script.index("wait $DPO")
+    assert "--prefix corpus-40b" in script, "artifacts land beside the corpus"
+
+
+def test_post_stage_asks_for_a_small_box():
+    """Both prepares are single-threaded; sizing by max_train_docs would rent
+    a 24-core box to run two single-threaded jobs."""
+    from vultr import prep as prep_mod
+    seen = {}
+
+    def fake_provision(args, bootstrap_instance=False):
+        seen.update(min_vcpu=args.min_vcpu, min_disk=args.min_disk)
+        raise RuntimeError("stop here")
+
+    import pytest as _pytest
+    from types import SimpleNamespace as NS
+    monkey = _pytest.MonkeyPatch()
+    monkey.setattr(prep_mod, "client_from_env", lambda: None)
+    monkey.setattr(prep_mod, "ensure_subscription",
+                   lambda *a, **k: {"region": "ams", "s3_hostname": "h",
+                                    "s3_access_key": "AK", "s3_secret_key": "SK"})
+    monkey.setattr(prep_mod, "provision", fake_provision)
+    args = NS(max_train_docs=31_000_000, disk=0, vcpu=0, keep=False, region=None,
+              label_storage="mot", prefix="corpus-40b", stage="post")
+    with _pytest.raises(RuntimeError, match="stop here"):
+        prep_mod.prep(args)
+    monkey.undo()
+    assert seen == {"min_vcpu": 2, "min_disk": 40}
+
+
+def test_sft_and_dpo_artifacts_survive_the_shard_cap():
+    """--corpus-shards 50 must not strip the post-training data."""
+    keys = ["c/train_00000.bin", "c/train_00001.bin", "c/sft_train.bin",
+            "c/sft_train_mask.bin", "c/dpo_train.bin", "c/dpo_train_pairs.bin",
+            "c/tokenizer.json"]
+    kept = storage.keep_shards(keys, 1)
+    assert "c/train_00001.bin" not in kept
+    for name in ("sft_train.bin", "sft_train_mask.bin", "dpo_train.bin",
+                 "dpo_train_pairs.bin", "tokenizer.json"):
+        assert f"c/{name}" in kept, f"{name} must survive the cap"

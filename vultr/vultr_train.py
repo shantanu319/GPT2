@@ -82,6 +82,9 @@ def main():
         "prep", help="tokenize the corpus on a cheap CPU box and upload it")
     add_instance_args(command, min_vram=0)
     command.add_argument("--max-train-docs", type=int, default=200_000)
+    command.add_argument("--stage", choices=("pretrain", "post"), default="pretrain",
+                         help="pretrain tokenizes the corpus; post builds the "
+                              "sft/dpo artifacts into the same prefix")
     command.add_argument("--prefix", default="corpus")
     command.add_argument("--label-storage", default="myowntransformer")
     command.add_argument("--shard-tokens", type=int, default=500_000_000)

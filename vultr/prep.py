@@ -62,26 +62,13 @@ def _bootstrap(state):
     )
 
 
-def build_script(args, subscription):
-    import shlex
-    quote = shlex.quote
-    data = f"data_cache/{args.prefix}"
-    exports = "\n".join(
-        f"export {name}={quote(value)}" for name, value in (
-            ("HF_TOKEN", os.environ.get("HF_TOKEN", "")),
-            ("VULTR_S3_HOSTNAME", subscription["s3_hostname"]),
-            ("VULTR_S3_ACCESS_KEY", subscription["s3_access_key"]),
-            ("VULTR_S3_SECRET_KEY", subscription["s3_secret_key"]),
-        ) if value)
-    return f"""#!/bin/bash
-set -euo pipefail
-cd {quote(REMOTE_ROOT)}
-export PYTHONUNBUFFERED=1
-{exports}
-step() {{ echo "[prep $(date +%H:%M:%S)] $*"; }}
-DATA={quote(data)}
+# sft_prepare and dpo_prepare are single-threaded and independent of each
+# other, so two cores run both at once; their outputs are ~2 GB.
+POST_VCPU, POST_DISK_GB = 2, 40
 
-step "uploading sealed shards as they land"
+
+def _pretrain_body(args, quote):
+    return f"""step "uploading sealed shards as they land"
 {PYTHON} -m vultr.storage up --from-env --follow --data-dir "$DATA" \
   --prefix {quote(args.prefix)} --workers {args.workers} &
 UPLOADER=$!
@@ -99,6 +86,51 @@ wait $UPLOADER
 
 step "dropping the fetch cache"
 rm -rf "$DATA/fetch_cache"
+"""
+
+
+def _post_body(args, quote):
+    """SFT and DPO only need tokenizer.json, which prep already rsyncs up, so
+    both stream straight from HuggingFace and neither waits on the other."""
+    return f"""step "sft_prepare and dpo_prepare (independent, run together)"
+{PYTHON} -m sft.sft_prepare --output-dir "$DATA" &
+SFT=$!
+{PYTHON} -m dpo.dpo_prepare --output-dir "$DATA" &
+DPO=$!
+wait $SFT
+wait $DPO
+
+step "artifacts on disk"
+ls -la "$DATA"/sft_*.bin "$DATA"/dpo_*.bin
+du -sh "$DATA"
+
+step "uploading to object storage"
+{PYTHON} -m vultr.storage up --from-env --data-dir "$DATA" \
+  --prefix {quote(args.prefix)} --workers {args.workers}"""
+
+
+def build_script(args, subscription):
+    import shlex
+    quote = shlex.quote
+    data = f"data_cache/{args.prefix}"
+    exports = "\n".join(
+        f"export {name}={quote(value)}" for name, value in (
+            ("HF_TOKEN", os.environ.get("HF_TOKEN", "")),
+            ("VULTR_S3_HOSTNAME", subscription["s3_hostname"]),
+            ("VULTR_S3_ACCESS_KEY", subscription["s3_access_key"]),
+            ("VULTR_S3_SECRET_KEY", subscription["s3_secret_key"]),
+        ) if value)
+    body = (_post_body if getattr(args, "stage", "pretrain") == "post"
+            else _pretrain_body)(args, quote)
+    return f"""#!/bin/bash
+set -euo pipefail
+cd {quote(REMOTE_ROOT)}
+export PYTHONUNBUFFERED=1
+{exports}
+step() {{ echo "[prep $(date +%H:%M:%S)] $*"; }}
+DATA={quote(data)}
+
+{body}
 echo "PREP COMPLETE"
 """
 
@@ -137,12 +169,14 @@ def prep(args):
     api = client_from_env()
     subscription = ensure_subscription(api, args.label_storage, args.region)
     region = subscription.get("region") or args.region
-    disk = args.disk or required_disk_gb(args.max_train_docs)
-    print(f"corpus needs ~{disk} GB; placing prep in {region} next to the bucket")
+    post = getattr(args, "stage", "pretrain") == "post"
+    disk = args.disk or (POST_DISK_GB if post else required_disk_gb(args.max_train_docs))
+    print(f"{'sft/dpo' if post else 'corpus'} needs ~{disk} GB; "
+          f"placing prep in {region} next to the bucket")
 
     # provision does the selecting; it just needs the floors this job requires.
     args.region, args.compute, args.metal = region, True, False
-    cores = args.vcpu or required_vcpu(args.max_train_docs)
+    cores = args.vcpu or (POST_VCPU if post else required_vcpu(args.max_train_docs))
     args.min_ram, args.min_disk, args.label = 2048, disk, "mot-prep"
     args.min_vcpu = cores
     started = time.time()
@@ -168,7 +202,7 @@ def prep(args):
             run_remote(state, f"tail -n 40 {REMOTE_ROOT}/prep.log", check=False)
             raise RuntimeError("prep did not reach PREP COMPLETE; see log above")
         print(f"[prep] done in {(time.time() - started) / 60:.1f} min; "
-              f"corpus is at prefix {args.prefix}")
+              f"{'sft/dpo' if post else 'corpus'} is at prefix {args.prefix}")
     finally:
         if state and not args.keep:
             print("[prep] destroying the instance to stop billing...")
