@@ -149,9 +149,13 @@ def _run_detached(state, poll=60):
     last = None
     while True:
         time.sleep(poll)
+        # The probe must exit 0 whether or not prep.sh is alive: a bare
+        # `pgrep && echo` returns pgrep's status, so the run finishing looked
+        # exactly like a dropped connection and the box was never reaped.
         result = run_remote(
             state,
-            f"tail -n 1 {log}; pgrep -f '[p]rep[.]sh' > /dev/null && echo __RUNNING__",
+            f"tail -n 1 {log}; "
+            f"if pgrep -f '[p]rep[.]sh' > /dev/null; then echo __RUNNING__; fi",
             check=False, capture_output=True)
         if result.returncode != 0:
             print("[prep] ssh unreachable; retrying")

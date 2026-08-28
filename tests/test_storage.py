@@ -415,3 +415,21 @@ def test_sft_and_dpo_artifacts_survive_the_shard_cap():
     for name in ("sft_train.bin", "sft_train_mask.bin", "dpo_train.bin",
                  "dpo_train_pairs.bin", "tokenizer.json"):
         assert f"c/{name}" in kept, f"{name} must survive the cap"
+
+
+def test_detached_probe_exits_zero_once_the_run_is_over():
+    """`pgrep ... && echo` returns pgrep's status, so prep.sh finishing looked
+    identical to a dropped ssh: the poll loop retried forever and the box was
+    never destroyed."""
+    import inspect
+    import subprocess
+    from vultr import prep as prep_mod
+    src = inspect.getsource(prep_mod._run_detached)
+    assert "&& echo __RUNNING__" not in src, "bare && leaks pgrep's exit status"
+    assert "if pgrep" in src
+
+    absent = "[n]o_such_process_xyz"
+    safe = f"if pgrep -f '{absent}' > /dev/null; then echo __RUNNING__; fi"
+    unsafe = f"pgrep -f '{absent}' > /dev/null && echo __RUNNING__"
+    assert subprocess.run(["bash", "-c", safe], capture_output=True).returncode == 0
+    assert subprocess.run(["bash", "-c", unsafe], capture_output=True).returncode != 0
