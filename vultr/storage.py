@@ -18,27 +18,49 @@ BUCKET = "myowntransformer"
 DEFAULT_REGION = "ams"
 
 
-def select_cluster(clusters, region=None):
-    """Prefer the training region, else the documented nearest one."""
+def candidate_clusters(clusters, region=None):
+    """Deployable clusters in the preferred region, nearest fallback, or any."""
     live = [c for c in clusters if c.get("deploy") == "yes"]
-    for wanted in (region, DEFAULT_REGION):
-        match = next((c for c in live if c["region"] == wanted), None)
-        if match:
-            return match
     if not live:
         raise RuntimeError("no deployable object-storage cluster")
-    return live[0]
+    for wanted in (region, DEFAULT_REGION):
+        matches = [c for c in live if c["region"] == wanted]
+        if matches:
+            return matches
+    return live
+
+
+def select_placement(api, region=None):
+    """Cheapest (cluster, tier) available in the preferred region.
+
+    Region alone is not enough: Amsterdam has two clusters at very different
+    prices — ams1 carries Standard at $0.018/GB/mo while ams2 only offers
+    Performance at $0.05 — and Standard's 600 MB/s ceiling is already far more
+    than pulling a corpus needs.
+    """
+    clusters = candidate_clusters(
+        api.request("GET", "/object-storage/clusters?per_page=100")["clusters"], region)
+    priced = []
+    for cluster in clusters:
+        tiers = api.request(
+            "GET", f"/object-storage/clusters/{cluster['id']}/tiers").get("tiers", [])
+        priced += [(tier["disk_gb_price"], cluster, tier) for tier in tiers]
+    if not priced:
+        raise RuntimeError("no object-storage tier offered in the chosen region")
+    price, cluster, tier = min(priced, key=lambda item: (item[0], item[2]["id"]))
+    return cluster, tier
 
 
 def ensure_subscription(api, label="myowntransformer", region=None, timeout=300):
     """Find or create the subscription and return it once its keys exist."""
     match = find_subscription(api, label)
     if match is None:
-        cluster = select_cluster(
-            api.request("GET", "/object-storage/clusters?per_page=100")["clusters"], region)
-        print(f"creating object storage in {cluster['region']} ({cluster['hostname']})...")
+        cluster, tier = select_placement(api, region)
+        print(f"creating object storage in {cluster['region']} "
+              f"({cluster['hostname']}), {tier['sales_name']} tier at "
+              f"${tier['disk_gb_price']}/GB/mo...")
         match = api.request("POST", "/object-storage", {
-            "cluster_id": cluster["id"], "label": label,
+            "cluster_id": cluster["id"], "tier_id": tier["id"], "label": label,
         })["object_storage"]
     deadline = time.time() + timeout
     while not match.get("s3_access_key"):

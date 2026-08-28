@@ -86,43 +86,83 @@ def test_remote_sizes_walks_every_page():
     assert len(storage.remote_sizes(client, 'run')) == 5
 
 
-def test_cluster_choice_prefers_the_training_region_then_amsterdam():
-    clusters = [
-        {'id': 2, 'region': 'ewr', 'deploy': 'yes'},
-        {'id': 12, 'region': 'ams', 'deploy': 'yes'},
-        {'id': 14, 'region': 'lhr', 'deploy': 'yes'},
-    ]
-    assert storage.select_cluster(clusters, 'lhr')['id'] == 14
+CLUSTERS = [
+    {'id': 6, 'region': 'ams', 'deploy': 'yes', 'hostname': 'ams1'},
+    {'id': 12, 'region': 'ams', 'deploy': 'yes', 'hostname': 'ams2'},
+    {'id': 14, 'region': 'lhr', 'deploy': 'yes', 'hostname': 'lhr1'},
+]
+TIERS = {
+    6: [{'id': 2, 'sales_name': 'Standard', 'disk_gb_price': 0.018},
+        {'id': 3, 'sales_name': 'Premium', 'disk_gb_price': 0.036}],
+    12: [{'id': 4, 'sales_name': 'Performance', 'disk_gb_price': 0.05}],
+    14: [{'id': 4, 'sales_name': 'Performance', 'disk_gb_price': 0.05}],
+}
+
+
+def _placement_api(clusters=None):
+    def request(method, path, payload=None, auth=True):
+        if path.endswith('/tiers'):
+            return {'tiers': TIERS[int(path.split('/')[-2])]}
+        return {'clusters': clusters if clusters is not None else CLUSTERS}
+    return SimpleNamespace(request=request)
+
+
+def test_candidate_clusters_prefer_the_region_then_amsterdam():
+    assert [c['id'] for c in storage.candidate_clusters(CLUSTERS, 'lhr')] == [14]
     # object storage has no fra cluster, and the A100 plan deploys in fra
-    assert storage.select_cluster(clusters, 'fra')['id'] == 12
-    assert storage.select_cluster(clusters)['id'] == 12
+    assert [c['id'] for c in storage.candidate_clusters(CLUSTERS, 'fra')] == [6, 12]
+    assert [c['id'] for c in storage.candidate_clusters(CLUSTERS)] == [6, 12]
 
 
-def test_cluster_choice_ignores_undeployable_clusters():
+def test_candidate_clusters_ignore_undeployable_ones():
     clusters = [{'id': 1, 'region': 'ams', 'deploy': 'no'},
                 {'id': 2, 'region': 'ewr', 'deploy': 'yes'}]
-    assert storage.select_cluster(clusters, 'ams')['id'] == 2
+    assert [c['id'] for c in storage.candidate_clusters(clusters, 'ams')] == [2]
     with pytest.raises(RuntimeError, match="no deployable"):
-        storage.select_cluster([{'id': 1, 'region': 'ams', 'deploy': 'no'}])
+        storage.candidate_clusters([{'id': 1, 'region': 'ams', 'deploy': 'no'}])
+
+
+def test_placement_picks_the_cheapest_tier_not_just_the_first_cluster():
+    """Both Amsterdam clusters serve the region, but ams2 is ~3x the price."""
+    cluster, tier = storage.select_placement(_placement_api(), 'fra')
+    assert cluster['id'] == 6 and tier['id'] == 2
+    assert tier['disk_gb_price'] == 0.018
+
+
+def test_placement_raises_when_a_region_offers_no_tier():
+    api = SimpleNamespace(request=lambda method, path, payload=None, auth=True:
+                          {'tiers': []} if path.endswith('/tiers')
+                          else {'clusters': CLUSTERS})
+    with pytest.raises(RuntimeError, match="no object-storage tier"):
+        storage.select_placement(api, 'fra')
 
 
 def test_subscription_waits_for_its_keys(monkeypatch):
     """A fresh subscription is created without credentials; polling until the
     keys appear is what makes the upload that follows work."""
-    states = [
-        {'object_storages': []},
-        {'clusters': [{'id': 12, 'region': 'ams', 'deploy': 'yes',
-                       'hostname': 'ams1.vultrobjects.com'}]},
-        {'object_storage': {'id': 'sub-1', 'label': 'mot'}},
-        {'object_storage': {'id': 'sub-1', 'label': 'mot'}},
-        {'object_storage': {'id': 'sub-1', 'label': 'mot',
-                            's3_access_key': 'AK', 's3_secret_key': 'SK',
-                            's3_hostname': 'ams1.vultrobjects.com'}},
-    ]
-    api = SimpleNamespace(request=lambda *a, **k: states.pop(0))
+    keyed = {'id': 'sub-1', 'label': 'mot', 's3_access_key': 'AK',
+             's3_secret_key': 'SK', 's3_hostname': 'ams1.vultrobjects.com'}
+    polls = [{'object_storage': {'id': 'sub-1', 'label': 'mot'}},
+             {'object_storage': {'id': 'sub-1', 'label': 'mot'}},
+             {'object_storage': keyed}]
+    created = []
+
+    def request(method, path, payload=None, auth=True):
+        if path.startswith('/object-storage/clusters'):
+            return ({'tiers': TIERS[int(path.split('/')[-2])]} if path.endswith('/tiers')
+                    else {'clusters': CLUSTERS})
+        if method == 'POST':
+            created.append(payload)
+            return {'object_storage': {'id': 'sub-1', 'label': 'mot'}}
+        if path == '/object-storage?per_page=500':
+            return {'object_storages': []}
+        return polls.pop(0)
+
     monkeypatch.setattr(storage.time, 'sleep', lambda _: None)
-    sub = storage.ensure_subscription(api, label='mot')
+    sub = storage.ensure_subscription(SimpleNamespace(request=request), label='mot')
     assert sub['s3_access_key'] == 'AK'
+    # the tier is required by the API; creating without one is a 400
+    assert created[0]['tier_id'] == 2 and created[0]['cluster_id'] == 6
 
 
 def test_subscription_reuses_an_existing_label(monkeypatch):
