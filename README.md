@@ -225,6 +225,17 @@ and the decoder is `torch.compile`d. At 101M params the flat all-reduce moves
 ~707 MB (~4 ms on NVLink) against ~600 ms/step of compute, so overlapping it
 would buy under 1%. `--batchsize` is per GPU; the pipeline prints tokens/step.
 
+Every `-printevery` steps the loop logs the signal a throughput pass needs:
+loss, perplexity, current LR, gradient norm (which `clip_grad_norm_` already
+computed and used to discard), tokens/s, ms/step, a per-phase breakdown
+(`fwd bwd reduce optim data`), peak GPU memory, and cumulative tokens. Phase
+timings come from CUDA events, so the only synchronize is the one per logging
+interval. A large `reduce` share means either real comms cost or rank skew —
+a slow rank makes the others wait inside the all-reduce. A large `optim` share
+is the case for sharding Muon's Newton-Schulz, which currently runs redundantly
+on every rank. `python -m bench.train_step --hours 9` prices a step before any
+corpus exists and prints the `--max-train-docs` that budget buys.
+
 The `pipeline` command forwards all 37 of pretrain/config.py's knobs — declared
 once in `TRAIN_FLAGS`, which generates both the subparser and the remote command
 line. Its defaults turn on the architecture opt-ins with papers and equivalence

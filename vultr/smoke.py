@@ -66,9 +66,13 @@ def smoke(args):
         except RuntimeError as error:
             if "support request for access to this product" not in str(error):
                 raise
-            print("[smoke] Cloud GPU access is not enabled; falling back to shared CPU compute")
+            print("[smoke] GPU access is not enabled; falling back to shared CPU compute")
             args.compute = True
             args.plan = None
+            # Also drop --metal: re-selecting with it set would pick the
+            # cheapest bare-metal plan that has a live region, which is the
+            # 8x A100 box at $11.92/hr.
+            args.metal = False
             api, state = provision(args, bootstrap_instance=False)
         print("[smoke] installing the minimal runtime...")
         _bootstrap(state, compute=args.compute)

@@ -24,7 +24,7 @@ def pipeline_args(**overrides):
 def smoke_args(tmp_path, keep=False):
     return SimpleNamespace(
         keep=keep, out=str(tmp_path), min_vram=99, label="old", compute=False,
-        ranks=1,
+        ranks=1, metal=False,
         plan=None, region=None, os_id=2284,
         ssh_public_key="public", ssh_private_key="private",
     )
@@ -232,3 +232,24 @@ def test_smoke_falls_back_to_cpu_when_ranks_outnumber_gpus(monkeypatch, tmp_path
 def test_smoke_single_rank_skips_the_launcher(monkeypatch, tmp_path):
     command = _smoke_run(monkeypatch, tmp_path, ranks=1, gpus=1)
     assert "torch.distributed.run" not in command
+
+
+def test_gpu_fallback_cannot_escalate_to_a_bare_metal_gpu_box(monkeypatch, tmp_path):
+    """The fallback clears --plan; if it kept --metal, re-selection would pick
+    the cheapest metal plan with a live region — the 8x A100 at $11.92/hr."""
+    seen = []
+    gated = RuntimeError("support request for access to this product")
+
+    def provision(args, **kwargs):
+        seen.append({"metal": args.metal, "compute": args.compute, "plan": args.plan})
+        if len(seen) == 1:
+            raise gated
+        raise RuntimeError("stop")
+
+    monkeypatch.setattr(smoke_module, "provision", provision)
+    args = smoke_args(tmp_path)
+    args.metal = True
+    with pytest.raises(RuntimeError, match="stop"):
+        smoke_module.smoke(args)
+    assert seen[0]["metal"] is True
+    assert seen[1] == {"metal": False, "compute": True, "plan": None}

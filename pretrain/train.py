@@ -16,6 +16,7 @@ from core.tokenizer import BPETokenizer
 from pretrain.config import parse_args
 from pretrain.fused_ce import chunked_cross_entropy
 from pretrain.muon import Muon as LocalMuon
+from pretrain.telemetry import PhaseTimer, format_phases, peak_memory_gib
 
 
 def resolve_device(no_cuda):
@@ -250,6 +251,9 @@ def train_model(model, opt):
     step = 0
     micro = 0
     stop_training = False
+    timer = PhaseTimer(opt.device)
+    tokens_seen = 0
+    logged_tokens = 0
 
     def eval_and_check(max_batches):
         nonlocal stop_training
@@ -279,6 +283,7 @@ def train_model(model, opt):
         for inX, out, *rest in _feeder(opt, opt.train,
                                        shuffle=bool(getattr(opt, 'shuffle', 0)),
                                        seed=42 + epoch):
+            timer.mark('data')
             seg = rest[0] if rest else None
             iter += 1
             apply_lr_schedule(opt.optimizers, step, opt.total_steps, opt.warmup_steps,
@@ -289,27 +294,43 @@ def train_model(model, opt):
 
             with torch.autocast(device_type=opt.device.type, dtype=torch.bfloat16):
                 loss = batch_loss(model, inX, out, opt, seg=seg)
+            timer.mark('fwd')
 
             epoch_loss += loss.detach() * out.numel()
             epoch_tokens += out.numel()
+            tokens_seen += out.numel() * dist.world_size()
 
             (loss / grad_accum).backward()
+            timer.mark('bwd')
             micro += 1
             if micro % grad_accum != 0:
                 continue
 
             dist.average_grads(model.parameters())
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
+            timer.mark('reduce')
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=opt.norm)
             for o in opt.optimizers:
                 o.step()
                 o.zero_grad()
-
-            if iter % opt.printevery == 0:
-                current_pplx = math.exp(loss.item())
-                dist.printr(f"Epoch {epoch+1} | iter {iter} | step {step} | Loss: {loss.item():.4f} | pplx: {current_pplx:.2f}")
-                train_curve.append((step, loss.item()))
-
+            timer.mark('optim')
             step += 1
+
+            if step % opt.printevery == 0:
+                phases = timer.drain()
+                window = sum(phases.values()) / 1000
+                rate = (tokens_seen - logged_tokens) / window if window else 0
+                logged_tokens = tokens_seen
+                memory = peak_memory_gib(opt.device)
+                dist.printr(
+                    f"step {step}/{opt.total_steps} | loss {loss.item():.4f} | "
+                    f"pplx {math.exp(loss.item()):.2f} | "
+                    f"lr {opt.optimizers[0].param_groups[0]['lr']:.2e} | "
+                    f"gnorm {grad_norm.item():.2f} | {rate:,.0f} tok/s | "
+                    f"{window * 1000 / opt.printevery:.0f} ms/step | "
+                    f"{format_phases(phases, opt.printevery)}"
+                    + (f" | {memory:.1f} GiB" if memory else "")
+                    + f" | {tokens_seen / 1e9:.3f}B seen")
+                train_curve.append((step, loss.item()))
             if opt.save_every and step % opt.save_every == 0:
                 path = _checkpoint_path(opt, f'step{step}')
                 save_checkpoint(model, opt.optimizers, step, path, config=opt.model_config)
