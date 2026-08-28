@@ -217,3 +217,17 @@ def test_destroy_by_id_rejects_unverified_provisional_match(monkeypatch, instanc
         lifecycle.destroy(SimpleNamespace(id=instance_id))
     assert not any(call[0] == "DELETE" for call in api.calls)
     assert not cleared
+
+
+def test_bootstrap_installs_drivers_only_when_nvidia_smi_is_missing(monkeypatch):
+    """Bare metal deploys plain Ubuntu 24.04 — there is no GPU-enabled image
+    in /os, and no CUDA marketplace app — so drivers may not be present."""
+    captured = []
+    monkeypatch.setattr(lifecycle, "run_remote",
+                        lambda state, command: captured.append(command))
+    lifecycle.bootstrap({"ssh_host": "h", "ssh_private_key": "k"})
+    command = captured[0]
+    assert "nvidia-smi >/dev/null 2>&1 ||" in command
+    assert "ubuntu-drivers install --gpgpu" in command
+    # the driver step must precede the CUDA assertion it exists to satisfy
+    assert command.index("ubuntu-drivers") < command.index("torch.cuda.is_available")

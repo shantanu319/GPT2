@@ -13,7 +13,7 @@ from vultr.remote import (
 )
 
 
-GPU_OS_ID = 2284
+GPU_OS_ID = 2284  # plain Ubuntu 24.04; /os has no GPU-enabled variant
 # Bare metal racks and boots real hardware, so it takes far longer than a VM.
 METAL_READY_TIMEOUT = 45 * 60
 DEFAULT_PUBLIC_KEY = "~/.ssh/id_ed25519.pub"
@@ -42,12 +42,23 @@ def print_plans(args):
           "the preemptible one")
 
 
+# Cloud GPU images ship with drivers; bare metal deploys plain Ubuntu, where
+# nvidia-smi may be absent. A no-op when it is already there.
+ENSURE_DRIVERS = (
+    "(nvidia-smi >/dev/null 2>&1 || ("
+    "echo 'no nvidia-smi — installing drivers' && "
+    "apt-get install -y -qq ubuntu-drivers-common && "
+    "ubuntu-drivers install --gpgpu && modprobe nvidia)) && "
+)
+
+
 def bootstrap(state):
     print("bootstrapping Python environment...")
     run_remote(
         state,
         "cloud-init status --wait && export DEBIAN_FRONTEND=noninteractive && "
         "apt-get update -qq && apt-get install -y -qq python3-venv rsync && "
+        + ENSURE_DRIVERS +
         "python3 -m venv /opt/myowntransformer && "
         "/opt/myowntransformer/bin/pip install -q --upgrade pip && "
         "/opt/myowntransformer/bin/pip install -q torch==2.11.0 datasets matplotlib && "
