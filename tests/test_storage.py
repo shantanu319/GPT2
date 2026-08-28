@@ -292,3 +292,33 @@ def test_download_honours_the_shard_cap(monkeypatch, tmp_path):
     storage.down(_env_args(data_dir=str(tmp_path / "out"), max_shards=2))
     got = sorted(os.path.basename(p) for p in os.listdir(tmp_path / "out"))
     assert got == ["tokenizer.json", "train_00000.bin", "train_00001.bin"]
+
+
+def test_prep_sizes_the_box_by_how_long_the_job_is():
+    """Cheapest-$/hr alone picked 6 cores and 14.5h for a 40B prep, when the
+    32-core plan costs the same total and finishes in 2.7h."""
+    from vultr.prep import required_vcpu
+    assert required_vcpu(20_000) == 1            # the smoke box is unchanged
+    assert required_vcpu(31_000_000) == 29       # -> cheapest >=29-core plan
+    assert required_vcpu(31_000_000, target_hours=6) == 15
+
+
+def test_prep_passes_a_core_floor_to_provisioning(monkeypatch):
+    """The floor is useless if prep never sets it."""
+    from vultr import prep as prep_mod
+    seen = {}
+
+    def fake_provision(args, bootstrap_instance=False):
+        seen.update(min_vcpu=args.min_vcpu, min_disk=args.min_disk)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(prep_mod, "client_from_env", lambda: None)
+    monkeypatch.setattr(prep_mod, "ensure_subscription",
+                        lambda *a, **k: {"region": "ams", "s3_hostname": "h",
+                                         "s3_access_key": "AK", "s3_secret_key": "SK"})
+    monkeypatch.setattr(prep_mod, "provision", fake_provision)
+    args = SimpleNamespace(max_train_docs=31_000_000, disk=0, vcpu=0, keep=False,
+                           region=None, label_storage="mot", prefix="c")
+    with pytest.raises(RuntimeError, match="stop here"):
+        prep_mod.prep(args)
+    assert seen == {"min_vcpu": 29, "min_disk": 296}

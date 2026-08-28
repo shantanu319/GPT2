@@ -87,6 +87,8 @@ def main():
     command.add_argument("--shard-tokens", type=int, default=500_000_000)
     command.add_argument("--disk", type=int, default=0,
                          help="GB floor for the prep box; derived from doc count by default")
+    command.add_argument("--vcpu", type=int, default=0,
+                         help="core floor for the prep box; derived from doc count by default")
     command.add_argument("--workers", type=int, default=8)
     command.add_argument("--tokenizer", default="data_cache/cosmopedia/tokenizer.json",
                          help="reuse this tokenizer; pass '' to train a fresh one "

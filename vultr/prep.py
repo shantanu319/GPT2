@@ -5,6 +5,7 @@ paying $11.92/hr to wait on HuggingFace — and paying again after a preemption.
 This provisions a small instance in the bucket's own region, runs prepare,
 uploads the shards, and destroys the box in a finally.
 """
+import math
 import os
 import time
 
@@ -18,6 +19,7 @@ from vultr.storage import ensure_subscription
 BYTES_PER_TOKEN_CACHED = 3.3
 BYTES_PER_TOKEN_BIN = 2
 TOKENS_PER_DOC = 1290   # measured: 25.8M tokens from 20k docs
+TOKENS_PER_CORE_SEC = 128_000   # measured: 25.8M tokens in 202s on one vCPU
 
 
 def required_disk_gb(max_train_docs, headroom=1.4):
@@ -27,6 +29,17 @@ def required_disk_gb(max_train_docs, headroom=1.4):
     tokens = max_train_docs * TOKENS_PER_DOC
     total = tokens * (BYTES_PER_TOKEN_CACHED + BYTES_PER_TOKEN_BIN)
     return max(30, int(total / 1e9 * headroom))
+
+
+def required_vcpu(max_train_docs, target_hours=3):
+    """Cores needed to finish in target_hours.
+
+    Prep is core-hours bound, but the selector minimises $/hr with floors only
+    on RAM and disk — which alone picks the slowest box that fits, and Vultr
+    prices these linearly per core, so the wall-clock saving is free.
+    """
+    core_seconds = max_train_docs * TOKENS_PER_DOC / TOKENS_PER_CORE_SEC
+    return max(1, math.ceil(core_seconds / (target_hours * 3600)))
 
 
 def _bootstrap(state):
@@ -118,7 +131,9 @@ def prep(args):
 
     # provision does the selecting; it just needs the floors this job requires.
     args.region, args.compute, args.metal = region, True, False
+    cores = args.vcpu or required_vcpu(args.max_train_docs)
     args.min_ram, args.min_disk, args.label = 2048, disk, "mot-prep"
+    args.min_vcpu = cores
     started = time.time()
     state = None
     try:
