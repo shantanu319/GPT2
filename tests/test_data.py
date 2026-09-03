@@ -68,6 +68,14 @@ def test_data_feeder_shuffle_same_seed_same_order():
     assert all(torch.equal(xa, xb) and torch.equal(ya, yb) for (xa, ya), (xb, yb) in zip(a, b))
 
 
+def test_data_feeder_skip_rejoins_the_same_order():
+    data = list(range(24 * 8))
+    full = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=7))
+    rest = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=7, skip=5))
+    assert len(rest) == len(full) - 5
+    assert all(torch.equal(xa, xb) for (xa, _), (xb, _) in zip(full[5:], rest))
+
+
 def test_data_feeder_shuffle_different_seed_different_order():
     data = list(range(24 * 8))
     a = list(data_feeder(data, 2, 8, torch.device("cpu"), shuffle=True, seed=1))

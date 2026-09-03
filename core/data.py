@@ -192,17 +192,19 @@ def data_feeder_masked(data, mask, batch_size, seq_len, device, eos_id=None,
 
 
 def data_feeder(data, batch_size, seq_len, device, shuffle=False, seed=42, eos_id=None,
-                rank=0, world=1):
+                rank=0, world=1, skip=0):
     """Yields (inputs, targets) windows of (batch_size, seq_len), shifted by one.
 
     shuffle=True serves the windows in a seeded-permuted order for the pass
     (reproducible given the same seed). On CUDA, H2D copies go through pinned
     staging buffers with a 1-batch lookahead so transfer overlaps compute.
     When eos_id is given, also yields per-token segment ids aligned with the
-    inputs (documents end at EOS; see segment_ids_np)."""
+    inputs (documents end at EOS; see segment_ids_np). skip drops this rank's
+    first `skip` batches of the pass, so a resumed run rejoins the same order
+    mid-epoch."""
     total = len(data)
     num_sequences = total // seq_len
-    order = _window_order(num_sequences, batch_size, shuffle, seed, rank, world)
+    order = _window_order(num_sequences, batch_size, shuffle, seed, rank, world)[skip:]
     if not order:
         return
 
