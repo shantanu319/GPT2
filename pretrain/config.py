@@ -1,7 +1,7 @@
 import argparse
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument('-no_cuda', action='store_true',
                         help='Force CPU even if CUDA or MPS is available')
@@ -69,6 +69,9 @@ def parse_args():
     parser.add_argument('-threshold', type=int, default=3)
     parser.add_argument('-savename', type=str)
     parser.add_argument('-loadname', type=str)
+    parser.add_argument('-resume', type=str,
+                        help='Checkpoint to continue: restores weights, optimizer state, '
+                             'step and data position (-loadname restores weights only)')
     parser.add_argument('-save_every', type=int, default=500,
                         help='Save a checkpoint every N training steps (0 disables periodic saves)')
     parser.add_argument('-val_every', type=int, default=0,
@@ -88,5 +91,5 @@ def parse_args():
     parser.add_argument('-data_dir', type=str, default='data_cache/cosmopedia',
                         help='Directory with tokenizer.json + train.bin + val.bin (run prepare.py)')
 
-    opt, unknown = parser.parse_known_args()
+    opt, unknown = parser.parse_known_args(argv)
     return opt

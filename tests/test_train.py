@@ -226,3 +226,48 @@ def test_chunked_cross_entropy_applies_the_lm_head_bias():
     fused.backward()
     assert model.out.bias.grad is not None
     assert model.out.bias.grad.abs().sum() > 0
+
+
+def _tiny_run(tmp_path, save_every=0, resume=None, restore=True):
+    """train_model on a fixed 8-step corpus, set up the way main() does it.
+    Returns (model, train_curve)."""
+    import numpy as np
+    from core.model import get_model
+    from pretrain.config import parse_args
+    from pretrain.train import make_optimizers, restore_optimizers, train_model
+    torch.manual_seed(0)
+    opt = parse_args([])
+    opt.device = torch.device('cpu')
+    opt.d_model, opt.n_layers, opt.heads, opt.kv_heads = 32, 2, 4, 2
+    opt.batchsize, opt.seqlen, opt.epochs = 2, 16, 2
+    opt.warmup_steps, opt.momentum_warmup, opt.printevery = 2, 3, 1
+    opt.save_every, opt.val_every = save_every, 0
+    opt.vocab_size, opt.eos_id, opt.model_config = 64, None, None
+    opt.dir_name, opt.savename = str(tmp_path), 'ckpt'
+    opt.loadname = resume
+    rng = np.random.default_rng(0)
+    opt.train = rng.integers(0, 64, 2 * 16 * 4, dtype=np.uint16)   # 4 batches/epoch
+    opt.valid = rng.integers(0, 64, 2 * 16 * 2, dtype=np.uint16)
+    opt.batches_per_epoch = len(opt.train) // (opt.batchsize * opt.seqlen)
+    opt.total_steps = opt.epochs * opt.batches_per_epoch
+    model = get_model(opt, opt.vocab_size)
+    opt.optimizers = make_optimizers(model, muon_lr=0.01, embed_lr=1e-3, scalar_lr=1e-3)
+    opt.start_step = restore_optimizers(opt.optimizers, resume) if (resume and restore) else 0
+    train_curve, _ = train_model(model, opt)
+    return model, train_curve
+
+
+def test_resume_reproduces_the_uninterrupted_run(tmp_path):
+    """Step 3 of 8 is mid-epoch: the resumed run must land on the same
+    weights as the run that never stopped, which needs the optimizer state,
+    the step, and the data position all restored."""
+    import os
+    straight, _ = _tiny_run(tmp_path / 'a', save_every=3)
+    ckpt = os.path.join(str(tmp_path / 'a'), 'ckpt_step3.pt')
+    resumed, curve = _tiny_run(tmp_path / 'b', resume=ckpt)
+    assert curve[0][0] == 4, "the first logged step continues the count"
+    assert all(torch.equal(a, b) for a, b in
+               zip(straight.state_dict().values(), resumed.state_dict().values()))
+    weights_only, _ = _tiny_run(tmp_path / 'c', resume=ckpt, restore=False)
+    assert not all(torch.equal(a, b) for a, b in
+                   zip(straight.state_dict().values(), weights_only.state_dict().values()))

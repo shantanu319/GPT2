@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from core.chat_format import EOS_TOKEN
 from core.data import bin_exists, data_feeder, load_bin
 from core import dist
-from core.model import LOGIT_SOFTCAP, get_model, nopeak_mask
+from core.model import LOGIT_SOFTCAP, get_model, load_checkpoint, nopeak_mask
 from core.tokenizer import BPETokenizer
 from pretrain.config import parse_args
 from pretrain.fused_ce import chunked_cross_entropy
@@ -153,6 +153,19 @@ def save_checkpoint(model, optimizers, step, path, config=None, extra=None):
     }, path)
 
 
+def restore_optimizers(optimizers, path):
+    """Load the optimizer state a checkpoint saved; returns the step it was
+    saved at. The run's own peak LRs are kept, so a resumed run can still
+    change its LR flags."""
+    ckpt = load_checkpoint(path)
+    for optimizer, state in zip(optimizers, ckpt['optimizers']):
+        peaks = [group['peak_lr'] for group in optimizer.param_groups]
+        optimizer.load_state_dict(state)
+        for group, peak in zip(optimizer.param_groups, peaks):
+            group['peak_lr'] = peak
+    return ckpt['step']
+
+
 def _checkpoint_path(opt, tag):
     base = opt.savename or 'ckpt'
     return os.path.join(opt.dir_name, f'{base}_{tag}.pt')
@@ -248,12 +261,12 @@ def train_model(model, opt):
         val_every = 1000
         print("early stop needs periodic validation — defaulting -val_every to 1000")
 
-    step = 0
-    micro = 0
+    step = getattr(opt, 'start_step', 0)
+    micro = step * grad_accum
     stop_training = False
     timer = PhaseTimer(opt.device)
-    tokens_seen = 0
-    logged_tokens = 0
+    tokens_seen = micro * opt.batchsize * (opt.seqlen - 1) * dist.world_size()
+    logged_tokens = tokens_seen
 
     def eval_and_check(max_batches):
         nonlocal stop_training
@@ -272,7 +285,9 @@ def train_model(model, opt):
                       f"evals (best {stopper.best:.4f})")
                 stop_training = True
         return val_loss
-    for epoch in range(opt.epochs):
+    # A resumed run rejoins its epoch mid-pass, past the batches it consumed.
+    first_epoch, skip = divmod(micro, opt.batches_per_epoch)
+    for epoch in range(first_epoch, opt.epochs):
         epoch_loss = torch.zeros((), device=opt.device)
         epoch_tokens = 0
         iter = 0
@@ -282,7 +297,7 @@ def train_model(model, opt):
 
         for inX, out, *rest in _feeder(opt, opt.train,
                                        shuffle=bool(getattr(opt, 'shuffle', 0)),
-                                       seed=42 + epoch):
+                                       seed=42 + epoch, skip=skip):
             timer.mark('data')
             seg = rest[0] if rest else None
             iter += 1
@@ -340,6 +355,7 @@ def train_model(model, opt):
                 if stop_training:
                     break
 
+        skip = 0
         loss_sum, tok_sum = dist.sum_across(
             [epoch_loss.item(), epoch_tokens], opt.device)
         train_loss = loss_sum / tok_sum
@@ -481,6 +497,8 @@ def main():
     opt.valid = load_bin(val_bin)
     opt.test = load_bin(test_bin)
 
+    if opt.resume:
+        opt.loadname = opt.resume   # the weights come from the same checkpoint
     model = get_model(opt, opt.vocab_size)
 
     if opt.device.type == 'cuda' and not opt.no_compile:
@@ -516,9 +534,12 @@ def main():
                                      scalar_lr=opt.scalar_lr,
                                      muon_impl=opt.muon_impl,
                                      muon_per_head=bool(getattr(opt, 'muon_per_head', 0)))
-    batches_per_epoch = max(1, len(opt.train)
-                            // (opt.batchsize * opt.seqlen * dist.world_size()))
-    opt.total_steps = max(1, opt.epochs * batches_per_epoch // max(1, opt.grad_accum))
+    opt.batches_per_epoch = max(1, len(opt.train)
+                                // (opt.batchsize * opt.seqlen * dist.world_size()))
+    opt.total_steps = max(1, opt.epochs * opt.batches_per_epoch // max(1, opt.grad_accum))
+    opt.start_step = restore_optimizers(opt.optimizers, opt.resume) if opt.resume else 0
+    if opt.resume:
+        dist.printr(f'resuming {opt.resume} at step {opt.start_step}/{opt.total_steps}')
 
     train_curve, val_curve = train_model(model, opt)
     test_loss = test_model(model, opt, -1)
