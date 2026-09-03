@@ -3,6 +3,8 @@
 The corpus is a weighted interleave of several HuggingFace streams (see SOURCES):
 real educational web (fineweb-edu-dedup, DCLM-baseline), synthetic textbooks
 (cosmopedia-v2), educational Python code (codeparrot-clean) and math (FineMath-4+).
+--mix anneal builds the decay-phase corpus instead (ANNEAL_SOURCES), for
+train.py's -anneal_dir.
 
 Run once to produce:
   {output_dir}/tokenizer.json
@@ -67,6 +69,20 @@ SOURCES = [
     Source('code-python', 'codeparrot/codeparrot-clean',    None,                0.10, _render_content),
     Source('finemath',    'HuggingFaceTB/finemath',         'finemath-4plus',    0.05, _render_text),
 ]
+
+# Decay-phase mixture (SmolLM2 stage 4, arXiv:2502.02737): a thinner web
+# backbone with math, code and synthetic textbooks tilted up. OpenMathInstruct-2
+# (arXiv:2410.01560) adds solved word problems, the TinyGSM lever at 100M scale.
+ANNEAL_SOURCES = [
+    Source('fineweb-edu', 'HuggingFaceTB/smollm-corpus',    'fineweb-edu-dedup', 0.25, _render_text),
+    Source('dclm',        'mlfoundations/dclm-baseline-1.0', None,               0.15, _render_text),
+    Source('cosmopedia',  'HuggingFaceTB/smollm-corpus',    'cosmopedia-v2',     0.15, _render_text),
+    Source('code-python', 'codeparrot/codeparrot-clean',    None,                0.15, _render_content),
+    Source('finemath',    'HuggingFaceTB/finemath',         'finemath-4plus',    0.15, _render_text),
+    Source('openmath',    'nvidia/OpenMathInstruct-2',      None,                0.15, _render_problem_solution),
+]
+
+MIXES = {'pretrain': SOURCES, 'anneal': ANNEAL_SOURCES}
 
 # Worker-process state, populated once per worker by _init_worker.
 _WORKER_TOKENIZER = None
@@ -398,7 +414,11 @@ def main():
                         help='Seed for the weighted source interleave')
     parser.add_argument('--shard-tokens', type=int, default=SHARD_TOKENS,
                         help='Tokens per train shard; each sealed shard is a resume point')
+    parser.add_argument('--mix', choices=sorted(MIXES), default='pretrain',
+                        help='Source mixture: the pretraining corpus, or the anneal '
+                             'corpus train.py serves through the WSD decay')
     args = parser.parse_args()
+    sources = MIXES[args.mix]
 
     assert args.vocab_size > 256, "vocab_size must leave room for base bytes"
     assert np.iinfo(BIN_DTYPE).max >= args.vocab_size - 1, \
@@ -412,8 +432,8 @@ def main():
     specials = special_token_map(args.vocab_size)
     eos_id = specials[EOS_TOKEN]
 
-    mix_desc = ', '.join(f"{s.name}={s.weight:.0%}" for s in SOURCES)
-    print(f"Mixture: {mix_desc}")
+    mix_desc = ', '.join(f"{s.name}={s.weight:.0%}" for s in sources)
+    print(f"Mixture ({args.mix}): {mix_desc}")
 
     if args.max_train_docs is not None:
         # Fast path: parallel per-source fetch, then local interleave (same
@@ -421,15 +441,15 @@ def main():
         cache_dir = os.path.join(args.output_dir, 'fetch_cache')
         print(f"Fetching up to {args.max_train_docs:,} docs "
               f"(per-source parallel streams)...")
-        fetch_paths = fetch_all(SOURCES, args.max_train_docs, cache_dir,
-                                workers=min(len(SOURCES), num_workers))
+        fetch_paths = fetch_all(sources, args.max_train_docs, cache_dir,
+                                workers=min(len(sources), num_workers))
 
         def make_stream():
-            return local_mixed_stream(fetch_paths, SOURCES, seed=args.seed,
+            return local_mixed_stream(fetch_paths, sources, seed=args.seed,
                                       max_docs=args.max_train_docs)
     else:
         def make_stream():
-            return mixed_stream(seed=args.seed)
+            return mixed_stream(sources, seed=args.seed)
 
     tok_path = os.path.join(args.output_dir, 'tokenizer.json')
     if os.path.exists(tok_path):

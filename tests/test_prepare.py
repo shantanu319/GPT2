@@ -157,9 +157,24 @@ def test_local_fast_path_matches_serial(monkeypatch, tmp_path):
     assert capped == serial[:100]
 
 
-def test_default_sources_weights_sum_to_one():
+def test_every_mix_sums_to_one_and_names_each_source_once():
     import pretrain.prepare as prepare
-    assert abs(sum(s.weight for s in prepare.SOURCES) - 1.0) < 1e-9
+    assert set(prepare.MIXES) == {'pretrain', 'anneal'}
+    for name, sources in prepare.MIXES.items():
+        assert abs(sum(s.weight for s in sources) - 1.0) < 1e-9, name
+        assert len({s.name for s in sources}) == len(sources), name
+        assert all(callable(s.render) for s in sources), name
+
+
+def test_anneal_mix_tilts_toward_math_and_code():
+    """The decay-phase corpus is the whole point of -anneal_dir: less web,
+    more of what SmolLM2 found pays off late in the schedule."""
+    import pretrain.prepare as prepare
+    weight = lambda sources, *names: sum(s.weight for s in sources if s.name in names)
+    web = ('fineweb-edu', 'dclm')
+    assert weight(prepare.ANNEAL_SOURCES, *web) < weight(prepare.SOURCES, *web)
+    assert weight(prepare.ANNEAL_SOURCES, 'finemath', 'openmath', 'code-python') > \
+        weight(prepare.SOURCES, 'finemath', 'openmath', 'code-python')
 
 
 def _kill_after_last_shard(tmp_path):
