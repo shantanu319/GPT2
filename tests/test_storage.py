@@ -433,3 +433,13 @@ def test_detached_probe_exits_zero_once_the_run_is_over():
     unsafe = f"pgrep -f '{absent}' > /dev/null && echo __RUNNING__"
     assert subprocess.run(["bash", "-c", safe], capture_output=True).returncode == 0
     assert subprocess.run(["bash", "-c", unsafe], capture_output=True).returncode != 0
+
+
+def test_prep_can_build_the_anneal_mix():
+    from types import SimpleNamespace as NS
+    from vultr.prep import build_script
+    sub = {"s3_hostname": "h", "s3_access_key": "AK", "s3_secret_key": "SK"}
+    base = dict(prefix="anneal-6b", max_train_docs=5_000_000, shard_tokens=500_000_000,
+                workers=8)
+    assert "--mix anneal" in build_script(NS(**base, mix="anneal"), sub)
+    assert "--mix pretrain" in build_script(NS(**base), sub)

@@ -59,6 +59,9 @@ def main():
     command.add_argument("--corpus-shards", type=int, default=0,
                          help="pull only the first N train shards; the LR schedule "
                               "anneals to whatever lands (0 = the whole corpus)")
+    command.add_argument("--anneal-prefix", default="",
+                         help="prepared corpus (prep --mix anneal) served through the "
+                              "WSD decay phase instead of the main one")
     command.add_argument("--gpus", default="auto",
                          help="ranks to launch; 'auto' counts the box's GPUs")
     command.add_argument("--sft-epochs", type=int, default=1)
@@ -86,6 +89,9 @@ def main():
                          help="pretrain tokenizes the corpus; post builds the "
                               "sft/dpo artifacts into the same prefix")
     command.add_argument("--prefix", default="corpus")
+    command.add_argument("--mix", choices=("pretrain", "anneal"), default="pretrain",
+                         help="anneal builds the decay-phase corpus: give it its own "
+                              "--prefix and a smaller --max-train-docs")
     command.add_argument("--label-storage", default="myowntransformer")
     command.add_argument("--shard-tokens", type=int, default=500_000_000)
     command.add_argument("--disk", type=int, default=0,

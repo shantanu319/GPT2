@@ -10,9 +10,10 @@ S3_VARS = ("VULTR_S3_HOSTNAME", "VULTR_S3_ACCESS_KEY", "VULTR_S3_SECRET_KEY")
 
 # Every pretrain.train knob the pipeline forwards, as (flag, type, default).
 # Defaults track pretrain/config.py except where a cluster run differs: the
-# validated architecture opt-ins are on (-kda 4 is the Kimi 3:1 hybrid, -swa
-# pairs with it so no layer keeps an O(T^2) term, -muon_per_head follows Kimi
-# K3), and the schedule is sized for one pass over a large corpus.
+# stack is dense (the KDA hybrid measured ~half the throughput of dense on an
+# A100 and has never been trained at scale here), -muon_per_head follows Kimi
+# K3, the schedule is sized for one pass over a large corpus with SmolLM2's
+# 20% decay, and checkpoints land often enough that a preemption is cheap.
 TRAIN_FLAGS = [
     ("d_model", int, 512),
     ("n_layers", int, 30),
@@ -24,8 +25,8 @@ TRAIN_FLAGS = [
     ("value_residual", int, 1),
     ("unet_skips", int, 1),
     ("attn_res", int, 0),
-    ("kda", int, 4),
-    ("swa", int, 1024),
+    ("kda", int, 0),
+    ("swa", int, 0),
     ("batchsize", int, 128),
     ("seqlen", int, 1024),
     ("grad_accum", int, 1),
@@ -37,7 +38,7 @@ TRAIN_FLAGS = [
     ("muon_impl", str, "local"),
     ("muon_per_head", int, 1),
     ("schedule", str, "wsd"),
-    ("decay_frac", float, 0.25),
+    ("decay_frac", float, 0.2),
     ("momentum_warmup", int, 300),
     ("norm", float, 2.0),
     ("shuffle", int, 1),
@@ -45,7 +46,7 @@ TRAIN_FLAGS = [
     ("ce_chunk", int, 16384),
     ("epochs", int, 1),
     ("warmup_steps", int, 1000),
-    ("save_every", int, 4000),
+    ("save_every", int, 2000),
     ("val_every", int, 2000),
     ("val_batches", int, 50),
     ("early_stop", int, 0),
@@ -80,18 +81,28 @@ def build_pipeline(args):
     # Pulling a prepared corpus beats rebuilding it: prep is download-bound,
     # and this box bills by the hour. Falls through to prepare if nothing lands.
     prefix = getattr(args, "corpus_prefix", "") or ""
+    anneal = getattr(args, "anneal_prefix", "") or ""
+    exports = "\n".join(f"export {name}={quote(os.environ.get(name, ''))}"
+                         for name in S3_VARS) if prefix or anneal else ""
     fetch = ""
     if prefix:
-        exports = "\n".join(f"export {name}={quote(os.environ.get(name, ''))}"
-                             for name in S3_VARS)
         cap = getattr(args, "corpus_shards", 0)
-        fetch = f'''{exports}
-if ! prepared; then
+        fetch = f'''if ! prepared "$DATA"; then
   step "fetch corpus from object storage"
   "$PY" -m vultr.storage down --from-env --prefix {quote(prefix)} \\
     --max-shards {cap} \\
     --data-dir "$DATA" || step "no corpus in storage; will tokenize instead"
 fi'''
+    anneal_fetch = anneal_flag = ""
+    if anneal:
+        # The decay-phase corpus is only ever fetched: tokenizing it here would
+        # bill the GPU box for a CPU job, so a missing one stops the run.
+        anneal_fetch = f'''ANNEAL=data_cache/{quote(anneal)}
+if ! prepared "$ANNEAL"; then
+  step "fetch anneal corpus from object storage"
+  "$PY" -m vultr.storage down --from-env --prefix {quote(anneal)} --data-dir "$ANNEAL"
+fi'''
+        anneal_flag = '-anneal_dir "$ANNEAL"'
     prepare_args = f"--max-train-docs {args.max_train_docs}" if args.max_train_docs else ""
     train_args = train_flag_string(args)
     gpus = str(getattr(args, "gpus", "auto"))
@@ -119,20 +130,21 @@ else
 fi
 step "launching on $GPUS GPU(s)"
 
-prepared() {{ "$PY" -c "import json,sys;sys.exit(0 if json.load(open('$DATA/train_manifest.json')).get('complete') else 1)" 2>/dev/null; }}
+prepared() {{ "$PY" -c "import json,sys;sys.exit(0 if json.load(open('$1/train_manifest.json')).get('complete') else 1)" 2>/dev/null; }}
+{exports}
 {fetch}
-if ! prepared; then
+if ! prepared "$DATA"; then
   step prepare
   "$PY" -m pretrain.prepare --output-dir "$DATA" {prepare_args}
 fi
-
+{anneal_fetch}
 if [[ ! -f "saved/$DIR/ckpt_final.pt" ]]; then
   latest=$(ls "saved/$DIR"/ckpt_step*.pt 2>/dev/null | sort -V | tail -1 || true)
   resume=()
-  [[ -n "$latest" ]] && resume=(-loadname "$latest")
+  [[ -n "$latest" ]] && resume=(-resume "$latest")
   step pretrain
   "${{LAUNCH[@]}}" -m pretrain.train -data_dir "$DATA" -dir_name "$DIR" \
-    {train_args} "${{resume[@]}}"
+    {train_args} {anneal_flag} "${{resume[@]}}"
 fi
 
 if [[ ! -f "$DATA/sft_train.bin" ]]; then

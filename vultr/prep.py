@@ -75,8 +75,8 @@ def _pretrain_body(args, quote):
   --prefix {quote(args.prefix)} --workers {args.workers} &
 UPLOADER=$!
 
-step "tokenizing up to {args.max_train_docs} docs"
-{PYTHON} -m pretrain.prepare --output-dir "$DATA" \
+step "tokenizing up to {args.max_train_docs} docs ({getattr(args, 'mix', 'pretrain')} mix)"
+{PYTHON} -m pretrain.prepare --output-dir "$DATA" --mix {getattr(args, 'mix', 'pretrain')} \
   --max-train-docs {args.max_train_docs} --shard-tokens {args.shard_tokens}
 
 step "shards on disk"

@@ -32,7 +32,7 @@ def smoke_args(tmp_path, keep=False):
 
 def test_pipeline_is_resumable_across_all_training_stages():
     script = build_pipeline(pipeline_args())
-    assert "if ! prepared; then" in script
+    assert 'if ! prepared "$DATA"; then' in script
     assert '[[ ! -f "saved/$DIR/ckpt_final.pt" ]]' in script
     assert '[[ ! -f "$DATA/sft_train.bin" ]]' in script
     assert '[[ ! -f "saved/$SFT/sft_final.pt" ]]' in script
@@ -158,11 +158,40 @@ def test_pipeline_forwards_every_declared_train_flag():
         assert f"-{name} " in script, f"{name} never reaches pretrain.train"
 
 
-def test_pipeline_defaults_enable_the_validated_arch_opt_ins():
+def test_pipeline_defaults_to_the_dense_stack():
     script = build_pipeline(pipeline_args())
-    assert "-kda 4" in script
-    assert "-swa 1024" in script
+    assert "-kda 0" in script and "-swa 0" in script
     assert "-muon_per_head 1" in script
+    assert "-decay_frac 0.2" in script
+    assert dict((n, d) for n, _k, d in TRAIN_FLAGS)["save_every"] == 2000
+
+
+def test_pipeline_resumes_the_latest_step_checkpoint_in_full():
+    """-loadname restores weights only; a preempted run needs its step,
+    optimizer state and data position back."""
+    script = build_pipeline(pipeline_args())
+    assert 'resume=(-resume "$latest")' in script
+    assert "-loadname" not in script
+
+
+def test_pipeline_fetches_the_anneal_corpus_and_points_train_at_it():
+    script = build_pipeline(pipeline_args(corpus_prefix="corpus-40b",
+                                          anneal_prefix="anneal-6b"))
+    assert "--prefix anneal-6b --data-dir \"$ANNEAL\"" in script
+    assert '-anneal_dir "$ANNEAL"' in script
+    assert script.index("-anneal_dir") > script.index("--prefix anneal-6b")
+    plain = build_pipeline(pipeline_args(corpus_prefix="corpus-40b"))
+    assert "-anneal_dir" not in plain and "ANNEAL" not in plain
+
+
+def test_anneal_corpus_is_never_tokenized_on_the_gpu_box(monkeypatch):
+    """A missing anneal corpus must fail the run, not fall through to prepare."""
+    from vultr.pipeline import S3_VARS
+    monkeypatch.setenv(S3_VARS[0], "set")
+    script = build_pipeline(pipeline_args(anneal_prefix="anneal-6b"))
+    line = next(l for l in script.splitlines() if "--prefix anneal-6b" in l)
+    assert "||" not in line
+    assert f"export {S3_VARS[0]}=set" in script
 
 
 def test_pipeline_arch_flags_are_overridable():
@@ -265,7 +294,7 @@ def test_pipeline_fetches_a_prepared_corpus_before_deciding_to_tokenize():
     prepare = script.index("step prepare")
     assert fetch < prepare, "the fetch must run before prepare is considered"
     # and prepare is still gated, so a successful fetch skips tokenizing
-    assert script.count("if ! prepared; then") == 2
+    assert script.count('if ! prepared "$DATA"; then') == 2
 
 
 def test_corpus_fetch_falls_through_to_tokenizing_when_storage_is_empty():
