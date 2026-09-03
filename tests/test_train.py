@@ -228,7 +228,7 @@ def test_chunked_cross_entropy_applies_the_lm_head_bias():
     assert model.out.bias.grad.abs().sum() > 0
 
 
-def _tiny_run(tmp_path, save_every=0, resume=None, restore=True):
+def _tiny_run(tmp_path, save_every=0, resume=None, restore=True, anneal=False):
     """train_model on a fixed 8-step corpus, set up the way main() does it.
     Returns (model, train_curve)."""
     import numpy as np
@@ -248,6 +248,10 @@ def _tiny_run(tmp_path, save_every=0, resume=None, restore=True):
     rng = np.random.default_rng(0)
     opt.train = rng.integers(0, 64, 2 * 16 * 4, dtype=np.uint16)   # 4 batches/epoch
     opt.valid = rng.integers(0, 64, 2 * 16 * 2, dtype=np.uint16)
+    opt.anneal = None
+    if anneal:   # decay, and so the anneal corpus, from step 2 of 8
+        opt.decay_frac = 0.75
+        opt.anneal = rng.integers(0, 64, 2 * 16 * 3, dtype=np.uint16)
     opt.batches_per_epoch = len(opt.train) // (opt.batchsize * opt.seqlen)
     opt.total_steps = opt.epochs * opt.batches_per_epoch
     model = get_model(opt, opt.vocab_size)
@@ -271,3 +275,62 @@ def test_resume_reproduces_the_uninterrupted_run(tmp_path):
     weights_only, _ = _tiny_run(tmp_path / 'c', resume=ckpt, restore=False)
     assert not all(torch.equal(a, b) for a, b in
                    zip(straight.state_dict().values(), weights_only.state_dict().values()))
+
+
+def test_resume_reproduces_the_uninterrupted_run_with_an_anneal_corpus(tmp_path):
+    """Resumed at step 3 with the decay phase already one batch into the
+    anneal corpus, so the anneal feeder has to rejoin its own order too."""
+    import os
+    straight, _ = _tiny_run(tmp_path / 'a', save_every=3, anneal=True)
+    ckpt = os.path.join(str(tmp_path / 'a'), 'ckpt_step3.pt')
+    resumed, _ = _tiny_run(tmp_path / 'b', resume=ckpt, anneal=True)
+    assert all(torch.equal(a, b) for a, b in
+               zip(straight.state_dict().values(), resumed.state_dict().values()))
+
+
+def test_decay_start_is_shared_by_the_schedule():
+    from pretrain.train import decay_start
+    start = decay_start(1000, 0.25)
+    assert start == 750
+    assert lr_factor(749, 1000, warmup_steps=1, decay_frac=0.25) == 1.0
+    assert lr_factor(751, 1000, warmup_steps=1, decay_frac=0.25) < 1.0
+
+
+def _batch_opt(main_token, anneal_token, decay_frac=0.5, grad_accum=1):
+    import numpy as np
+    from types import SimpleNamespace
+    opt = SimpleNamespace(batchsize=2, seqlen=8, device=torch.device('cpu'), eos_id=None,
+                          shuffle=1, grad_accum=grad_accum, decay_frac=decay_frac)
+    opt.train = np.full(2 * 8 * 8, main_token, dtype=np.uint16)       # 8 batches
+    opt.anneal = np.full(2 * 8 * 3, anneal_token, dtype=np.uint16)    # 3 per pass
+    opt.batches_per_epoch = 8
+    opt.total_steps = 8 // grad_accum
+    return opt
+
+
+def _firsts(batches):
+    return [x[0, 0].item() for x, _ in batches]
+
+
+def test_epoch_batches_switch_to_the_anneal_corpus_at_decay_start():
+    from pretrain.train import cycle_feeder, epoch_batches
+    opt = _batch_opt(1, 9)
+    assert _firsts(epoch_batches(opt, 0, 0, cycle_feeder(opt, opt.anneal))) == [1] * 4 + [9] * 4
+    assert _firsts(epoch_batches(opt, 0, 0)) == [1] * 8
+
+
+def test_anneal_switch_counts_optimizer_steps_not_micro_batches():
+    from pretrain.train import cycle_feeder, epoch_batches
+    opt = _batch_opt(1, 9, grad_accum=2)   # 4 steps; decay from step 2 = micro 4
+    assert _firsts(epoch_batches(opt, 0, 0, cycle_feeder(opt, opt.anneal))) == [1] * 4 + [9] * 4
+
+
+def test_cycle_feeder_skip_continues_across_passes():
+    import itertools
+    import numpy as np
+    from pretrain.train import cycle_feeder
+    opt = _batch_opt(1, 9)
+    opt.anneal = np.arange(2 * 8 * 3, dtype=np.uint16)   # distinct windows, 3 per pass
+    full = _firsts(itertools.islice(cycle_feeder(opt, opt.anneal), 7))
+    assert len(set(full[:3])) == 3 and sorted(full[:3]) == sorted(full[3:6])
+    assert _firsts(itertools.islice(cycle_feeder(opt, opt.anneal, skip=4), 3)) == full[4:]

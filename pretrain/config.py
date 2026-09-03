@@ -90,6 +90,10 @@ def parse_args(argv=None):
     parser.add_argument('-norm', type=float, default=2.0)
     parser.add_argument('-data_dir', type=str, default='data_cache/cosmopedia',
                         help='Directory with tokenizer.json + train.bin + val.bin (run prepare.py)')
+    parser.add_argument('-anneal_dir', type=str, default=None,
+                        help='Corpus (same tokenizer) served instead of -data_dir from the WSD '
+                             'decay start on: a full mix tilted toward math, code and '
+                             'synthetic text, the way SmolLM2 anneals (prepare.py --mix anneal)')
 
     opt, unknown = parser.parse_known_args(argv)
     return opt

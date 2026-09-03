@@ -1,3 +1,4 @@
+import filecmp
 import os
 import math
 import random
@@ -86,6 +87,12 @@ def make_optimizers(model, muon_lr=0.02, embed_lr=3e-3, scalar_lr=0.01,
     return [muon, adamw]
 
 
+def decay_start(total_steps, decay_frac):
+    """The step the WSD decay phase begins at (fractional: steps at or past it
+    decay). The anneal corpus switches in at the same point."""
+    return (1 - decay_frac) * total_steps
+
+
 def lr_factor(step, total_steps, warmup_steps=100, schedule='wsd',
               decay_frac=0.25, min_lr_ratio=0.1):
     if step < warmup_steps:
@@ -94,11 +101,11 @@ def lr_factor(step, total_steps, warmup_steps=100, schedule='wsd',
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
         cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
         return min_lr_ratio + (1 - min_lr_ratio) * cosine
-    # WSD: constant peak until decay_start, then 1 - sqrt(p) down to ~0.
-    decay_start = (1 - decay_frac) * total_steps
-    if step < decay_start:
+    # WSD: constant peak until the decay start, then 1 - sqrt(p) down to ~0.
+    start = decay_start(total_steps, decay_frac)
+    if step < start:
         return 1.0
-    p = (step - decay_start) / max(1, total_steps - decay_start)
+    p = (step - start) / max(1, total_steps - start)
     return 1.0 - math.sqrt(min(1.0, p))
 
 
@@ -196,6 +203,34 @@ def _feeder(opt, data, **kw):
                        rank=dist.rank(), world=dist.world_size(), **kw)
 
 
+def cycle_feeder(opt, data, skip=0):
+    """_feeder over `data` without end, reshuffled every pass. skip is the
+    number of batches already drawn, across passes, so a resumed run picks
+    up where it left off."""
+    per_pass = len(data) // (opt.batchsize * opt.seqlen * dist.world_size())
+    assert per_pass, "anneal corpus holds less than one batch per rank"
+    passes, skip = divmod(skip, per_pass)
+    while True:
+        yield from _feeder(opt, data, shuffle=bool(getattr(opt, 'shuffle', 0)),
+                           seed=1000 + passes, skip=skip)
+        passes, skip = passes + 1, 0
+
+
+def epoch_batches(opt, epoch, skip, anneal=None):
+    """One epoch's batches for this rank in seeded order, minus the first
+    `skip`. From the WSD decay start on, each batch is drawn from the anneal
+    feeder instead: the main feeder keeps pacing the epoch, its batch dropped."""
+    grad_accum = max(1, getattr(opt, 'grad_accum', 1))
+    start = decay_start(opt.total_steps, getattr(opt, 'decay_frac', 0.25))
+    micro = epoch * opt.batches_per_epoch + skip
+    for batch in _feeder(opt, opt.train, shuffle=bool(getattr(opt, 'shuffle', 0)),
+                         seed=42 + epoch, skip=skip):
+        if anneal is not None and micro // grad_accum >= start:
+            batch = next(anneal)
+        yield batch
+        micro += 1
+
+
 def _apply_momentum_warmup(optimizers, step, warmup):
     """Ramp Muon momentum 0.85 -> 0.95 over the first `warmup` steps."""
     if not warmup:
@@ -285,8 +320,14 @@ def train_model(model, opt):
                       f"evals (best {stopper.best:.4f})")
                 stop_training = True
         return val_loss
-    # A resumed run rejoins its epoch mid-pass, past the batches it consumed.
+    # A resumed run rejoins its epoch mid-pass, past the batches it consumed,
+    # and the anneal feeder past the batches the decay phase already drew.
     first_epoch, skip = divmod(micro, opt.batches_per_epoch)
+    anneal = None
+    if getattr(opt, 'anneal', None) is not None:
+        start = decay_start(opt.total_steps, getattr(opt, 'decay_frac', 0.25))
+        anneal = cycle_feeder(opt, opt.anneal,
+                              skip=max(0, step - math.ceil(start)) * grad_accum)
     for epoch in range(first_epoch, opt.epochs):
         epoch_loss = torch.zeros((), device=opt.device)
         epoch_tokens = 0
@@ -295,9 +336,7 @@ def train_model(model, opt):
         for o in opt.optimizers:
             o.zero_grad()
 
-        for inX, out, *rest in _feeder(opt, opt.train,
-                                       shuffle=bool(getattr(opt, 'shuffle', 0)),
-                                       seed=42 + epoch, skip=skip):
+        for inX, out, *rest in epoch_batches(opt, epoch, skip, anneal):
             timer.mark('data')
             seg = rest[0] if rest else None
             iter += 1
@@ -496,6 +535,13 @@ def main():
     opt.train = load_bin(train_bin)
     opt.valid = load_bin(val_bin)
     opt.test = load_bin(test_bin)
+    opt.anneal = None
+    if opt.anneal_dir:
+        anneal_tok = os.path.join(opt.anneal_dir, 'tokenizer.json')
+        if not filecmp.cmp(anneal_tok, tok_path, shallow=False):
+            raise ValueError(f"{anneal_tok} is not {tok_path}: the anneal corpus "
+                             "must be tokenized with the run's own tokenizer")
+        opt.anneal = load_bin(os.path.join(opt.anneal_dir, 'train.bin'))
 
     if opt.resume:
         opt.loadname = opt.resume   # the weights come from the same checkpoint
